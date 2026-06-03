@@ -1,0 +1,21 @@
+# === SECRETS (never commit) ===
+auth.json
+telegram.json
+
+# === CACHE — installed packages (reinstallable) ===
+git/
+npm/
+
+# === RUNTIME STATE ===
+locks.json
+run-history.jsonl
+sessions/
+tmp/
+
+# === RUNTIME — mind worker ephemeral state ===
+# mind-worker.json at root is portable CONFIG, not ignored
+mindworker/*.sock
+mindworker/*-mind-control.json
+mindworker/*-manifest.json
+mindworker/*-plan.md
+mindworker/*-pending-*.json

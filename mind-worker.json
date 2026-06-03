@@ -1,0 +1,13 @@
+{
+  "timeout": 6000,
+  "statusStream": true,
+  "autoSpawnWorker": true,
+  "workerTaskStrictness": "strict",
+  "notifyOnMindIdle": true,
+  "ntfyTopic": "nrk_mangalpete_legion_ai_reminders",
+  "mindModel": "openai-codex/gpt-5.5",
+  "workerModel": "opencode-go/deepseek-v4-flash",
+  "resetTimeout": 5,
+  "kittyEnabled": true,
+  "workerCount": 3
+}

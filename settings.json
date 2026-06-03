@@ -1,0 +1,55 @@
+{
+  "quietStartup": true,
+  "lastChangelogVersion": "0.78.0",
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-5.5",
+  "defaultThinkingLevel": "high",
+  "enabledModels": [
+    "openai-codex/gpt-5.4",
+    "openai-codex/gpt-5.5",
+    "openai-codex/gpt-5.3-codex",
+    "openai-codex/gpt-5.4-mini",
+    "opencode-go/deepseek-v4-flash",
+    "lm-studio/google/gemma-4-e2b",
+    "opencode-go/deepseek-v4-pro"
+  ],
+  "enableSkillCommands": true,
+  "packages": [
+    "npm:pi-web-access",
+    "npm:@codexstar/pi-listen",
+    "npm:pi-nvim",
+    "npm:@llblab/pi-telegram"
+  ],
+  "hideThinkingBlock": false,
+  "steeringMode": "one-at-a-time",
+  "followUpMode": "one-at-a-time",
+  "enableInstallTelemetry": false,
+  "doubleEscapeAction": "tree",
+  "treeFilterMode": "default",
+  "voice": {
+    "version": 2,
+    "enabled": true,
+    "language": "en",
+    "scope": "global",
+    "backend": "local",
+    "localModel": "parakeet-v2",
+    "toggleShortcut": "ctrl+shift+v",
+    "ttsEnabled": false,
+    "ttsBackend": "local",
+    "ttsLocalModel": "kitten-nano-en-v0_2",
+    "ttsLocalVoiceId": 0,
+    "ttsDeepgramVoiceId": "aura-asteria-en",
+    "ttsSpeed": 1,
+    "ttsAutoSpeak": true,
+    "autoSubmitOnSpeak": false,
+    "holdThresholdMs": 700,
+    "ttsDeepgramStreaming": false,
+    "ttsOnboardingShown": false,
+    "onboarding": {
+      "completed": true,
+      "schemaVersion": 2,
+      "completedAt": "2026-05-09T12:24:16.898Z",
+      "source": "migration"
+    }
+  }
+}
