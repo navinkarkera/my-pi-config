@@ -19,6 +19,12 @@ interface WorkerConnection {
 	taskId: string | null;
 	workerId: string;
 	connectedAt: number;
+	tier: string;
+}
+
+interface WorkerModelEntry {
+	model: string;
+	tier: string;
 }
 
 interface MindWorkerConfig {
@@ -33,6 +39,7 @@ interface MindWorkerConfig {
 	resetTimeout: number;
 	kittyEnabled: boolean;
 	workerCount: number;
+	workerModels?: Array<{ model: string; count: number; tier?: string }>;
 }
 
 interface SocketMsg {
@@ -46,6 +53,7 @@ interface SocketMsg {
 	role?: string;
 	generation?: number;
 	workerId?: string;
+	tier?: string;
 	explanation?: string;
 	diff?: string;
 	filesChanged?: string[];
@@ -68,6 +76,7 @@ const DEFAULT_CONFIG: MindWorkerConfig = {
 	resetTimeout: 5,
 	kittyEnabled: true,
 	workerCount: 3,
+	workerModels: undefined,
 };
 
 const MIND_ALLOWED_TOOLS = ["delegate", "read", "git", "ripgrep"];
@@ -81,6 +90,9 @@ const LAUNCHER_GENERATION: number | null = parseEnvGeneration();
 
 /** Parsed from env var PI_MIND_WORKER_ID (launcher path). null = not set. */
 const LAUNCHER_WORKER_ID: string | null = parseEnvWorkerId();
+
+/** Parsed from env var PI_MIND_WORKER_TIER (launcher path). null = not set. */
+const LAUNCHER_WORKER_TIER: string | null = parseEnvWorkerTier();
 
 /** Mutable boot-time hint cleared after role activation. Prevents stale-flag bugs on role changes. */
 let launcherBootHint: Role | null = LAUNCHER_ROLE_FLAG;
@@ -102,6 +114,11 @@ function parseEnvGeneration(): number | null {
 
 function parseEnvWorkerId(): string | null {
 	const val = process.env.PI_MIND_WORKER_ID;
+	return val?.trim() || null;
+}
+
+function parseEnvWorkerTier(): string | null {
+	const val = process.env.PI_MIND_WORKER_TIER;
 	return val?.trim() || null;
 }
 
@@ -140,6 +157,7 @@ interface QueuedTask {
 	plan?: string;
 	context?: string;
 	reset?: boolean;
+	tier?: string;
 	ctx: ExtensionContext;
 	resolve: (result: any) => void;
 	signal?: AbortSignal;
@@ -321,11 +339,46 @@ function getConfigPath(): string {
 	return join(getAgentDir(), "mind-worker.json");
 }
 
-function loadConfig(): { config: MindWorkerConfig; created: boolean } {
+function resolveWorkerModels(config: MindWorkerConfig): WorkerModelEntry[] {
+	const resolved: WorkerModelEntry[] = [];
+	if (Array.isArray(config.workerModels) && config.workerModels.length > 0) {
+		let valid = true;
+		for (const entry of config.workerModels) {
+			if (typeof entry.model !== "string" || !entry.model.trim()) { valid = false; break; }
+			if (typeof entry.count !== "number" || entry.count < 1 || entry.count > 10) { valid = false; break; }
+			const tier = entry.tier || "flash";
+			if (tier !== "flash" && tier !== "strong") { valid = false; break; }
+		}
+		if (valid) {
+			const total = config.workerModels.reduce((sum: number, e) => sum + e.count, 0);
+			if (total >= 1 && total <= 10) {
+				for (const entry of config.workerModels) {
+					const tier = entry.tier || "flash";
+					for (let i = 0; i < entry.count; i++) {
+						resolved.push({ model: entry.model.trim(), tier });
+					}
+				}
+			}
+		}
+		if (resolved.length === 0) {
+			console.warn("[mind-worker] workerModels validation failed — falling back to legacy config");
+		}
+	}
+	if (resolved.length === 0) {
+		// Fallback: workerModel x workerCount, all flash
+		for (let i = 0; i < config.workerCount; i++) {
+			resolved.push({ model: config.workerModel, tier: "flash" });
+		}
+	}
+	return resolved;
+}
+
+function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWorkers: WorkerModelEntry[] } {
 	const path = getConfigPath();
 	if (!existsSync(path)) {
 		writeFileSync(path, JSON.stringify(DEFAULT_CONFIG, null, 2), "utf-8");
-		return { config: DEFAULT_CONFIG, created: true };
+		const resolved = resolveWorkerModels(DEFAULT_CONFIG);
+		return { config: DEFAULT_CONFIG, created: true, resolvedWorkers: resolved };
 	}
 	try {
 		const parsed = JSON.parse(readFileSync(path, "utf-8")) as Partial<MindWorkerConfig>;
@@ -344,26 +397,27 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean } {
 		const wc = typeof parsed.workerCount === "number" && parsed.workerCount >= 1 && parsed.workerCount <= 10
 			? parsed.workerCount : DEFAULT_CONFIG.workerCount;
 
-		return {
-			config: {
-				mindModel: parsed.mindModel || DEFAULT_CONFIG.mindModel,
-				workerModel: parsed.workerModel || DEFAULT_CONFIG.workerModel,
-				timeout: typeof parsed.timeout === "number" ? parsed.timeout : DEFAULT_CONFIG.timeout,
-				statusStream: parsed.statusStream !== false,
-				autoSpawnWorker: parsed.autoSpawnWorker !== false,
-				notifyOnMindIdle: parsed.notifyOnMindIdle === true,
-				ntfyTopic: parsed.ntfyTopic || DEFAULT_CONFIG.ntfyTopic,
-				ntfyServer: parsed.ntfyServer || DEFAULT_CONFIG.ntfyServer,
-				resetTimeout: typeof parsed.resetTimeout === "number" && parsed.resetTimeout > 0
-					? parsed.resetTimeout : DEFAULT_CONFIG.resetTimeout,
-				kittyEnabled: typeof parsed.kittyEnabled === "boolean"
-					? parsed.kittyEnabled : DEFAULT_CONFIG.kittyEnabled,
-				workerCount: wc,
-			},
-			created: false,
+		const config: MindWorkerConfig = {
+			mindModel: parsed.mindModel || DEFAULT_CONFIG.mindModel,
+			workerModel: parsed.workerModel || DEFAULT_CONFIG.workerModel,
+			timeout: typeof parsed.timeout === "number" ? parsed.timeout : DEFAULT_CONFIG.timeout,
+			statusStream: parsed.statusStream !== false,
+			autoSpawnWorker: parsed.autoSpawnWorker !== false,
+			notifyOnMindIdle: parsed.notifyOnMindIdle === true,
+			ntfyTopic: parsed.ntfyTopic || DEFAULT_CONFIG.ntfyTopic,
+			ntfyServer: parsed.ntfyServer || DEFAULT_CONFIG.ntfyServer,
+			resetTimeout: typeof parsed.resetTimeout === "number" && parsed.resetTimeout > 0
+				? parsed.resetTimeout : DEFAULT_CONFIG.resetTimeout,
+			kittyEnabled: typeof parsed.kittyEnabled === "boolean"
+				? parsed.kittyEnabled : DEFAULT_CONFIG.kittyEnabled,
+			workerCount: wc,
+			workerModels: parsed.workerModels,
 		};
+		const resolved = resolveWorkerModels(config);
+		return { config, created: false, resolvedWorkers: resolved };
 	} catch {
-		return { config: DEFAULT_CONFIG, created: false };
+		const resolved = resolveWorkerModels(DEFAULT_CONFIG);
+		return { config: DEFAULT_CONFIG, created: false, resolvedWorkers: resolved };
 	}
 }
 
@@ -529,10 +583,11 @@ function failPendingTasksForWorker(workerId: string, message: string, code = "DI
 	}
 }
 
-/** Find first idle (non-busy, connected) worker from the pool. */
-function findIdleWorker(): { workerId: string; connection: WorkerConnection } | null {
+/** Find first idle (non-busy, connected) worker from the pool. Optionally filter by tier. */
+function findIdleWorker(tier?: string): { workerId: string; connection: WorkerConnection } | null {
 	for (const [wid, conn] of workerPool) {
 		if (!conn.busy && !conn.socket.destroyed) {
+			if (tier && conn.tier !== tier) continue;
 			return { workerId: wid, connection: conn };
 		}
 	}
@@ -548,11 +603,22 @@ function countBusyWorkers(): number {
 	return busy;
 }
 
-/** Pop next queued task and dispatch to given idle worker. Returns true if dispatched. */
+/** Pop next queued task (matching worker tier) and dispatch to given idle worker. Returns true if dispatched. */
 function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx: ExtensionContext): boolean {
 	if (pendingQueue.length === 0) return false;
 	if (connection.socket.destroyed) return false;
-	const entry = pendingQueue.shift()!;
+
+	// Scan queue for first entry matching this worker's tier (or any if entry has no tier preference)
+	let matchIdx = -1;
+	for (let i = 0; i < pendingQueue.length; i++) {
+		const e = pendingQueue[i];
+		if (!e.tier || e.tier === connection.tier) {
+			matchIdx = i;
+			break;
+		}
+	}
+	if (matchIdx === -1) return false;
+	const entry = pendingQueue.splice(matchIdx, 1)[0];
 
 	const { config } = loadConfig();
 	const id = entry.id;
@@ -688,13 +754,6 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 	}
 
 	mindServer = createServer((socket) => {
-		// Pool capacity guard — reject if already at max
-		if (workerPool.size >= maxWorkers) {
-			sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${maxWorkers} workers already connected` });
-			socket.destroy();
-			return;
-		}
-
 		let handshakeDone = false;
 		let assignedWorkerId: string | null = null;
 
@@ -707,6 +766,25 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 				// ── Handshake phase ──────────────────────────────────
 				if (!handshakeDone) {
 					if (msg.type === "handshake") {
+						const workerTier = (msg.tier || "flash") as string;
+
+						// Tier-aware pool capacity guard (fallback to total maxWorkers if tier unknown)
+						const { resolvedWorkers } = loadConfig();
+						const tierWorkers = resolvedWorkers.filter(w => w.tier === workerTier).length;
+						const tierConnected = [...workerPool.values()].filter(w => w.tier === workerTier && !w.socket.destroyed).length;
+						if (tierWorkers === 0) {
+							// Tier not in resolved config (defensive) — use total pool limit
+							if (workerPool.size >= maxWorkers) {
+								sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${maxWorkers} workers already connected` });
+								socket.destroy();
+								return;
+							}
+						} else if (tierConnected >= tierWorkers) {
+							sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${tierWorkers} ${workerTier} workers already connected` });
+							socket.destroy();
+							return;
+						}
+
 					// Launcher-path worker: validate generation
 						const manifest = readManifest(cwd);
 						const manifestGen = (manifest?.generation as number) ?? 0;
@@ -736,13 +814,14 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 						workerPool.set(assignedWorkerId, {
 							socket, busy: false, taskId: null,
 							workerId: assignedWorkerId, connectedAt: Date.now(),
+							tier: workerTier,
 						});
 						// Dispatch any queued tasks to this new worker
 						if (pendingQueue.length > 0) {
 							dispatchNextQueued(assignedWorkerId, workerPool.get(assignedWorkerId)!, ctx);
 						}
-						console.error(`[mind-worker] Handshake OK, worker=${assignedWorkerId}, gen=${msg.generation}`);
-						ctx.ui.notify(`Worker ${assignedWorkerId} connected (${workerPool.size}/${maxWorkers})`, "success");
+						console.error(`[mind-worker] Handshake OK, worker=${assignedWorkerId}, tier=${workerTier}, gen=${msg.generation}`);
+						ctx.ui.notify(`Worker ${assignedWorkerId} [${workerTier}] connected (${workerPool.size}/${maxWorkers})`, "success");
 						ctx.ui.setStatus("mind-worker", `🔵 mind (${workerPool.size}/${maxWorkers})`);
 						if (LAUNCHER_ROLE_FLAG === "mind") {
 							writeControlFileWorkerConnected(cwd);
@@ -757,12 +836,18 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 						socket.end();
 						return;
 					}
-					// Legacy path (no handshake) — accept immediately
+					// Legacy path (no handshake) — accept immediately with total pool guard
+					if (workerPool.size >= maxWorkers) {
+						sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${maxWorkers} workers already connected` });
+						socket.destroy();
+						return;
+					}
 					handshakeDone = true;
 					assignedWorkerId = `legacy-${Date.now()}`;
 					workerPool.set(assignedWorkerId, {
 						socket, busy: false, taskId: null,
 						workerId: assignedWorkerId, connectedAt: Date.now(),
+						tier: "flash",
 					});
 					// Dispatch any queued tasks to this new worker
 					if (pendingQueue.length > 0) {
@@ -807,8 +892,9 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 
 		socket.on("close", () => {
 			if (assignedWorkerId && workerPool.has(assignedWorkerId)) {
+				const tier = workerPool.get(assignedWorkerId)!.tier;
 				workerPool.delete(assignedWorkerId);
-				ctx.ui.notify(`Worker ${assignedWorkerId} disconnected (${workerPool.size}/${maxWorkers})`, "warning");
+				ctx.ui.notify(`Worker ${assignedWorkerId} [${tier}] disconnected (${workerPool.size}/${maxWorkers})`, "warning");
 				ctx.ui.setStatus(
 					"mind-worker",
 					workerPool.size > 0 ? `🔵 mind (${workerPool.size}/${maxWorkers})` : "🔵 mind (no workers)",
@@ -889,14 +975,14 @@ function stopMindServer(cwd: string, ctx: ExtensionContext): void {
 
 async function spawnWorkerInKitty(cwd: string): Promise<void> {
 	if (!process.env.KITTY_LISTEN_ON) return;
-	const { config } = loadConfig();
-	const count = config.workerCount;
+	const { resolvedWorkers } = loadConfig();
 	const errors: string[] = [];
-	for (let i = 0; i < count; i++) {
+	for (let i = 0; i < resolvedWorkers.length; i++) {
+		const entry = resolvedWorkers[i];
 		try {
 			await new Promise<void>((resolve, reject) => {
-				const title = `Pi Worker ${i}`;
-				const child = spawn("kitty", ["@", "launch", "--cwd", cwd, "--title", title, "--env", `PI_MIND_WORKER_ID=worker-${i}`, "pi", "/be-worker"], {
+				const title = `Pi Worker ${i} [${entry.tier}]`;
+				const child = spawn("kitty", ["@", "launch", "--cwd", cwd, "--title", title, "--env", `PI_MIND_WORKER_ID=worker-${i}`, "--env", `PI_MIND_WORKER_TIER=${entry.tier}`, "pi", "--model", entry.model, "/be-worker"], {
 					stdio: "ignore",
 					timeout: 10000,
 				});
@@ -911,7 +997,7 @@ async function spawnWorkerInKitty(cwd: string): Promise<void> {
 		}
 	}
 	if (errors.length > 0) {
-		console.error(`[spawnWorkerInKitty] ${errors.length}/${count} workers failed: ${errors.join("; ")}`);
+		console.error(`[spawnWorkerInKitty] ${errors.length}/${resolvedWorkers.length} workers failed: ${errors.join("; ")}`);
 	}
 }
 
@@ -953,13 +1039,15 @@ async function connectWorker(
 				ctx.ui.setStatus("mind-worker", "🟢 worker");
 				ctx.ui.notify("Connected to mind", "success");
 
-				// Send generation handshake with workerId
-				console.error(`[worker] Connected, sending handshake gen=${generation} workerId=${LAUNCHER_WORKER_ID}`);
+				// Send generation handshake with workerId and tier
+				const workerTier = LAUNCHER_WORKER_TIER || "flash";
+				console.error(`[worker] Connected, sending handshake gen=${generation} workerId=${LAUNCHER_WORKER_ID} tier=${workerTier}`);
 				sendJson(socket, {
 					type: "handshake",
 					role: "worker",
 					generation,
 					workerId: LAUNCHER_WORKER_ID || undefined,
+					tier: workerTier,
 				});
 
 				resolve(true);
@@ -1179,15 +1267,15 @@ async function activateMindRole(ctx: ExtensionContext, pi: ExtensionAPI): Promis
 		return;
 	}
 
-	const { config, created } = loadConfig();
+	const { config, created, resolvedWorkers } = loadConfig();
 	if (created) {
 		ctx.ui.notify(`Created config: ${getConfigPath()}`, "info");
 		ctx.ui.notify("Tip: enable notifyOnMindIdle in mind-worker.json for desktop notify-send + optional ntfy phone push", "info");
 	}
 
-	// Set max workers and queue size from config
-	maxWorkers = config.workerCount;
-	maxQueueSize = config.workerCount * 2;
+	// Set max workers and queue size from resolved worker list
+	maxWorkers = resolvedWorkers.length;
+	maxQueueSize = resolvedWorkers.length * 2;
 
 	if (!defaultTools) defaultTools = pi.getActiveTools();
 	pi.setActiveTools(MIND_ALLOWED_TOOLS);
@@ -1228,12 +1316,27 @@ async function activateWorkerRole(ctx: ExtensionContext, pi: ExtensionAPI): Prom
 		return;
 	}
 
-	const { config } = loadConfig();
+	const { config, resolvedWorkers } = loadConfig();
 	if (!defaultTools) defaultTools = pi.getActiveTools();
 	if (defaultTools) pi.setActiveTools(defaultTools);
 
 	currentRole = "worker";
-	await setModelFromId(pi, ctx, config.workerModel);
+	// Pick model by worker index (worker-N) from resolved list, fallback to tier match, then config.workerModel
+	let workerModel = config.workerModel;
+	const workerIdxMatch = LAUNCHER_WORKER_ID?.match(/^worker-(\d+)$/);
+	if (workerIdxMatch) {
+		const idx = parseInt(workerIdxMatch[1], 10);
+		if (idx >= 0 && idx < resolvedWorkers.length) {
+			workerModel = resolvedWorkers[idx].model;
+		}
+	} else {
+		const tier = LAUNCHER_WORKER_TIER;
+		if (tier) {
+			const tierEntry = resolvedWorkers.find(w => w.tier === tier);
+			if (tierEntry) workerModel = tierEntry.model;
+		}
+	}
+	await setModelFromId(pi, ctx, workerModel);
 	pi.setThinkingLevel(WORKER_THINKING_LEVEL);
 	const connected = await connectWorker(ctx.cwd, ctx, createWorkerHandler(pi));
 	if (!connected) {
@@ -1343,7 +1446,7 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "delegate",
 		label: "Delegate",
-		description: "Delegate task to worker pool. To fan out across N workers, call delegate N times in succession — each routes to next idle worker and runs in parallel. After all calls return, merge results. Omit workerId for auto-routing to first idle worker. If all workers busy, task queues up to max queue size and dispatches when worker becomes idle. Specify workerId to target a specific worker.",
+		description: "Delegate task to worker pool. To fan out across N workers, call delegate N times in succession — each routes to next idle worker and runs in parallel. After all calls return, merge results. Omit workerId for auto-routing to first idle worker. If all workers busy, task queues up to max queue size and dispatches when worker becomes idle. Specify workerId to target a specific worker, or tier to target a specific worker type.",
 		parameters: Type.Object({
 			task: Type.String({ description: "Task for worker" }),
 			step: Type.Optional(Type.Number({ description: "Step number" })),
@@ -1351,6 +1454,7 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 			context: Type.Optional(Type.String({ description: "Running summary" })),
 			reset: Type.Optional(Type.Boolean({ description: "Reserved" })),
 			workerId: Type.Optional(Type.String({ description: "Target specific worker by ID. Omit for auto-routing to first idle worker." })),
+			tier: Type.Optional(Type.String({ description: "Worker tier: 'flash' for simple/scoped tasks, 'strong' for complex/deep reasoning. Omit or 'auto' for any idle worker." })),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			if (currentRole !== "mind") {
@@ -1359,6 +1463,16 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 			if (!params.task?.trim()) {
 				return { content: [{ type: "text", text: "task is required" }], isError: true };
 			}
+
+			// ── Determine target tier ────────────────────────────────
+			const targetTier = params.tier?.trim();
+			if (targetTier && targetTier !== "flash" && targetTier !== "strong" && targetTier !== "auto") {
+				return {
+					content: [{ type: "text", text: `Invalid tier "${targetTier}". Use "flash", "strong", "auto", or omit.` }],
+					isError: true,
+				};
+			}
+			const effectiveTier = (targetTier === "auto" || !targetTier) ? undefined : targetTier;
 
 			// ── Find target worker ──────────────────────────────────
 			let targetWorkerId = params.workerId?.trim() || null;
@@ -1382,8 +1496,8 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 				}
 				connection = conn;
 			} else {
-				// Auto-select first idle worker
-				const idle = findIdleWorker();
+				// Auto-select first idle worker of requested tier (or any if no tier)
+				const idle = findIdleWorker(effectiveTier);
 				if (!idle) {
 					const connected = [...workerPool.values()].filter(w => !w.socket.destroyed).length;
 					if (connected === 0) {
@@ -1391,6 +1505,26 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 							content: [{ type: "text", text: "No workers connected. Workers start automatically." }],
 							isError: true,
 						};
+					}
+					// If tier specified, check if any worker of that tier exists
+					if (effectiveTier) {
+						const tierCount = [...workerPool.values()].filter(w => w.tier === effectiveTier && !w.socket.destroyed).length;
+						const tierBusy = [...workerPool.values()].filter(w => w.tier === effectiveTier && w.busy && !w.socket.destroyed).length;
+						if (tierCount === 0) {
+							return {
+								content: [{ type: "text", text: `No ${effectiveTier} workers connected. Available tiers: ${[...new Set([...workerPool.values()].filter(w => !w.socket.destroyed).map(w => w.tier))].join(", ") || "(none)"}` }],
+								isError: true,
+							};
+						}
+						// Tier workers exist but all busy — queue for that tier
+						if (tierCount > 0 && tierCount === tierBusy) {
+							// Fall through to queue below
+						} else {
+							return {
+								content: [{ type: "text", text: `All ${effectiveTier} worker(s) busy (${tierBusy}/${tierCount}). Use "auto" or omit tier to queue for any available worker.` }],
+								isError: true,
+							};
+						}
 					}
 					// Queue the task if within limit
 					if (pendingQueue.length >= maxQueueSize) {
@@ -1412,6 +1546,7 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 							plan: params.plan,
 							context: params.context,
 							reset: params.reset,
+							tier: effectiveTier,
 							ctx,
 							resolve,
 							signal,
@@ -1617,25 +1752,36 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 		const planPath = getPlanPath(cwd);
 		const planSection = existsSync(planPath) ? `\n\n## Current Plan\n${readFileSync(planPath, "utf-8")}` : "";
 
-		const { config } = loadConfig();
-		const wc = config.workerCount;
+		const { config, resolvedWorkers } = loadConfig();
+		const flashCount = resolvedWorkers.filter(w => w.tier === "flash").length;
+		const strongCount = resolvedWorkers.filter(w => w.tier === "strong").length;
+
+		let tierDesc = "";
+		if (flashCount > 0 && strongCount > 0) {
+			tierDesc = `${flashCount} flash workers (fast/cheap — scoped tasks: grep, single-file edits, run tests, builds) + ${strongCount} strong worker (deep reasoning — multi-file refactors, architecture, debugging).`;
+		} else {
+			tierDesc = `${resolvedWorkers.length} workers available (each handles 1 task at a time).`;
+		}
 
 		return {
 			systemPrompt:
 				event.systemPrompt +
 				"\n\n[MIND MODE ACTIVE]\n" +
-				`You are planner/reviewer Mind. ${wc} workers available (each handles 1 task at a time).\n` +
+				"You are planner/reviewer Mind. " + tierDesc + "\n" +
 				"Allowed tools: delegate, read, git, ripgrep.\n" +
 				"Default: parallel-first. Saturate all idle workers whenever tasks are independent.\n" +
 				"Preflight rule: before every non-trivial task, decompose it into independent chunks and saturate all idle workers immediately.\n" +
 				"Use delegate for implementation, edits, test runs, builds.\n" +
+				"Use delegate(tier='flash') for scoped, single-file tasks — faster and cheaper.\n" +
+				"Use delegate(tier='strong') for multi-file refactors, architecture decisions, debugging, reviews, or any correctness-sensitive work.\n" +
+				"Workers can assist with reviews, but Mind owns final review and verdict.\n" +
 				"Use read/git/ripgrep for code review and evidence gathering.\n" +
 				"Never use write/edit/bash/grep/find directly in mind mode.\n" +
 				"Parallel-by-default: independent tasks (separate files, separate searches, separate assertions) fan out across all idle workers in the same turn. This is the expected default — not a special pattern.\n" +
 				"Sequential exception: only dependent or overlapping file edits stay sequential — one delegate call at a time on the same files, waiting for each result before the next.\n" +
 				"Results from same-turn parallel delegates return after the full batch completes; merge them together.\n" +
-				"If no workerId is given, delegate auto-routes to first idle worker.\n" +
-				"If all " + wc + " workers are busy, delegate queues the task (up to " + maxQueueSize + " queued). Tasks dispatch automatically when a worker becomes idle. If queue is full, returns error — wait for results then retry or split into fewer parallel chunks.\n" +
+				"If no workerId or tier is given, delegate auto-routes to first idle worker of any tier.\n" +
+				`If all workers of the requested tier are busy, delegate queues the task (up to ${maxQueueSize} queued). Tasks dispatch automatically when a matching-tier worker becomes idle. If queue is full, returns error — wait for results then retry or split into fewer parallel chunks.\n` +
 				"Use read/git/ripgrep only for one-off, lightweight checks.\n" +
 				"Avoid reading large files directly in mind; this pollutes context window.\n" +
 				"Prefer delegating file reading/search to worker whenever possible, then consume concise summaries.\n" +
@@ -1727,9 +1873,9 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 		if (roleEntry.data.role === "mind" && currentRole !== "mind") {
 			currentRole = "mind";
 			pi.setActiveTools(MIND_ALLOWED_TOOLS);
-			const { config } = loadConfig();
-			maxWorkers = config.workerCount;
-			maxQueueSize = config.workerCount * 2;
+			const { resolvedWorkers } = loadConfig();
+			maxWorkers = resolvedWorkers.length;
+			maxQueueSize = resolvedWorkers.length * 2;
 			startMindServer(ctx.cwd, ctx);
 			ctx.ui.notify(`Mind role restored (max ${maxWorkers} workers)`, "info");
 			return;

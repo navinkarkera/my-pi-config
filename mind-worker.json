@@ -6,6 +6,10 @@
   "notifyOnMindIdle": true,
   "ntfyTopic": "nrk_mangalpete_legion_ai_reminders",
   "mindModel": "openai-codex/gpt-5.5",
+  "workerModels": [
+    { "model": "opencode-go/deepseek-v4-flash", "count": 2, "tier": "flash" },
+    { "model": "opencode-go/qwen3.7-plus", "count": 1, "tier": "strong" }
+  ],
   "workerModel": "opencode-go/deepseek-v4-flash",
   "resetTimeout": 5,
   "kittyEnabled": true,

@@ -11,6 +11,14 @@ compatibility: playwright-cli (>=0.1), Playwright Extension (mmlmfjhmonkocbjadbf
 - `playwright-cli` available on PATH
 - [Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm) installed in Brave
 - Brave must be running with the extension enabled
+- **Brave Nightly** (or non-standard channels) requires two env vars before attach:
+
+  ```bash
+  export PLAYWRIGHT_MCP_EXECUTABLE_PATH=/usr/bin/brave-browser-nightly
+  export PLAYWRIGHT_MCP_BROWSER=brave
+  ```
+
+  Adjust the executable path for your Brave install location.
 
 
 ## Workflow
@@ -19,7 +27,11 @@ compatibility: playwright-cli (>=0.1), Playwright Extension (mmlmfjhmonkocbjadbf
 
 Use when user already has a browser tab open with the target app.
 
+Export the required env vars (especially needed for Brave Nightly):
+
 ```bash
+export PLAYWRIGHT_MCP_EXECUTABLE_PATH=/usr/bin/brave-browser-nightly
+export PLAYWRIGHT_MCP_BROWSER=brave
 playwright-cli attach --extension=brave
 ```
 
@@ -90,7 +102,7 @@ playwright-cli -s=brave run-code 'async (page) => {
 
 | Error | Action |
 |-------|--------|
-| `Playwright Extension not found` | Ask user to verify extension installed in Brave, restart Brave, retry. Do not auto-install anything. |
+| `Playwright Extension not found` | Ask user to verify extension installed in Brave, restart Brave, retry. If using Brave Nightly, the extension profile lookup may need a symlink from `~/.config/google-chrome` to the Brave profile dir (e.g. `~/.config/BraveSoftware/Brave-Browser-Nightly/`). Do not auto-install anything. |
 | `Browser not installed` | Report blocker to user. Ask user how to proceed. Do not install without explicit approval. |
 | `Unsupported channel` | Brave channel not mapped in Playwright internals. Inform user. |
 
@@ -105,6 +117,10 @@ playwright-cli -s=brave run-code 'async (page) => {
 ## Example Session
 
 ```bash
+# Set env vars for Brave Nightly (adjust path for your install)
+export PLAYWRIGHT_MCP_EXECUTABLE_PATH=/usr/bin/brave-browser-nightly
+export PLAYWRIGHT_MCP_BROWSER=brave
+
 # Attach to already-open Brave
 playwright-cli attach --extension=brave
 # Session: brave
