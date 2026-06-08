@@ -645,6 +645,18 @@ function findIdleWorker(tier?: string): { workerId: string; connection: WorkerCo
 	return null;
 }
 
+/** Find all idle workers, optionally filtered by tier. */
+function findAllIdleWorkers(tier?: string): Array<{ workerId: string; connection: WorkerConnection }> {
+	const idle: Array<{ workerId: string; connection: WorkerConnection }> = [];
+	for (const [wid, conn] of workerPool) {
+		if (!conn.busy && !conn.socket.destroyed) {
+			if (tier && conn.tier !== tier) continue;
+			idle.push({ workerId: wid, connection: conn });
+		}
+	}
+	return idle;
+}
+
 /** Count busy workers in the pool. */
 function countBusyWorkers(): number {
 	let busy = 0;
@@ -1765,10 +1777,285 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 		},
 	});
 
+// ── Auto Fanout Router Helpers ──────────────────────────────────────────
+
+interface FanoutLane {
+	label: string;
+	tier?: "flash" | "strong";
+	prompt: string;
+}
+
+const INTENT_KEYWORDS: Record<string, string[]> = {
+	review: ["review", "audit", "inspect", "examine", "assess", "evaluate", "look over", "sanity check"],
+	explore: ["explore", "search", "locate", "discover", "map out", "inventory", "understand", "survey"],
+	test: ["test", "spec", "verify", "validate", "run test", "coverage", "jest", "mocha", "pytest"],
+	debug: ["debug", "investigate", "diagnose", "trace", "root cause", "broken", "failing", "error in"],
+	implement: ["implement", "build", "create", "add feature", "refactor", "migrate"],
+};
+
+function inferIntent(task: string): string {
+	const lower = task.toLowerCase();
+	for (const [intent, keywords] of Object.entries(INTENT_KEYWORDS)) {
+		for (const kw of keywords) {
+			if (lower.includes(kw)) return intent;
+		}
+	}
+	return "explore";
+}
+
+function generateLanes(intent: string, task: string): FanoutLane[] {
+	switch (intent) {
+		case "review":
+			return [
+				{ label: "deep-review", tier: "strong", prompt: `[Deep Review Lane]\n${task}\n\nFocus: correctness, design, security, edge cases.\nReturn structured output:\n- **Findings**: list with severity (critical/high/medium/low), confidence (high/medium/low), evidence (file:line).\n- **Risks/Unknowns**: what could go wrong, what's unclear.\n- **No edits** — read-only analysis.` },
+				{ label: "test-evidence", tier: "flash", prompt: `[Test & Evidence Lane]\n${task}\n\nFocus: run tests, check test coverage gaps, verify assertions.\nReturn structured output:\n- **Tests/Commands Run**: list with exit codes and key output.\n- **Coverage Risks**: untested paths, missing assertions.\n- **No edits** — read-only analysis.` },
+				{ label: "config-risks", tier: "flash", prompt: `[Config & Risky Patterns Lane]\n${task}\n\nFocus: configuration issues, risky patterns (hardcoded secrets, missing validation, unsafe ops).\nReturn structured output:\n- **Findings**: list with severity, confidence, evidence (file:line).\n- **Risks/Unknowns**: insecure defaults, missing env vars.\n- **No edits** — read-only analysis.` },
+			];
+		case "test":
+			return [
+				{ label: "test-discovery", tier: "flash", prompt: `[Test Discovery Lane]\n${task}\n\nFocus: find all test files, test scripts, build/package scripts.\nReturn:\n- **Inventory**: list of test files and how to run them.\n- **Build/Package Scripts**: relevant commands from package.json or similar.` },
+				{ label: "run-tests", tier: "flash", prompt: `[Run Tests Lane]\n${task}\n\nFocus: run targeted tests, identify failing tests, capture output.\nReturn:\n- **Commands Run**: exact commands with exit codes.\n- **Failures**: list of failing tests with error messages.` },
+				{ label: "coverage-config", tier: "flash", prompt: `[Coverage & Config Lane]\n${task}\n\nFocus: check test coverage config, missing test configs, flaky test patterns.\nReturn:\n- **Risks/Unknowns**: coverage gaps, config issues, potential flakiness.` },
+			];
+		case "explore":
+			return [
+				{ label: "architecture", tier: "flash", prompt: `[Architecture Map Lane]\n${task}\n\nFocus: map module boundaries, dependencies, entry points.\nReturn: concise architecture summary with file evidence (file paths).` },
+				{ label: "search-evidence", tier: "flash", prompt: `[Search & Evidence Lane]\n${task}\n\nFocus: search for key patterns, usages, implementations.\nReturn: findings with file paths and line numbers.` },
+				{ label: "docs-config", tier: "flash", prompt: `[Docs & Config Lane]\n${task}\n\nFocus: find relevant documentation, config files, READMEs.\nReturn: summary of docs/config found with file paths.` },
+			];
+		case "debug":
+		case "implement":
+			return [
+				{ label: "deep-analysis", tier: "strong", prompt: `[Deep Analysis Lane]\n${task}\n\nFocus: deep reasoning, root cause analysis, design implications.\nReturn:\n- **Analysis**: with evidence and confidence levels.\n- **Recommendations**: concrete next steps.` },
+				{ label: "evidence-gather", tier: "flash", prompt: `[Evidence Gathering Lane]\n${task}\n\nFocus: grep for relevant code, read key files, gather context.\nReturn: concise findings with file paths and line numbers.` },
+				{ label: "test-validate", tier: "flash", prompt: `[Test & Validate Lane]\n${task}\n\nFocus: run relevant tests, check current behavior.\nReturn:\n- **Commands Run**: exact commands with exit codes.\n- **Observations**: current behavior, regressions.` },
+			];
+		default:
+			return [
+				{ label: "primary", prompt: `[Primary Lane]\n${task}\n\nReturn structured findings with evidence.` },
+				{ label: "secondary", prompt: `[Secondary Lane]\n${task}\n\nReturn structured findings with evidence.` },
+			];
+	}
+}
+
+function assignLanesToWorkers(
+	lanes: FanoutLane[],
+	idleWorkers: Array<{ workerId: string; connection: WorkerConnection }>
+): Array<{ lane: FanoutLane; worker: { workerId: string; connection: WorkerConnection } }> {
+	const assignments: Array<{ lane: FanoutLane; worker: { workerId: string; connection: WorkerConnection } }> = [];
+	const usedWorkers = new Set<string>();
+
+	// First pass: assign tier-specific lanes to matching workers
+	for (const lane of lanes) {
+		if (!lane.tier) continue;
+		const match = idleWorkers.find(w => !usedWorkers.has(w.workerId) && w.connection.tier === lane.tier);
+		if (match) {
+			assignments.push({ lane, worker: match });
+			usedWorkers.add(match.workerId);
+		}
+	}
+
+	// Second pass: assign remaining lanes to any idle workers
+	for (const lane of lanes) {
+		if (assignments.some(a => a.lane === lane)) continue;
+		const match = idleWorkers.find(w => !usedWorkers.has(w.workerId));
+		if (match) {
+			assignments.push({ lane, worker: match });
+			usedWorkers.add(match.workerId);
+		}
+	}
+
+	// Third pass: saturate remaining idle workers with extra lanes
+	let extraIdx = 0;
+	for (const worker of idleWorkers) {
+		if (!usedWorkers.has(worker.workerId)) {
+			const baseLane = lanes[extraIdx % lanes.length];
+			assignments.push({ lane: { ...baseLane, label: `${baseLane.label}-extra-${extraIdx}` }, worker });
+			usedWorkers.add(worker.workerId);
+			extraIdx++;
+		}
+	}
+
+	return assignments;
+}
+
+async function executeFanout(
+	task: string,
+	intent: string,
+	tier: string | undefined,
+	plan: string | undefined,
+	context: string | undefined,
+	step: number | undefined,
+	signal: AbortSignal | undefined,
+	onUpdate: ((update: any) => void) | undefined,
+	ctx: ExtensionContext
+): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean; details?: any }> {
+	const effectiveTier = (tier === "auto" || !tier) ? undefined : tier;
+	const idleWorkers = findAllIdleWorkers(effectiveTier);
+
+	if (idleWorkers.length === 0) {
+		const connected = [...workerPool.values()].filter(w => !w.socket.destroyed).length;
+		const busy = countBusyWorkers();
+		return {
+			content: [{ type: "text", text: `No idle workers available for auto-fanout. ${connected} connected, ${busy} busy.` }],
+			isError: true,
+			details: { code: "NO_IDLE_WORKERS" },
+		};
+	}
+
+	const lanes = generateLanes(intent, task);
+	const assignments = assignLanesToWorkers(lanes, idleWorkers);
+
+	if (assignments.length === 0) {
+		return {
+			content: [{ type: "text", text: `Failed to assign lanes to workers. ${idleWorkers.length} idle but no valid assignments.` }],
+			isError: true,
+			details: { code: "LANE_ASSIGNMENT_FAILED" },
+		};
+	}
+
+	// Write plan file if provided
+	if (plan) {
+		const planPath = getPlanPath(ctx.cwd);
+		ensureDir(dirname(planPath));
+		writeFileSync(planPath, plan, "utf-8");
+	}
+
+	const { config } = loadConfig();
+	writeControlFileBusy(ctx.cwd);
+
+	const results = await Promise.all(
+		assignments.map(({ lane, worker }) => {
+			const taskId = `fanout-${Date.now()}-${lane.label}-${Math.random().toString(36).slice(2, 6)}`;
+
+			// Mark worker busy
+			worker.connection.busy = true;
+			worker.connection.taskId = taskId;
+			taskWorkerMap.set(taskId, worker.workerId);
+
+			if (onUpdate) {
+				pendingUpdates.set(taskId, onUpdate);
+			}
+
+			return new Promise<{ lane: string; workerId: string; tier: string; content: string; isError: boolean }>((resolve) => {
+				let settled = false;
+				let abortListener: (() => void) | null = null;
+				let timeoutId: ReturnType<typeof setTimeout>;
+
+				const resolveOnce = (result: { lane: string; workerId: string; tier: string; content: string; isError: boolean }) => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timeoutId);
+					if (abortListener && signal) {
+						signal.removeEventListener("abort", abortListener);
+					}
+					resolve(result);
+				};
+
+				timeoutId = setTimeout(() => {
+					// Timeout: clean maps, send abort, mark worker idle, dispatch next, write control file
+					pendingResolvers.delete(taskId);
+					pendingUpdates.delete(taskId);
+					taskWorkerMap.delete(taskId);
+					if (!worker.connection.socket.destroyed) {
+						sendJson(worker.connection.socket, { type: "abort", id: taskId });
+					}
+					worker.connection.busy = false;
+					worker.connection.taskId = null;
+					dispatchNextQueued(worker.workerId, worker.connection, ctx);
+					writeControlFileIdle(ctx.cwd);
+					resolveOnce({
+						lane: lane.label,
+						workerId: worker.workerId,
+						tier: worker.connection.tier,
+						content: `Timeout after ${config.timeout}s`,
+						isError: true,
+					});
+				}, Math.max(1, config.timeout) * 1000);
+
+				pendingResolvers.set(taskId, (msg) => {
+					// Normal completion: socket handler already marked worker idle + dispatched next queued
+					// Must NOT mark worker idle or dispatch queued here
+					resolveOnce({
+						lane: lane.label,
+						workerId: worker.workerId,
+						tier: worker.connection.tier,
+						content: msg.explanation || msg.message || "(no result)",
+						isError: msg.type === "error",
+					});
+				});
+
+				sendJson(worker.connection.socket, {
+					type: "task",
+					id: taskId,
+					task: lane.prompt,
+					step: step,
+					plan: plan || undefined,
+					context: context || undefined,
+				});
+
+				// Declare abortListener in outer promise scope so resolver can remove it
+				abortListener = () => {
+					// Abort: clean maps, send abort, mark worker idle, dispatch next, write control file
+					pendingResolvers.delete(taskId);
+					pendingUpdates.delete(taskId);
+					taskWorkerMap.delete(taskId);
+					worker.connection.busy = false;
+					worker.connection.taskId = null;
+					if (!worker.connection.socket.destroyed) {
+						sendJson(worker.connection.socket, { type: "abort", id: taskId });
+					}
+					dispatchNextQueued(worker.workerId, worker.connection, ctx);
+					writeControlFileIdle(ctx.cwd);
+					resolveOnce({
+						lane: lane.label,
+						workerId: worker.workerId,
+						tier: worker.connection.tier,
+						content: "Task aborted",
+						isError: true,
+					});
+				};
+
+				if (signal) {
+					if (signal.aborted) abortListener();
+					else signal.addEventListener("abort", abortListener, { once: true });
+				}
+			});
+		})
+	);
+
+	writeControlFileIdle(ctx.cwd);
+
+	// Aggregate results
+	const errorCount = results.filter(r => r.isError).length;
+	const laneSummary = assignments.map(a => a.lane.label).join(", ");
+	const mergeGuide = intent === "review"
+		? "Cross-reference findings across lanes. Deduplicate overlapping issues. Prioritize by severity (critical > high > medium > low)."
+		: intent === "test"
+			? "Combine test results. Identify failing tests. Check coverage gaps across all lanes."
+			: intent === "explore"
+				? "Merge architecture map with search findings and docs. Build complete picture."
+				: "Combine analysis from all lanes. Cross-reference findings.";
+
+	const body = results
+		.map(r => `## Lane: ${r.lane} (Worker: ${r.workerId}, tier: ${r.tier})\n${r.content}`)
+		.join("\n\n---\n\n");
+
+	return {
+		content: [{
+			type: "text",
+			text: `# Auto-Fanout Results\n\n**Intent:** ${intent}\n**Lanes:** ${assignments.length} (${laneSummary})\n**Workers:** ${assignments.length} assigned, ${errorCount} errors\n\n## Merge Guide\n${mergeGuide}\n\n---\n\n${body}`,
+		}],
+	};
+}
+
+// ── End Auto Fanout Router Helpers ──────────────────────────────────────
+
 	pi.registerTool({
 		name: "delegate",
 		label: "Delegate",
-		description: "Delegate task to worker pool. To fan out across N workers, call delegate N times in succession — each routes to next idle worker and runs in parallel. After all calls return, merge results. Omit workerId for auto-routing to first idle worker. If all workers busy, task queues up to max queue size and dispatches when worker becomes idle. Specify workerId to target a specific worker, or tier to target a specific worker type.",
+		description: "Delegate task to worker pool. Use strategy:'auto', strategy:'fanout', or just provide intent to auto-fanout across idle workers with intent-specific lanes. intent: 'review'|'explore'|'test'|'debug'|'implement' (inferred from task keywords if omitted). Use strategy:'single' or omit strategy/intent to delegate one task to one worker. If all workers busy, task queues up to max queue size. Specify workerId to target a specific worker, or tier for a worker type.",
+		promptSnippet: "Fan-out tasks to worker pool. strategy:'auto'+intent or just intent alone auto-decomposes across idle workers.",
 		parameters: Type.Object({
 			task: Type.String({ description: "Task for worker" }),
 			step: Type.Optional(Type.Number({ description: "Step number" })),
@@ -1777,8 +2064,46 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 			reset: Type.Optional(Type.Boolean({ description: "Reserved" })),
 			workerId: Type.Optional(Type.String({ description: "Target specific worker by ID. Omit for auto-routing to first idle worker." })),
 			tier: Type.Optional(Type.String({ description: "Worker tier: 'flash' for simple/scoped tasks, 'strong' for complex/deep reasoning. Omit or 'auto' for any idle worker." })),
+			strategy: Type.Optional(Type.String({ description: "Routing strategy: 'single' (default, one task to one worker), 'auto' or 'fanout' (auto-decompose and fan out to all idle workers)." })),
+			intent: Type.Optional(Type.String({ description: "Task intent for auto-fanout: 'review', 'explore', 'test', 'debug', 'implement'. Providing intent alone enables auto-fanout. Inferred from task keywords if omitted." })),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			// ── Auto Fanout Router ──
+			const rawStrategy = params.strategy;
+			const rawIntent = params.intent;
+			const strategy = typeof rawStrategy === "string" ? rawStrategy.toLowerCase().trim() : undefined;
+			const intentParam = typeof rawIntent === "string" ? rawIntent.toLowerCase().trim() : undefined;
+			const ALLOWED_INTENTS = new Set(["review", "explore", "test", "debug", "implement"]);
+
+			// Validate strategy in all roles
+			if (strategy !== undefined && strategy !== "single" && strategy !== "auto" && strategy !== "fanout") {
+				return { content: [{ type: "text", text: `Invalid strategy "${params.strategy}". Allowed: "single", "auto", "fanout", or omit.` }], isError: true };
+			}
+
+			const shouldFanout = strategy !== "single" && (strategy === "auto" || strategy === "fanout" || !!intentParam);
+
+			if (shouldFanout && currentRole === "mind") {
+				if (!params.task?.trim()) {
+					return { content: [{ type: "text", text: "task is required" }], isError: true };
+				}
+				// Validate intent for fanout
+				if (intentParam !== undefined && !ALLOWED_INTENTS.has(intentParam)) {
+					return { content: [{ type: "text", text: `Invalid intent "${params.intent}". Allowed: "review", "explore", "test", "debug", "implement", or omit.` }], isError: true };
+				}
+				// Validate tier for fanout
+				const tier = params.tier?.trim();
+				if (tier && tier !== "flash" && tier !== "strong" && tier !== "auto") {
+					return { content: [{ type: "text", text: `Invalid tier "${params.tier}" for fanout. Allowed: "flash", "strong", "auto", or omit.` }], isError: true };
+				}
+				const intent = intentParam && ALLOWED_INTENTS.has(intentParam) ? intentParam : inferIntent(params.task);
+				return executeFanout(params.task, intent, params.tier, params.plan, params.context, params.step, signal, onUpdate, ctx);
+			}
+
+			// ── Fanout guard for worker role ──
+			if (currentRole === "worker" && (strategy === "auto" || strategy === "fanout" || (strategy !== "single" && !!intentParam))) {
+				return { content: [{ type: "text", text: "Auto-fanout only available in mind mode. Strong workers can single-delegate to flash workers by omitting strategy and intent." }], isError: true, details: { code: "FANOUT_IN_WORKER" } };
+			}
+
 			// ── Worker-side subdelegation (strong worker → mind → flash worker) ──
 			if (currentRole === "worker") {
 				// Only strong-tier workers may subdelegate
