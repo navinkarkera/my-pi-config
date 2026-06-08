@@ -2,8 +2,8 @@
   "quietStartup": true,
   "lastChangelogVersion": "0.78.1",
   "defaultProvider": "opencode-go",
-  "defaultModel": "qwen3.7-plus",
-  "defaultThinkingLevel": "high",
+  "defaultModel": "deepseek-v4-flash",
+  "defaultThinkingLevel": "xhigh",
   "enabledModels": [
     "openai-codex/gpt-5.4",
     "openai-codex/gpt-5.5",

@@ -43,7 +43,7 @@ interface MindWorkerConfig {
 }
 
 interface SocketMsg {
-	type: "task" | "result" | "error" | "status" | "abort" | "ping" | "pong" | "handshake";
+	type: "task" | "result" | "error" | "status" | "abort" | "ping" | "pong" | "handshake" | "subdelegate-request" | "subdelegate-response";
 	id?: string;
 	task?: string;
 	step?: number;
@@ -62,6 +62,9 @@ interface SocketMsg {
 	message?: string;
 	phase?: string;
 	detail?: string;
+	requesterWorkerId?: string;
+	requesterTaskId?: string;
+	error?: string;
 }
 
 const DEFAULT_CONFIG: MindWorkerConfig = {
@@ -146,6 +149,50 @@ const taskWorkerMap = new Map<string, string>();
 
 let workerBusy = false;
 let workerTaskId: string | null = null;
+
+/** Worker-side: pending subdelegate resolvers (strong worker waiting for flash result via mind). */
+interface SubdelegateWaiter {
+	resolve: (result: any) => void;
+	timeoutId: ReturnType<typeof setTimeout>;
+}
+const subdelegateWaiters = new Map<string, SubdelegateWaiter>();
+
+/** Mind-side: track which flash-worker tasks are subdelegations from strong workers. Maps flashTaskId → requester info. */
+interface SubdelegateTracker {
+	requesterWorkerId: string;
+	requesterSocket: Socket;
+	subdelegateId: string;
+}
+const subdelegateTrackers = new Map<string, SubdelegateTracker>();
+/** Reverse map: subdelegateId → flashTaskId (for abort handling). */
+const subdelegateReverseMap = new Map<string, string>();
+
+/** Remove a queued subdelegate by subdelegateId. Returns true if found and removed. */
+function removeQueuedSubdelegate(subdelegateId: string): boolean {
+	const flashTaskId = subdelegateReverseMap.get(subdelegateId);
+	if (!flashTaskId) return false;
+	const idx = pendingQueue.findIndex(e => e.id === flashTaskId);
+	if (idx >= 0) {
+		pendingQueue.splice(idx, 1);
+		subdelegateTrackers.delete(flashTaskId);
+		subdelegateReverseMap.delete(subdelegateId);
+		return true;
+	}
+	return false;
+}
+
+/** Remove all queued subdelegates initiated by a specific worker. */
+function removeQueuedSubdelegatesByRequester(requesterWorkerId: string): void {
+	for (let i = pendingQueue.length - 1; i >= 0; i--) {
+		const entry = pendingQueue[i];
+		const tracker = subdelegateTrackers.get(entry.id);
+		if (tracker && tracker.requesterWorkerId === requesterWorkerId) {
+			pendingQueue.splice(i, 1);
+			subdelegateReverseMap.delete(tracker.subdelegateId);
+			subdelegateTrackers.delete(entry.id);
+		}
+	}
+}
 
 const pendingResolvers = new Map<string, (msg: SocketMsg) => void>();
 const pendingUpdates = new Map<string, (update: any) => void>();
@@ -563,6 +610,10 @@ function failPendingTasks(message: string, code = "DISCONNECT"): void {
 	pendingResolvers.clear();
 	pendingUpdates.clear();
 	taskWorkerMap.clear();
+	// Clear subdelegate state
+	subdelegateTrackers.clear();
+	subdelegateReverseMap.clear();
+	subdelegateWaiters.clear();
 }
 
 function failPendingTasksForWorker(workerId: string, message: string, code = "DISCONNECT"): void {
@@ -858,6 +909,208 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 					// Fall through to process this first message normally
 				}
 
+				// ── Subdelegate request from strong worker ─────────────
+				if (msg.type === "subdelegate-request" && msg.id) {
+					const requesterId = assignedWorkerId;
+					if (!requesterId || !workerPool.has(requesterId)) {
+						sendJson(socket, { type: "subdelegate-response", id: msg.id, error: "Unknown requester worker", code: "UNKNOWN_REQUESTER" });
+						return;
+					}
+					const requester = workerPool.get(requesterId)!;
+					if (requester.tier !== "strong") {
+						sendJson(socket, { type: "subdelegate-response", id: msg.id, error: "Only strong-tier workers may subdelegate. Flash workers cannot delegate.", code: "TIER_BLOCKED" });
+						return;
+					}
+					if (!msg.task?.trim()) {
+						sendJson(socket, { type: "subdelegate-response", id: msg.id, error: "task is required", code: "INVALID_PARAMS" });
+						return;
+					}
+					// Generate task ID for flash worker
+					const flashTaskId = `subdel-flash-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+					// Track this subdelegation (both forward and reverse maps)
+					subdelegateTrackers.set(flashTaskId, {
+						requesterWorkerId: requesterId,
+						requesterSocket: socket,
+						subdelegateId: msg.id,
+					});
+					subdelegateReverseMap.set(msg.id, flashTaskId);
+					// Find idle flash worker or queue
+					const idle = findIdleWorker("flash");
+					if (!idle) {
+						const flashConnected = [...workerPool.values()].filter(w => w.tier === "flash" && !w.socket.destroyed).length;
+						if (flashConnected === 0) {
+							subdelegateTrackers.delete(flashTaskId);
+							subdelegateReverseMap.delete(msg.id);
+							sendJson(socket, { type: "subdelegate-response", id: msg.id, error: "No flash workers connected. Workers start automatically — retry shortly.", code: "NO_FLASH_WORKERS" });
+							return;
+						}
+						// All flash workers busy — queue the task
+						if (pendingQueue.length >= maxQueueSize) {
+							subdelegateTrackers.delete(flashTaskId);
+							subdelegateReverseMap.delete(msg.id);
+							sendJson(socket, { type: "subdelegate-response", id: msg.id, error: `All flash workers busy and queue full (${pendingQueue.length}/${maxQueueSize}). Retry later.`, code: "QUEUE_FULL" });
+							return;
+						}
+						// Enqueue for flash tier
+						pendingQueue.push({
+							id: flashTaskId,
+							task: msg.task,
+							step: msg.step,
+							plan: msg.plan,
+							context: msg.context,
+							tier: "flash",
+							ctx,
+							resolve: (result) => {
+								const tracker = subdelegateTrackers.get(flashTaskId);
+								subdelegateTrackers.delete(flashTaskId);
+								subdelegateReverseMap.delete(msg.id);
+								pendingUpdates.delete(flashTaskId);
+								taskWorkerMap.delete(flashTaskId);
+								if (tracker && !tracker.requesterSocket.destroyed) {
+									const response: SocketMsg = {
+										type: "subdelegate-response",
+										id: tracker.subdelegateId,
+									};
+									if (result.isError) {
+										response.error = result.content?.[0]?.text || "Unknown error";
+										response.code = result.details?.code || "ERROR";
+									} else {
+										response.explanation = result.content?.[0]?.text || "(no explanation)";
+										response.diff = result.details?.diff || "";
+										response.filesChanged = result.details?.filesChanged || [];
+										response.bashResults = result.details?.bashResults || [];
+									}
+									sendJson(tracker.requesterSocket, response);
+								}
+							},
+							signal: undefined,
+							cwd,
+						});
+						writeControlFileBusy(cwd);
+						return;
+					}
+					// Dispatch to idle flash worker
+					const flashWorkerId = idle.workerId;
+					const flashConn = idle.connection;
+					flashConn.busy = true;
+					flashConn.taskId = flashTaskId;
+					taskWorkerMap.set(flashTaskId, flashWorkerId);
+					writeControlFileBusy(cwd);
+					const { config } = loadConfig();
+					if (msg.plan) {
+						const planPath = getPlanPath(cwd);
+						ensureDir(dirname(planPath));
+						writeFileSync(planPath, msg.plan, "utf-8");
+					}
+					const timeoutId = setTimeout(() => {
+						const tracker = subdelegateTrackers.get(flashTaskId);
+						subdelegateTrackers.delete(flashTaskId);
+						if (tracker) subdelegateReverseMap.delete(tracker.subdelegateId);
+						pendingResolvers.delete(flashTaskId);
+						pendingUpdates.delete(flashTaskId);
+						taskWorkerMap.delete(flashTaskId);
+						if (workerPool.has(flashWorkerId)) {
+							const conn = workerPool.get(flashWorkerId)!;
+							conn.busy = false;
+							conn.taskId = null;
+							dispatchNextQueued(flashWorkerId, conn, ctx);
+						}
+						writeControlFileIdle(cwd);
+						if (tracker && !tracker.requesterSocket.destroyed) {
+							sendJson(tracker.requesterSocket, {
+								type: "subdelegate-response",
+								id: tracker.subdelegateId,
+								error: `Subdelegate timeout after ${config.timeout}s`,
+								code: "TIMEOUT",
+							});
+						}
+						if (!flashConn.socket.destroyed) {
+							sendJson(flashConn.socket, { type: "abort", id: flashTaskId });
+						}
+					}, Math.max(1, config.timeout) * 1000);
+					pendingResolvers.set(flashTaskId, (resultMsg) => {
+						clearTimeout(timeoutId);
+						const tracker = subdelegateTrackers.get(flashTaskId);
+						subdelegateTrackers.delete(flashTaskId);
+						if (tracker) subdelegateReverseMap.delete(tracker.subdelegateId);
+						pendingUpdates.delete(flashTaskId);
+						taskWorkerMap.delete(flashTaskId);
+						if (workerPool.has(flashWorkerId)) {
+							const conn = workerPool.get(flashWorkerId)!;
+							conn.busy = false;
+							conn.taskId = null;
+							dispatchNextQueued(flashWorkerId, conn, ctx);
+						}
+						writeControlFileIdle(cwd);
+						if (tracker && !tracker.requesterSocket.destroyed) {
+							if (resultMsg.type === "error") {
+								sendJson(tracker.requesterSocket, {
+									type: "subdelegate-response",
+									id: tracker.subdelegateId,
+									error: resultMsg.message || "Worker error",
+									code: resultMsg.code || "ERROR",
+								});
+							} else {
+								sendJson(tracker.requesterSocket, {
+									type: "subdelegate-response",
+									id: tracker.subdelegateId,
+									explanation: resultMsg.explanation || "(no explanation)",
+									diff: resultMsg.diff || "",
+									filesChanged: resultMsg.filesChanged || [],
+									bashResults: resultMsg.bashResults || [],
+								});
+							}
+						}
+					});
+					sendJson(flashConn.socket, {
+						type: "task",
+						id: flashTaskId,
+						task: msg.task,
+						step: msg.step,
+						plan: msg.plan,
+						context: msg.context,
+					});
+					return;
+				}
+				// ── Abort pending subdelegate (from strong worker) ─────────
+				if (msg.type === "abort" && msg.id && subdelegateReverseMap.has(msg.id)) {
+					// First check if it's still in the queue (not yet dispatched)
+					if (removeQueuedSubdelegate(msg.id)) {
+						// Was queued, no flash worker to abort
+						writeControlFileIdle(cwd);
+						return;
+					}
+					// Already dispatched, abort the flash worker
+					const flashTaskId = subdelegateReverseMap.get(msg.id)!;
+					const tracker = subdelegateTrackers.get(flashTaskId);
+					const flashWorkerId = taskWorkerMap.get(flashTaskId);
+					subdelegateTrackers.delete(flashTaskId);
+					subdelegateReverseMap.delete(msg.id);
+					pendingResolvers.delete(flashTaskId);
+					pendingUpdates.delete(flashTaskId);
+					taskWorkerMap.delete(flashTaskId);
+					// Abort the flash worker
+					if (flashWorkerId && workerPool.has(flashWorkerId)) {
+						const conn = workerPool.get(flashWorkerId)!;
+						conn.busy = false;
+						conn.taskId = null;
+						if (!conn.socket.destroyed) {
+							sendJson(conn.socket, { type: "abort", id: flashTaskId });
+						}
+						dispatchNextQueued(flashWorkerId, conn, ctx);
+					}
+					writeControlFileIdle(cwd);
+					// Notify strong worker that subdelegate was aborted
+					if (tracker && !tracker.requesterSocket.destroyed) {
+						sendJson(tracker.requesterSocket, {
+							type: "subdelegate-response",
+							id: tracker.subdelegateId,
+							error: "Subdelegate aborted by requester",
+							code: "ABORTED",
+						});
+					}
+					return;
+				}
 				// ── Result / Error / Status messages ────────────────
 				if ((msg.type === "result" || msg.type === "error") && msg.id) {
 					const resolve = pendingResolvers.get(msg.id);
@@ -893,6 +1146,28 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 		socket.on("close", () => {
 			if (assignedWorkerId && workerPool.has(assignedWorkerId)) {
 				const tier = workerPool.get(assignedWorkerId)!.tier;
+				// Remove any queued subdelegates initiated by this worker (if strong)
+				removeQueuedSubdelegatesByRequester(assignedWorkerId);
+				// Clean up any subdelegates initiated by this worker (if strong)
+				for (const [flashTaskId, tracker] of subdelegateTrackers) {
+					if (tracker.requesterWorkerId === assignedWorkerId) {
+						subdelegateTrackers.delete(flashTaskId);
+						subdelegateReverseMap.delete(tracker.subdelegateId);
+						pendingResolvers.delete(flashTaskId);
+						pendingUpdates.delete(flashTaskId);
+						const flashWorkerId = taskWorkerMap.get(flashTaskId);
+						taskWorkerMap.delete(flashTaskId);
+						if (flashWorkerId && workerPool.has(flashWorkerId)) {
+							const conn = workerPool.get(flashWorkerId)!;
+							conn.busy = false;
+							conn.taskId = null;
+							if (!conn.socket.destroyed) {
+								sendJson(conn.socket, { type: "abort", id: flashTaskId });
+							}
+							dispatchNextQueued(flashWorkerId, conn, ctx);
+						}
+					}
+				}
 				workerPool.delete(assignedWorkerId);
 				ctx.ui.notify(`Worker ${assignedWorkerId} [${tier}] disconnected (${workerPool.size}/${maxWorkers})`, "warning");
 				ctx.ui.setStatus(
@@ -1152,6 +1427,16 @@ async function connectWorker(
 }
 
 function disconnectWorker(ctx: ExtensionContext): void {
+	// Fail any pending subdelegate responses
+	for (const [subdelegateId, waiter] of subdelegateWaiters) {
+		clearTimeout(waiter.timeoutId);
+		waiter.resolve({
+			content: [{ type: "text", text: "Worker stopped, subdelegate aborted" }],
+			isError: true,
+			details: { code: "WORKER_STOPPED" },
+		});
+	}
+	subdelegateWaiters.clear();
 	if (workerSocket) {
 		try { workerSocket.destroy(); } catch { /* ignore */ }
 		workerSocket = null;
@@ -1173,7 +1458,44 @@ function buildWorkerPrompt(task: string, step?: number, plan?: string, context?:
 
 function createWorkerHandler(pi: ExtensionAPI) {
 	return async (msg: SocketMsg, socket: Socket, ctx: ExtensionContext): Promise<void> => {
+		// ── Worker-side: handle subdelegate-response from mind ──
+		if (msg.type === "subdelegate-response") {
+			const waiter = subdelegateWaiters.get(msg.id);
+			if (!waiter) return; // timeout or already resolved
+			clearTimeout(waiter.timeoutId);
+			subdelegateWaiters.delete(msg.id);
+			if (msg.error) {
+				waiter.resolve({
+					content: [{ type: "text", text: msg.error }],
+					isError: true,
+					details: { code: msg.code || "SUBDELEGATE_ERROR" },
+				});
+			} else {
+				waiter.resolve({
+					content: [{ type: "text", text: msg.explanation || "(no explanation)" }],
+					details: {
+						diff: msg.diff || "",
+						filesChanged: msg.filesChanged || [],
+						bashResults: msg.bashResults || [],
+					},
+				});
+			}
+			return;
+		}
 		if (msg.type === "abort") {
+			// Abort any pending subdelegates
+			for (const [subdelId, waiter] of subdelegateWaiters) {
+				clearTimeout(waiter.timeoutId);
+				waiter.resolve({
+					content: [{ type: "text", text: "Parent task aborted, subdelegate aborted" }],
+					isError: true,
+					details: { code: "ABORTED" },
+				});
+				if (workerSocket && !workerSocket.destroyed) {
+					sendJson(workerSocket, { type: "abort", id: subdelId });
+				}
+			}
+			subdelegateWaiters.clear();
 			if (workerBusy) {
 				ctx.abort();
 				workerBusy = false;
@@ -1457,6 +1779,63 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 			tier: Type.Optional(Type.String({ description: "Worker tier: 'flash' for simple/scoped tasks, 'strong' for complex/deep reasoning. Omit or 'auto' for any idle worker." })),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			// ── Worker-side subdelegation (strong worker → mind → flash worker) ──
+			if (currentRole === "worker") {
+				// Only strong-tier workers may subdelegate
+				if (LAUNCHER_WORKER_TIER !== "strong") {
+					return { content: [{ type: "text", text: "delegate blocked: only strong-tier workers may delegate. Flash workers cannot delegate." }], isError: true };
+				}
+				if (!workerSocket || workerSocket.destroyed) {
+					return { content: [{ type: "text", text: "delegate blocked: worker not connected to mind. Cannot subdelegate." }], isError: true };
+				}
+				// Enforce flash-only targeting
+				const targetTier = params.tier?.trim();
+				if (targetTier && targetTier !== "flash" && targetTier !== "auto") {
+					return { content: [{ type: "text", text: `delegate blocked: strong workers can only delegate to flash tier. Got: "${targetTier}". Omit tier or use "flash" or "auto".` }], isError: true };
+				}
+				if (!params.task?.trim()) {
+					return { content: [{ type: "text", text: "task is required" }], isError: true };
+				}
+				const subdelegateId = `subdel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+				const { config } = loadConfig();
+				return new Promise((resolve) => {
+					const timeoutId = setTimeout(() => {
+						subdelegateWaiters.delete(subdelegateId);
+						resolve({
+							content: [{ type: "text", text: `Subdelegate timeout after ${config.timeout}s` }],
+							isError: true,
+							details: { code: "TIMEOUT" },
+						});
+					}, Math.max(1, config.timeout) * 1000);
+					subdelegateWaiters.set(subdelegateId, { resolve, timeoutId });
+					sendJson(workerSocket!, {
+						type: "subdelegate-request",
+						id: subdelegateId,
+						task: params.task,
+						step: params.step,
+						plan: params.plan,
+						context: params.context,
+						tier: "flash",
+						requesterWorkerId: LAUNCHER_WORKER_ID || undefined,
+						requesterTaskId: workerTaskId || undefined,
+					});
+					if (signal) {
+						const onAbort = () => {
+							const waiter = subdelegateWaiters.get(subdelegateId);
+							if (waiter) {
+								clearTimeout(waiter.timeoutId);
+								subdelegateWaiters.delete(subdelegateId);
+							}
+							if (workerSocket && !workerSocket.destroyed) {
+								sendJson(workerSocket, { type: "abort", id: subdelegateId });
+							}
+							resolve({ content: [{ type: "text", text: "Subdelegate aborted" }], isError: true });
+						};
+						if (signal.aborted) onAbort();
+						else signal.addEventListener("abort", onAbort, { once: true });
+					}
+				});
+			}
 			if (currentRole !== "mind") {
 				return { content: [{ type: "text", text: "delegate only in mind mode. Run /be-mind first." }], isError: true };
 			}
@@ -1747,6 +2126,23 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (event) => {
+		// ── Strong worker: inject subdelegate capability prompt ──
+		if ((currentRole === "worker" || launcherBootHint === "worker") && LAUNCHER_WORKER_TIER === "strong") {
+			return {
+				systemPrompt:
+					event.systemPrompt +
+					"\n\n[STRONG WORKER MODE]\n" +
+					"You are a strong-tier worker with deep reasoning capabilities.\n" +
+					"You have access to the `delegate` tool to subdelegate scoped tasks to flash workers.\n" +
+					"Use delegate(tier='flash') for: simple file reads, grep/ripgrep searches, single-file edits, test runs, builds, or any scoped/fast task.\n" +
+					"You handle: multi-file refactors, architecture decisions, complex debugging, correctness-sensitive work.\n" +
+					"Flash workers cannot delegate further — you are the top of the worker delegation chain.\n" +
+					"Parallel-by-default: if your task has multiple independent subtasks, fan out to flash workers immediately.\n" +
+					"When subdelegating, provide clear, scoped task descriptions. Flash workers work best with focused, single-purpose tasks.\n" +
+					"After flash workers complete, merge their results and continue with your own deep reasoning work.\n" +
+					"Never attempt to delegate to 'strong' tier — only flash workers are available for subdelegation.\n",
+			};
+		}
 		if (currentRole !== "mind" && launcherBootHint !== "mind") return;
 		const cwd = event.systemPromptOptions?.cwd || process.cwd();
 		const planPath = getPlanPath(cwd);
