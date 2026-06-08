@@ -40,6 +40,11 @@ interface MindWorkerConfig {
 	kittyEnabled: boolean;
 	workerCount: number;
 	workerModels?: Array<{ model: string; count: number; tier?: string }>;
+	dashboardEnabled: boolean;
+	dashboardRetention: number;
+	dashboardHeartbeatMs: number;
+	dashboardStaleMs: number;
+	dashboardLogResponses: boolean;
 }
 
 interface SocketMsg {
@@ -80,6 +85,11 @@ const DEFAULT_CONFIG: MindWorkerConfig = {
 	kittyEnabled: true,
 	workerCount: 3,
 	workerModels: undefined,
+	dashboardEnabled: true,
+	dashboardRetention: 200,
+	dashboardHeartbeatMs: 10000,
+	dashboardStaleMs: 30000,
+	dashboardLogResponses: true,
 };
 
 const MIND_ALLOWED_TOOLS = ["delegate", "read", "git", "ripgrep"];
@@ -218,6 +228,137 @@ let lastNotificationFingerprint = "";
 let lastNotificationTime = 0;
 const NOTIFICATION_COOLDOWN_MS = 10_000;
 
+// ── Dashboard support ────────────────────────────────────────────────────────
+
+interface TaskMetadata {
+	startedAt: number;
+	description: string;
+	tier: string;
+	workerId: string;
+	cwd: string;
+}
+const taskMetadataMap = new Map<string, TaskMetadata>();
+
+let dashboardHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let lastDashboardStatus = "";
+let lastDashboardCwd = "";
+
+function getResultsLogPath(cwd: string): string {
+	return join(getStateDir(), `${getCwdHash(cwd)}-results.jsonl`);
+}
+
+function getResponsesLogPath(cwd: string): string {
+	return join(getStateDir(), `${getCwdHash(cwd)}-responses.jsonl`);
+}
+
+/** Track task metadata for dashboard result logging. Call when dispatching a task. */
+function trackTaskStart(taskId: string, workerId: string, tier: string, description: string, cwd: string): void {
+	taskMetadataMap.set(taskId, { startedAt: Date.now(), description, tier, workerId, cwd });
+}
+
+/** Log delegate result to *-results.jsonl. Call when a task resolves. Returns void. */
+function logDelegateResult(
+	taskId: string, 
+	status: string, 
+	summary: string,
+	details?: {
+		filesChanged?: string[];
+		diffLength?: number;
+		bashExitCodes?: number[];
+		bashCount?: number;
+	}
+): void {
+	const meta = taskMetadataMap.get(taskId);
+	if (!meta) return;
+	taskMetadataMap.delete(taskId);
+	try {
+		const { config } = loadConfig();
+		if (!config.dashboardEnabled || !config.dashboardLogResponses) return;
+		const entry: Record<string, unknown> = {
+			timestamp: Date.now(),
+			taskId,
+			workerId: meta.workerId,
+			tier: meta.tier,
+			durationMs: Date.now() - meta.startedAt,
+			status,
+			summary: summary.slice(0, 4096),
+		};
+		if (details?.filesChanged) entry.filesChanged = details.filesChanged;
+		if (details?.diffLength !== undefined) entry.diffLength = details.diffLength;
+		if (details?.bashExitCodes) entry.bashExitCodes = details.bashExitCodes;
+		if (details?.bashCount !== undefined) entry.bashCount = details.bashCount;
+		appendJsonlEntry(getResultsLogPath(meta.cwd), entry, config.dashboardRetention);
+	} catch {
+		// Best-effort
+	}
+}
+
+/** Log mind response to *-responses.jsonl at agent_end. Caps text at ~4KB. */
+function logMindResponse(cwd: string, text: string): void {
+	try {
+		const { config } = loadConfig();
+		if (!config.dashboardEnabled || !config.dashboardLogResponses) return;
+		const capped = text.slice(0, 4096);
+		const entry = {
+			timestamp: Date.now(),
+			textLength: text.length,
+			text: capped,
+			truncated: text.length > 4096,
+		};
+		appendJsonlEntry(getResponsesLogPath(cwd), entry, config.dashboardRetention);
+	} catch {
+		// Best-effort
+	}
+}
+
+/** Append a JSON entry to a JSONL file and trim to maxEntries. */
+function appendJsonlEntry(filePath: string, entry: Record<string, unknown>, maxEntries: number): void {
+	ensureDir(dirname(filePath));
+	try {
+		let lines: string[] = [];
+		try {
+			const existing = readFileSync(filePath, "utf-8");
+			lines = existing.split("\n").filter(l => l.trim());
+		} catch {
+			/* file may not exist */
+		}
+		lines.push(JSON.stringify(entry));
+		// Trim to maxEntries (retain last N)
+		if (lines.length > maxEntries) {
+			lines = lines.slice(lines.length - maxEntries);
+		}
+		const tmpPath = filePath + ".tmp";
+		writeFileSync(tmpPath, lines.join("\n") + "\n", "utf-8");
+		renameSync(tmpPath, filePath);
+	} catch {
+		// Best-effort
+	}
+}
+
+/** Start dashboard heartbeat timer. Writes control file status periodically. */
+function startDashboardHeartbeat(cwd: string): void {
+	stopDashboardHeartbeat();
+	const { config } = loadConfig();
+	if (!config.dashboardEnabled) return;
+	lastDashboardCwd = cwd;
+	dashboardHeartbeatTimer = setInterval(() => {
+		// Re-write current status to update lastHeartbeat
+		if (lastDashboardStatus && lastDashboardCwd === cwd) {
+			writeControlFileStatus(cwd, lastDashboardStatus);
+		}
+	}, config.dashboardHeartbeatMs);
+}
+
+/** Stop dashboard heartbeat timer. */
+function stopDashboardHeartbeat(): void {
+	if (dashboardHeartbeatTimer) {
+		clearInterval(dashboardHeartbeatTimer);
+		dashboardHeartbeatTimer = null;
+	}
+	lastDashboardStatus = "";
+	lastDashboardCwd = "";
+}
+
 function getCwdHash(cwd: string): string {
 	return createHash("sha256").update(cwd).digest("hex").slice(0, 16);
 }
@@ -265,6 +406,9 @@ function writeControlFileStatus(cwd: string, status: string, message?: string): 
 	// Stop phase: supervisor owns status, extension must not write
 	if (isStopPhase(cwd)) return;
 
+	// Track last status for heartbeat writes
+	lastDashboardStatus = status;
+
 	const controlPath = getControlFilePath(cwd);
 	const manifest = readManifest(cwd);
 	const generation = manifest?.generation ?? 0;
@@ -290,6 +434,52 @@ function writeControlFileStatus(cwd: string, status: string, message?: string): 
 			data.connectedWorkers = activeWorkers;
 		}
 		data.expectedWorkers = maxWorkers;
+
+		// Dashboard extension: add schema v2 fields when dashboardEnabled
+		try {
+			const { config } = loadConfig();
+			if (config.dashboardEnabled) {
+				data.schemaVersion = 2;
+				data.lastHeartbeat = Date.now();
+				
+				// activeTasks: currently executing tasks
+				const activeTasks: Array<{ taskId: string; workerId: string; tier: string; startedAt?: number; description?: string }> = [];
+				for (const [taskId, workerId] of taskWorkerMap.entries()) {
+					const conn = workerPool.get(workerId);
+					if (conn && !conn.socket.destroyed) {
+						const meta = taskMetadataMap.get(taskId);
+						activeTasks.push({
+							taskId,
+							workerId,
+							tier: conn.tier,
+							startedAt: meta?.startedAt,
+							description: meta?.description?.slice(0, 100),
+						});
+					}
+				}
+				data.activeTasks = activeTasks;
+				
+				// queuedTasks: pending tasks in queue
+				data.queuedTasks = pendingQueue.map(q => ({
+					id: q.id,
+					tier: q.tier || "any",
+					description: q.task.slice(0, 100),
+				}));
+				
+				// workers: all connected workers with status
+				data.workers = [...workerPool.values()]
+					.filter(w => !w.socket.destroyed)
+					.map(w => ({
+						workerId: w.workerId,
+						tier: w.tier,
+						busy: w.busy,
+						taskId: w.taskId,
+						connectedAt: w.connectedAt,
+					}));
+			}
+		} catch {
+			// Best-effort: if config load fails, skip dashboard fields
+		}
 
 		// If caller explicitly passed a message, use it (overrides existing)
 		if (message !== undefined) {
@@ -440,6 +630,15 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 		if (parsed.workerCount !== undefined && (typeof parsed.workerCount !== "number" || parsed.workerCount < 1 || parsed.workerCount > 10)) {
 			console.warn("[mind-worker] workerCount must be 1-10 — using default 3");
 		}
+		if (parsed.dashboardRetention !== undefined && (typeof parsed.dashboardRetention !== "number" || parsed.dashboardRetention < 1)) {
+			console.warn("[mind-worker] dashboardRetention must be a positive number — using default 200");
+		}
+		if (parsed.dashboardHeartbeatMs !== undefined && (typeof parsed.dashboardHeartbeatMs !== "number" || parsed.dashboardHeartbeatMs < 1000)) {
+			console.warn("[mind-worker] dashboardHeartbeatMs must be >= 1000 — using default 10000");
+		}
+		if (parsed.dashboardStaleMs !== undefined && (typeof parsed.dashboardStaleMs !== "number" || parsed.dashboardStaleMs < 3000)) {
+			console.warn("[mind-worker] dashboardStaleMs must be >= 3000 — using default 30000");
+		}
 
 		const wc = typeof parsed.workerCount === "number" && parsed.workerCount >= 1 && parsed.workerCount <= 10
 			? parsed.workerCount : DEFAULT_CONFIG.workerCount;
@@ -459,6 +658,14 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 				? parsed.kittyEnabled : DEFAULT_CONFIG.kittyEnabled,
 			workerCount: wc,
 			workerModels: parsed.workerModels,
+			dashboardEnabled: parsed.dashboardEnabled !== false,
+			dashboardRetention: typeof parsed.dashboardRetention === "number" && parsed.dashboardRetention >= 1
+				? parsed.dashboardRetention : DEFAULT_CONFIG.dashboardRetention,
+			dashboardHeartbeatMs: typeof parsed.dashboardHeartbeatMs === "number" && parsed.dashboardHeartbeatMs >= 1000
+				? parsed.dashboardHeartbeatMs : DEFAULT_CONFIG.dashboardHeartbeatMs,
+			dashboardStaleMs: typeof parsed.dashboardStaleMs === "number" && parsed.dashboardStaleMs >= 3000
+				? parsed.dashboardStaleMs : DEFAULT_CONFIG.dashboardStaleMs,
+			dashboardLogResponses: parsed.dashboardLogResponses !== false,
 		};
 		const resolved = resolveWorkerModels(config);
 		return { config, created: false, resolvedWorkers: resolved };
@@ -690,6 +897,7 @@ function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx:
 	connection.busy = true;
 	connection.taskId = id;
 	taskWorkerMap.set(id, workerId);
+	trackTaskStart(id, workerId, connection.tier, entry.task.slice(0, 100), entry.cwd);
 
 	if (entry.onUpdate) pendingUpdates.set(id, entry.onUpdate);
 
@@ -719,6 +927,7 @@ function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx:
 			dispatchNextQueued(workerId, conn, ctx);
 		}
 		writeControlFileIdle(entry.cwd);
+		logDelegateResult(id, "timeout", `Worker "${workerId}" timeout after ${config.timeout}s`);
 		entry.resolve({
 			content: [{ type: "text", text: `Worker "${workerId}" timeout after ${config.timeout}s` }],
 			isError: true,
@@ -732,6 +941,15 @@ function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx:
 		pendingUpdates.delete(id);
 		taskWorkerMap.delete(id);
 		writeControlFileIdle(entry.cwd);
+		const status = msg.type === "result" ? "completed" : "error";
+		const summary = msg.explanation || msg.message || "(no result)";
+		const details = {
+			filesChanged: msg.filesChanged,
+			diffLength: msg.diff?.length,
+			bashExitCodes: msg.bashResults?.map(r => r.exitCode),
+			bashCount: msg.bashResults?.length,
+		};
+		logDelegateResult(id, status, summary, details);
 		if (msg.type === "result") {
 			entry.resolve({
 				content: [{ type: "text", text: msg.explanation || "(no explanation)" }],
@@ -780,6 +998,7 @@ function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx:
 				dispatchNextQueued(workerId, conn, ctx);
 			}
 			writeControlFileIdle(entry.cwd);
+			logDelegateResult(id, "aborted", "Task aborted");
 			entry.resolve({ content: [{ type: "text", text: "Task aborted" }], isError: true });
 		};
 		if (entry.signal.aborted) onAbort();
@@ -1199,7 +1418,7 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 					pendingQueue.length = 0;
 				}
 			}
-			if (LAUNCHER_ROLE_FLAG === "mind") {
+			if (LAUNCHER_ROLE_FLAG === "mind" && assignedWorkerId) {
 				writeControlFileWorkerConnected(cwd);
 			}
 		});
@@ -1224,7 +1443,7 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 					pendingQueue.length = 0;
 				}
 			}
-			if (LAUNCHER_ROLE_FLAG === "mind") {
+			if (LAUNCHER_ROLE_FLAG === "mind" && assignedWorkerId) {
 				writeControlFileWorkerConnected(cwd);
 			}
 		});
@@ -1244,6 +1463,7 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 }
 
 function stopMindServer(cwd: string, ctx: ExtensionContext): void {
+	stopDashboardHeartbeat();
 	// Fail queued tasks first
 	failPendingTasks("Mind stopped", "STOP");
 	// Destroy all worker connections
@@ -1615,6 +1835,7 @@ async function activateMindRole(ctx: ExtensionContext, pi: ExtensionAPI): Promis
 	pi.setActiveTools(MIND_ALLOWED_TOOLS);
 	currentRole = "mind";
 	startMindServer(ctx.cwd, ctx);
+	startDashboardHeartbeat(ctx.cwd);
 	await setModelFromId(pi, ctx, config.mindModel);
 
 	try {
@@ -1932,6 +2153,7 @@ async function executeFanout(
 			worker.connection.busy = true;
 			worker.connection.taskId = taskId;
 			taskWorkerMap.set(taskId, worker.workerId);
+			trackTaskStart(taskId, worker.workerId, worker.connection.tier, lane.prompt.slice(0, 100), ctx.cwd);
 
 			if (onUpdate) {
 				pendingUpdates.set(taskId, onUpdate);
@@ -1964,6 +2186,7 @@ async function executeFanout(
 					worker.connection.taskId = null;
 					dispatchNextQueued(worker.workerId, worker.connection, ctx);
 					writeControlFileIdle(ctx.cwd);
+					logDelegateResult(taskId, "timeout", `Timeout after ${config.timeout}s`);
 					resolveOnce({
 						lane: lane.label,
 						workerId: worker.workerId,
@@ -1976,6 +2199,15 @@ async function executeFanout(
 				pendingResolvers.set(taskId, (msg) => {
 					// Normal completion: socket handler already marked worker idle + dispatched next queued
 					// Must NOT mark worker idle or dispatch queued here
+					const status = msg.type === "error" ? "error" : "completed";
+					const summary = msg.explanation || msg.message || "(no result)";
+					const details = {
+						filesChanged: msg.filesChanged,
+						diffLength: msg.diff?.length,
+						bashExitCodes: msg.bashResults?.map(r => r.exitCode),
+						bashCount: msg.bashResults?.length,
+					};
+					logDelegateResult(taskId, status, summary, details);
 					resolveOnce({
 						lane: lane.label,
 						workerId: worker.workerId,
@@ -2007,6 +2239,7 @@ async function executeFanout(
 					}
 					dispatchNextQueued(worker.workerId, worker.connection, ctx);
 					writeControlFileIdle(ctx.cwd);
+					logDelegateResult(taskId, "aborted", "Task aborted");
 					resolveOnce({
 						lane: lane.label,
 						workerId: worker.workerId,
@@ -2291,6 +2524,7 @@ async function executeFanout(
 			connection.busy = true;
 			connection.taskId = id;
 			taskWorkerMap.set(id, targetWorkerId);
+			trackTaskStart(id, targetWorkerId, connection.tier, params.task.slice(0, 100), ctx.cwd);
 			writeControlFileBusy(ctx.cwd);
 
 			return new Promise((resolve) => {
@@ -2314,6 +2548,7 @@ async function executeFanout(
 						dispatchNextQueued(targetWorkerId, conn, ctx);
 					}
 					writeControlFileIdle(ctx.cwd);
+					logDelegateResult(id, "timeout", `Worker "${targetWorkerId}" timeout after ${config.timeout}s`);
 					resolve({
 						content: [{ type: "text", text: `Worker "${targetWorkerId}" timeout after ${config.timeout}s` }],
 						isError: true,
@@ -2328,6 +2563,15 @@ async function executeFanout(
 					taskWorkerMap.delete(id);
 					// Worker already marked idle in socket data handler
 					writeControlFileIdle(ctx.cwd);
+					const status = msg.type === "result" ? "completed" : "error";
+					const summary = msg.explanation || msg.message || "(no result)";
+					const details = {
+						filesChanged: msg.filesChanged,
+						diffLength: msg.diff?.length,
+						bashExitCodes: msg.bashResults?.map(r => r.exitCode),
+						bashCount: msg.bashResults?.length,
+					};
+					logDelegateResult(id, status, summary, details);
 					if (msg.type === "result") {
 						resolve({
 							content: [{ type: "text", text: msg.explanation || "(no explanation)" }],
@@ -2376,6 +2620,7 @@ async function executeFanout(
 							dispatchNextQueued(targetWorkerId, conn, ctx);
 						}
 						writeControlFileIdle(ctx.cwd);
+						logDelegateResult(id, "aborted", "Task aborted");
 						resolve({ content: [{ type: "text", text: "Task aborted" }], isError: true });
 					};
 					if (signal.aborted) onAbort();
@@ -2562,6 +2807,12 @@ async function executeFanout(
 		if (currentRole === "mind") {
 			const { config } = loadConfig();
 			const summary = extractLastAssistantText(event.messages);
+			
+			// Log mind response to JSONL for dashboard (respects dashboardEnabled + dashboardLogResponses)
+			if (summary) {
+				logMindResponse(ctx.cwd, summary);
+			}
+			
 			// Restore idle control-file status after processing completes
 			writeControlFileIdle(ctx.cwd);
 			await sendMindIdleNotification(config, ctx, summary);

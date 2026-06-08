@@ -13,5 +13,10 @@
   "workerModel": "opencode-go/deepseek-v4-flash",
   "resetTimeout": 5,
   "kittyEnabled": true,
-  "workerCount": 3
+  "workerCount": 3,
+  "dashboardEnabled": true,
+  "dashboardLogResponses": true,
+  "dashboardRetention": 200,
+  "dashboardHeartbeatMs": 10000,
+  "dashboardStaleMs": 30000
 }
