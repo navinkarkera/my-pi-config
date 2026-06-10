@@ -2028,33 +2028,33 @@ function generateLanes(intent: string, task: string): FanoutLane[] {
 	switch (intent) {
 		case "review":
 			return [
-				{ label: "deep-review", tier: "strong", prompt: `[Deep Review Lane]\n${task}\n\nFocus: correctness, design, security, edge cases.\nReturn structured output:\n- **Findings**: list with severity (critical/high/medium/low), confidence (high/medium/low), evidence (file:line).\n- **Risks/Unknowns**: what could go wrong, what's unclear.\n- **No edits** — read-only analysis.` },
-				{ label: "test-evidence", tier: "flash", prompt: `[Test & Evidence Lane]\n${task}\n\nFocus: run tests, check test coverage gaps, verify assertions.\nReturn structured output:\n- **Tests/Commands Run**: list with exit codes and key output.\n- **Coverage Risks**: untested paths, missing assertions.\n- **No edits** — read-only analysis.` },
-				{ label: "config-risks", tier: "flash", prompt: `[Config & Risky Patterns Lane]\n${task}\n\nFocus: configuration issues, risky patterns (hardcoded secrets, missing validation, unsafe ops).\nReturn structured output:\n- **Findings**: list with severity, confidence, evidence (file:line).\n- **Risks/Unknowns**: insecure defaults, missing env vars.\n- **No edits** — read-only analysis.` },
+				{ label: "deep-review", tier: "strong", prompt: `[Deep Review Lane]\nTask: ${task}\n\nSCOPE: Correctness, design, security, edge cases. Read-only analysis.\nDO NOT: Run tests, check coverage, analyze config — other lanes handle those.\nReturn structured output:\n- **Findings**: list with severity (critical/high/medium/low), confidence (high/medium/low), evidence (file:line).\n- **Risks/Unknowns**: what could go wrong, what's unclear.` },
+				{ label: "test-evidence", tier: "flash", prompt: `[Test & Evidence Lane]\nTask: ${task}\n\nSCOPE: Run tests, check test coverage gaps, verify assertions. Read-only analysis.\nDO NOT: Review design/security, analyze config — other lanes handle those.\nReturn structured output:\n- **Tests/Commands Run**: list with exit codes and key output.\n- **Coverage Risks**: untested paths, missing assertions.` },
+				{ label: "config-risks", tier: "flash", prompt: `[Config & Risky Patterns Lane]\nTask: ${task}\n\nSCOPE: Configuration issues, risky patterns (hardcoded secrets, missing validation, unsafe ops). Read-only analysis.\nDO NOT: Review design/security, run tests — other lanes handle those.\nReturn structured output:\n- **Findings**: list with severity, confidence, evidence (file:line).\n- **Risks/Unknowns**: insecure defaults, missing env vars.` },
 			];
 		case "test":
 			return [
-				{ label: "test-discovery", tier: "flash", prompt: `[Test Discovery Lane]\n${task}\n\nFocus: find all test files, test scripts, build/package scripts.\nReturn:\n- **Inventory**: list of test files and how to run them.\n- **Build/Package Scripts**: relevant commands from package.json or similar.` },
-				{ label: "run-tests", tier: "flash", prompt: `[Run Tests Lane]\n${task}\n\nFocus: run targeted tests, identify failing tests, capture output.\nReturn:\n- **Commands Run**: exact commands with exit codes.\n- **Failures**: list of failing tests with error messages.` },
-				{ label: "coverage-config", tier: "flash", prompt: `[Coverage & Config Lane]\n${task}\n\nFocus: check test coverage config, missing test configs, flaky test patterns.\nReturn:\n- **Risks/Unknowns**: coverage gaps, config issues, potential flakiness.` },
+				{ label: "test-discovery", tier: "flash", prompt: `[Test Discovery Lane]\nTask: ${task}\n\nSCOPE: Find all test files, test scripts, build/package scripts.\nDO NOT: Run tests, check coverage — other lanes handle those.\nReturn:\n- **Inventory**: list of test files and how to run them.\n- **Build/Package Scripts**: relevant commands from package.json or similar.` },
+				{ label: "run-tests", tier: "flash", prompt: `[Run Tests Lane]\nTask: ${task}\n\nSCOPE: Run targeted tests, identify failing tests, capture output.\nDO NOT: Discover test files, check coverage config — other lanes handle those.\nReturn:\n- **Commands Run**: exact commands with exit codes.\n- **Failures**: list of failing tests with error messages.` },
+				{ label: "coverage-config", tier: "flash", prompt: `[Coverage & Config Lane]\nTask: ${task}\n\nSCOPE: Check test coverage config, missing test configs, flaky test patterns.\nDO NOT: Run tests, discover test files — other lanes handle those.\nReturn:\n- **Risks/Unknowns**: coverage gaps, config issues, potential flakiness.` },
 			];
 		case "explore":
 			return [
-				{ label: "architecture", tier: "flash", prompt: `[Architecture Map Lane]\n${task}\n\nFocus: map module boundaries, dependencies, entry points.\nReturn: concise architecture summary with file evidence (file paths).` },
-				{ label: "search-evidence", tier: "flash", prompt: `[Search & Evidence Lane]\n${task}\n\nFocus: search for key patterns, usages, implementations.\nReturn: findings with file paths and line numbers.` },
-				{ label: "docs-config", tier: "flash", prompt: `[Docs & Config Lane]\n${task}\n\nFocus: find relevant documentation, config files, READMEs.\nReturn: summary of docs/config found with file paths.` },
+				{ label: "architecture", tier: "flash", prompt: `[Architecture Map Lane]\nTask: ${task}\n\nSCOPE: Map module boundaries, dependencies, entry points.\nDO NOT: Search for specific patterns, find docs/config — other lanes handle those.\nReturn: concise architecture summary with file evidence (file paths).` },
+				{ label: "search-evidence", tier: "flash", prompt: `[Search & Evidence Lane]\nTask: ${task}\n\nSCOPE: Search for key patterns, usages, implementations.\nDO NOT: Map architecture, find docs/config — other lanes handle those.\nReturn: findings with file paths and line numbers.` },
+				{ label: "docs-config", tier: "flash", prompt: `[Docs & Config Lane]\nTask: ${task}\n\nSCOPE: Find relevant documentation, config files, READMEs.\nDO NOT: Map architecture, search for patterns — other lanes handle those.\nReturn: summary of docs/config found with file paths.` },
 			];
 		case "debug":
 		case "implement":
 			return [
-				{ label: "deep-analysis", tier: "strong", prompt: `[Deep Analysis Lane]\n${task}\n\nFocus: deep reasoning, root cause analysis, design implications.\nReturn:\n- **Analysis**: with evidence and confidence levels.\n- **Recommendations**: concrete next steps.` },
-				{ label: "evidence-gather", tier: "flash", prompt: `[Evidence Gathering Lane]\n${task}\n\nFocus: grep for relevant code, read key files, gather context.\nReturn: concise findings with file paths and line numbers.` },
-				{ label: "test-validate", tier: "flash", prompt: `[Test & Validate Lane]\n${task}\n\nFocus: run relevant tests, check current behavior.\nReturn:\n- **Commands Run**: exact commands with exit codes.\n- **Observations**: current behavior, regressions.` },
+				{ label: "deep-analysis", tier: "strong", prompt: `[Deep Analysis Lane]\nTask: ${task}\n\nSCOPE: Deep reasoning, root cause analysis, design implications.\nDO NOT: Gather evidence, run tests — other lanes handle those.\nReturn:\n- **Analysis**: with evidence and confidence levels.\n- **Recommendations**: concrete next steps.` },
+				{ label: "evidence-gather", tier: "flash", prompt: `[Evidence Gathering Lane]\nTask: ${task}\n\nSCOPE: Grep for relevant code, read key files, gather context.\nDO NOT: Deep analysis, run tests — other lanes handle those.\nReturn: concise findings with file paths and line numbers.` },
+				{ label: "test-validate", tier: "flash", prompt: `[Test & Validate Lane]\nTask: ${task}\n\nSCOPE: Run relevant tests, check current behavior.\nDO NOT: Deep analysis, gather evidence — other lanes handle those.\nReturn:\n- **Commands Run**: exact commands with exit codes.\n- **Observations**: current behavior, regressions.` },
 			];
 		default:
 			return [
-				{ label: "primary", prompt: `[Primary Lane]\n${task}\n\nReturn structured findings with evidence.` },
-				{ label: "secondary", prompt: `[Secondary Lane]\n${task}\n\nReturn structured findings with evidence.` },
+				{ label: "primary", prompt: `[Primary Lane]\nTask: ${task}\n\nSCOPE: Primary investigation angle.\nDO NOT: Duplicate work from secondary lane.\nReturn structured findings with evidence.` },
+				{ label: "secondary", prompt: `[Secondary Lane]\nTask: ${task}\n\nSCOPE: Secondary investigation angle (different from primary).\nDO NOT: Duplicate work from primary lane.\nReturn structured findings with evidence.` },
 			];
 	}
 }
@@ -2076,7 +2076,7 @@ function assignLanesToWorkers(
 		}
 	}
 
-	// Second pass: assign remaining lanes to any idle workers
+	// Second pass: assign remaining lanes to any idle workers (untiered lanes or tier mismatch fallback)
 	for (const lane of lanes) {
 		if (assignments.some(a => a.lane === lane)) continue;
 		const match = idleWorkers.find(w => !usedWorkers.has(w.workerId));
@@ -2086,17 +2086,7 @@ function assignLanesToWorkers(
 		}
 	}
 
-	// Third pass: saturate remaining idle workers with extra lanes
-	let extraIdx = 0;
-	for (const worker of idleWorkers) {
-		if (!usedWorkers.has(worker.workerId)) {
-			const baseLane = lanes[extraIdx % lanes.length];
-			assignments.push({ lane: { ...baseLane, label: `${baseLane.label}-extra-${extraIdx}` }, worker });
-			usedWorkers.add(worker.workerId);
-			extraIdx++;
-		}
-	}
-
+	// Note: extra idle workers beyond lane count remain idle — no duplicate lane saturation.
 	return assignments;
 }
 
@@ -2287,8 +2277,8 @@ async function executeFanout(
 	pi.registerTool({
 		name: "delegate",
 		label: "Delegate",
-		description: "Delegate task to worker pool. Use strategy:'auto', strategy:'fanout', or just provide intent to auto-fanout across idle workers with intent-specific lanes. intent: 'review'|'explore'|'test'|'debug'|'implement' (inferred from task keywords if omitted). Use strategy:'single' or omit strategy/intent to delegate one task to one worker. If all workers busy, task queues up to max queue size. Specify workerId to target a specific worker, or tier for a worker type.",
-		promptSnippet: "Fan-out tasks to worker pool. strategy:'auto'+intent or just intent alone auto-decomposes across idle workers.",
+		description: "Delegate task to worker pool. Use strategy:'auto' or 'fanout' to auto-decompose across idle workers with intent-specific lanes. intent: 'review'|'explore'|'test'|'debug'|'implement' selects lane type when strategy is fanout/auto (inferred from task keywords if omitted). Use strategy:'single' or omit strategy/intent to delegate one task to one worker. If all workers busy, task queues up to max queue size. Specify workerId to target a specific worker, or tier for a worker type.",
+		promptSnippet: "Fan-out tasks to worker pool. strategy:'auto' or 'fanout' auto-decomposes across idle workers. intent selects lane type.",
 		parameters: Type.Object({
 			task: Type.String({ description: "Task for worker" }),
 			step: Type.Optional(Type.Number({ description: "Step number" })),
@@ -2297,8 +2287,8 @@ async function executeFanout(
 			reset: Type.Optional(Type.Boolean({ description: "Reserved" })),
 			workerId: Type.Optional(Type.String({ description: "Target specific worker by ID. Omit for auto-routing to first idle worker." })),
 			tier: Type.Optional(Type.String({ description: "Worker tier: 'flash' for simple/scoped tasks, 'strong' for complex/deep reasoning. Omit or 'auto' for any idle worker." })),
-			strategy: Type.Optional(Type.String({ description: "Routing strategy: 'single' (default, one task to one worker), 'auto' or 'fanout' (auto-decompose and fan out to all idle workers)." })),
-			intent: Type.Optional(Type.String({ description: "Task intent for auto-fanout: 'review', 'explore', 'test', 'debug', 'implement'. Providing intent alone enables auto-fanout. Inferred from task keywords if omitted." })),
+			strategy: Type.Optional(Type.String({ description: "Routing strategy: 'single' (default, one task to one worker), 'auto' or 'fanout' (auto-decompose and fan out to all idle workers). Intent alone does NOT trigger fanout." })),
+			intent: Type.Optional(Type.String({ description: "Task intent: 'review', 'explore', 'test', 'debug', 'implement'. Only selects lane type when strategy is 'auto' or 'fanout'. Does NOT trigger fanout by itself. Inferred from task keywords when fanout is active." })),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			// ── Auto Fanout Router ──
@@ -2313,7 +2303,7 @@ async function executeFanout(
 				return { content: [{ type: "text", text: `Invalid strategy "${params.strategy}". Allowed: "single", "auto", "fanout", or omit.` }], isError: true };
 			}
 
-			const shouldFanout = strategy !== "single" && (strategy === "auto" || strategy === "fanout" || !!intentParam);
+			const shouldFanout = strategy === "auto" || strategy === "fanout";
 
 			if (shouldFanout && currentRole === "mind") {
 				if (!params.task?.trim()) {
@@ -2333,7 +2323,7 @@ async function executeFanout(
 			}
 
 			// ── Fanout guard for worker role ──
-			if (currentRole === "worker" && (strategy === "auto" || strategy === "fanout" || (strategy !== "single" && !!intentParam))) {
+			if (currentRole === "worker" && (strategy === "auto" || strategy === "fanout")) {
 				return { content: [{ type: "text", text: "Auto-fanout only available in mind mode. Strong workers can single-delegate to flash workers by omitting strategy and intent." }], isError: true, details: { code: "FANOUT_IN_WORKER" } };
 			}
 
