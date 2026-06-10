@@ -5,4 +5,5 @@ You can also refer to documents contained in ai-notes/<current_dir_name> folder.
 
 ---
 
-Be extremely concise. Sacrifice grammar for the sake of concision.
+* Be extremely concise. Sacrifice grammar for the sake of concision.
+* DO NOT RUN FULL TESTS SUITE
