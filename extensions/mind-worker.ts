@@ -1,6 +1,6 @@
 import { exec, execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, renameSync, createWriteStream } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -45,6 +45,20 @@ interface MindWorkerConfig {
 	dashboardHeartbeatMs: number;
 	dashboardStaleMs: number;
 	dashboardLogResponses: boolean;
+	burstFlash: BurstFlashConfig;
+}
+
+interface BurstFlashConfig {
+	enabled: boolean;
+	model: string;
+	maxBurst: number;
+	idleTtlMs: number;
+	maxTasksPerWorker: number;
+	launchMode: "headless" | "kitty";
+	queuePressureThreshold: number;
+	spawnWaitMs: number;
+	killTimeoutMs: number;
+	logDetail: "compact" | "full";
 }
 
 interface SocketMsg {
@@ -72,6 +86,19 @@ interface SocketMsg {
 	error?: string;
 }
 
+const DEFAULT_BURST_FLASH_CONFIG: BurstFlashConfig = {
+	enabled: true,
+	model: "opencode-go/deepseek-v4-flash",
+	maxBurst: 2,
+	idleTtlMs: 180000,
+	maxTasksPerWorker: 3,
+	launchMode: "headless",
+	queuePressureThreshold: 1,
+	spawnWaitMs: 1000,
+	killTimeoutMs: 2000,
+	logDetail: "compact",
+};
+
 const DEFAULT_CONFIG: MindWorkerConfig = {
 	mindModel: "anthropic/claude-opus-4-5",
 	workerModel: "anthropic/claude-sonnet-4",
@@ -90,6 +117,7 @@ const DEFAULT_CONFIG: MindWorkerConfig = {
 	dashboardHeartbeatMs: 10000,
 	dashboardStaleMs: 30000,
 	dashboardLogResponses: true,
+	burstFlash: { ...DEFAULT_BURST_FLASH_CONFIG },
 };
 
 const MIND_ALLOWED_TOOLS = ["delegate", "read", "git", "ripgrep"];
@@ -220,6 +248,7 @@ interface QueuedTask {
 	signal?: AbortSignal;
 	onUpdate?: (update: any) => void;
 	cwd: string;
+	queuedAt: number;
 }
 const pendingQueue: QueuedTask[] = [];
 let maxQueueSize = 6; // 2x default maxWorkers; updated on config load
@@ -242,6 +271,259 @@ const taskMetadataMap = new Map<string, TaskMetadata>();
 let dashboardHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let lastDashboardStatus = "";
 let lastDashboardCwd = "";
+
+// ── Burst flash workers ──────────────────────────────────────────────────────
+
+interface BurstWorkerState {
+	workerId: string;
+	pid: number;
+	spawnedAt: number;
+	lastTaskAt: number;
+	taskCount: number;
+	sessionDir: string;
+	logPath: string;
+	process: import("node:child_process").ChildProcess;
+	connectedAt: number;
+	lastEvent: string;
+	lastEventAt: number;
+}
+
+const burstWorkers = new Map<string, BurstWorkerState>();
+let burstCounter = 0;
+let burstIdleCheckTimer: ReturnType<typeof setInterval> | null = null;
+
+// ── Burst flash helpers ──────────────────────────────────────────────────────
+
+function getBurstFlashLogPath(cwd: string, n: number): string {
+	return join(getStateDir(), `${getCwdHash(cwd)}-burst-flash-${n}.log`);
+}
+
+function getBurstFlashSessionDir(cwd: string, n: number): string {
+	return join(getAgentDir(), "sessions", `burst-flash-${getCwdHash(cwd)}-${n}`);
+}
+
+function logBurstEvent(cwd: string, workerId: string, event: string, detail?: string): void {
+	const state = [...burstWorkers.values()].find(b => b.workerId === workerId);
+	if (!state) return;
+	state.lastEvent = detail ? `${event}: ${detail}` : event;
+	state.lastEventAt = Date.now();
+	const ts = new Date().toISOString();
+	const line = detail ? `[${ts}] ${event}: ${detail}\n` : `[${ts}] ${event}\n`;
+	try {
+		const { config } = loadConfig();
+		if (config.burstFlash.logDetail === "compact" || config.burstFlash.logDetail === "full") {
+			const fd = require("node:fs").openSync(state.logPath, "a");
+			require("node:fs").writeSync(fd, line);
+			require("node:fs").closeSync(fd);
+		}
+	} catch { /* ignore log write errors */ }
+}
+
+function isBurstWorker(workerId: string): boolean {
+	return workerId.startsWith("burst-flash-");
+}
+
+function countBurstWorkers(): number {
+	return burstWorkers.size;
+}
+
+function countIdleFlashWorkers(): number {
+	let count = 0;
+	for (const [wid, conn] of workerPool) {
+		if (conn.tier === "flash" && !conn.busy && !conn.socket.destroyed) {
+			// Skip stale burst workers whose state has been cleaned up
+			if (isBurstWorker(wid) && !burstWorkers.has(wid)) continue;
+			count++;
+		}
+	}
+	return count;
+}
+
+function getOldestFlashQueueWait(cwd: string): number {
+	// Returns ms since oldest flash-eligible queued task was enqueued, or 0 if none
+	for (const entry of pendingQueue) {
+		if (entry.cwd === cwd && (!entry.tier || entry.tier === "flash" || entry.tier === "default")) {
+			return Date.now() - (entry as any).queuedAt || 0;
+		}
+	}
+	return 0;
+}
+
+function countFlashEligibleQueued(cwd: string): number {
+	return pendingQueue.filter(e => e.cwd === cwd && (!e.tier || e.tier === "flash" || e.tier === "default")).length;
+}
+
+function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
+	const { config } = loadConfig();
+	if (!config.burstFlash.enabled) return;
+	if (currentRole !== "mind") return;
+	if (countBurstWorkers() >= config.burstFlash.maxBurst) return;
+	if (countIdleFlashWorkers() > 0) return;
+	const flashQueued = countFlashEligibleQueued(cwd);
+	if (flashQueued === 0) return;
+	// Check trigger conditions
+	const pressureMet = flashQueued >= config.burstFlash.queuePressureThreshold;
+	const waitMet = getOldestFlashQueueWait(cwd) >= config.burstFlash.spawnWaitMs;
+	if (!pressureMet && !waitMet) return;
+	// Spawn
+	const n = ++burstCounter;
+	const workerId = `burst-flash-${n}`;
+	const sessionDir = getBurstFlashSessionDir(cwd, n);
+	const logPath = getBurstFlashLogPath(cwd, n);
+	const manifest = readManifest(cwd);
+	const generation = manifest?.generation ?? 0;
+	// Ensure dirs
+	try { mkdirSync(sessionDir, { recursive: true }); } catch { /* may exist */ }
+	try { mkdirSync(dirname(logPath), { recursive: true }); } catch { /* may exist */ }
+	// Build env: inherit but override mind-worker identity vars
+	const env: Record<string, string> = {};
+	for (const [k, v] of Object.entries(process.env)) {
+		if (v !== undefined && !k.startsWith("PI_MIND_WORKER_")) {
+			env[k] = v;
+		}
+	}
+	env.PI_MIND_WORKER_ROLE = "worker";
+	env.PI_MIND_WORKER_TIER = "flash";
+	env.PI_MIND_WORKER_ID = workerId;
+	env.PI_MIND_WORKER_GENERATION = String(generation);
+	env.PI_MIND_WORKER_SESSION_DIR = sessionDir;
+	const model = config.burstFlash.model;
+	const args = ["--model", model, "--session-dir", sessionDir];
+	const spawnStdio: Array<"pipe" | "ignore"> = ["pipe", "pipe", "pipe"];
+	if (config.burstFlash.launchMode === "kitty") {
+		console.error(`[burst-flash] launchMode=kitty not implemented, using headless for ${workerId}`);
+	}
+	const child = spawn("pi", args, {
+		env,
+		cwd,
+		stdio: spawnStdio,
+		detached: false,
+	});
+	if (!child.pid) {
+		console.error(`[burst-flash] spawn failed: no pid for ${workerId}`);
+		return;
+	}
+	const state: BurstWorkerState = {
+		workerId,
+		pid: child.pid,
+		spawnedAt: Date.now(),
+		lastTaskAt: Date.now(),
+		taskCount: 0,
+		sessionDir,
+		logPath,
+		process: child,
+		connectedAt: 0,
+		lastEvent: "spawned",
+		lastEventAt: Date.now(),
+	};
+	burstWorkers.set(workerId, state);
+	// Pipe stdout/stderr to log via write stream (end:false so one stream closing doesn't end the destination)
+	const logStream = createWriteStream(logPath, { flags: "a" });
+	if (child.stdout) child.stdout.pipe(logStream, { end: false });
+	if (child.stderr) child.stderr.pipe(logStream, { end: false });
+	child.on("exit", (code, signal) => {
+		const reason = signal ? `signal=${signal}` : `code=${code}`;
+		state.lastEvent = `exited ${reason}`;
+		state.lastEventAt = Date.now();
+		console.error(`[burst-flash] ${workerId} exited code=${code} signal=${signal}`);
+		logStream.end();
+		burstWorkers.delete(workerId);
+		// Cleanup session dir best-effort
+		try { require("node:fs").rmSync(sessionDir, { recursive: true, force: true }); } catch { /* ignore */ }
+	});
+	logBurstEvent(cwd, workerId, "spawned", `pid=${child.pid} model=${model}`);
+	console.error(`[burst-flash] spawned ${workerId} pid=${child.pid}`);
+	// Start idle check timer if not running
+	if (!burstIdleCheckTimer) {
+		burstIdleCheckTimer = setInterval(() => checkBurstIdleTtl(cwd), 5000);
+	}
+}
+
+function checkBurstIdleTtl(cwd: string): void {
+	const { config } = loadConfig();
+	const now = Date.now();
+	for (const [workerId, state] of burstWorkers) {
+		const conn = workerPool.get(workerId);
+		if (!conn || conn.socket.destroyed) {
+			// Worker disconnected, cleanup
+			burstWorkers.delete(workerId);
+			continue;
+		}
+		if (conn.busy) {
+			state.lastTaskAt = now;
+			continue;
+		}
+		// Check idle TTL
+		const idleMs = now - state.lastTaskAt;
+		if (idleMs >= config.burstFlash.idleTtlMs) {
+			retireBurstFlash(workerId, "idle-ttl");
+			continue;
+		}
+		// Check max tasks
+		if (state.taskCount >= config.burstFlash.maxTasksPerWorker) {
+			retireBurstFlash(workerId, "max-tasks");
+			continue;
+		}
+	}
+	// Stop timer if no burst workers remain
+	if (burstWorkers.size === 0 && burstIdleCheckTimer) {
+		clearInterval(burstIdleCheckTimer);
+		burstIdleCheckTimer = null;
+	}
+}
+
+function retireBurstFlash(workerId: string, reason: string): void {
+	const state = burstWorkers.get(workerId);
+	if (!state) return;
+	state.lastEvent = `retire: ${reason}`;
+	state.lastEventAt = Date.now();
+	console.error(`[burst-flash] retiring ${workerId} reason=${reason} tasks=${state.taskCount}`);
+	logBurstEvent("", workerId, "retire", reason);
+	// Stop sequence: socket shutdown -> SIGTERM -> SIGKILL
+	const conn = workerPool.get(workerId);
+	if (conn && !conn.socket.destroyed) {
+		try { conn.socket.end(); } catch { /* ignore */ }
+	}
+	const { config } = loadConfig();
+	setTimeout(() => {
+		if (!state.process.killed) {
+			try { state.process.kill("SIGTERM"); } catch { /* ignore */ }
+		}
+		setTimeout(() => {
+			if (!state.process.killed) {
+				try { state.process.kill("SIGKILL"); } catch { /* ignore */ }
+			}
+		}, config.burstFlash.killTimeoutMs);
+	}, 500); // Give socket close a moment
+	burstWorkers.delete(workerId);
+	// Cleanup session dir best-effort
+	try { require("node:fs").rmSync(state.sessionDir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+function retireAllBurstFlash(reason: string): void {
+	for (const workerId of [...burstWorkers.keys()]) {
+		retireBurstFlash(workerId, reason);
+	}
+}
+
+function onBurstWorkerConnected(workerId: string): void {
+	const state = burstWorkers.get(workerId);
+	if (state) {
+		state.connectedAt = Date.now();
+		state.lastEvent = "connected";
+		state.lastEventAt = Date.now();
+	}
+}
+
+function onBurstWorkerTaskStart(workerId: string): void {
+	const state = burstWorkers.get(workerId);
+	if (state) {
+		state.taskCount++;
+		state.lastTaskAt = Date.now();
+		state.lastEvent = `task-start (#${state.taskCount})`;
+		state.lastEventAt = Date.now();
+	}
+}
 
 function getResultsLogPath(cwd: string): string {
 	return join(getStateDir(), `${getCwdHash(cwd)}-results.jsonl`);
@@ -469,13 +751,38 @@ function writeControlFileStatus(cwd: string, status: string, message?: string): 
 				// workers: all connected workers with status
 				data.workers = [...workerPool.values()]
 					.filter(w => !w.socket.destroyed)
-					.map(w => ({
-						workerId: w.workerId,
-						tier: w.tier,
-						busy: w.busy,
-						taskId: w.taskId,
-						connectedAt: w.connectedAt,
-					}));
+					.map(w => {
+						const base: Record<string, unknown> = {
+							workerId: w.workerId,
+							tier: w.tier,
+							busy: w.busy,
+							taskId: w.taskId,
+							connectedAt: w.connectedAt,
+						};
+						if (isBurstWorker(w.workerId)) {
+							const state = burstWorkers.get(w.workerId);
+							if (state) {
+								base.burst = true;
+								base.pid = state.pid;
+								base.sessionDir = state.sessionDir;
+								base.logPath = state.logPath;
+								base.taskCount = state.taskCount;
+								base.lastEvent = state.lastEvent;
+								base.lastEventAt = state.lastEventAt;
+							}
+						}
+						return base;
+					});
+
+				// burstFlash: top-level summary
+				{
+					const connectedBurst = [...workerPool.values()].filter(w => isBurstWorker(w.workerId) && !w.socket.destroyed).length;
+					const totalBurst = burstWorkers.size;
+					const maxBurst = config.burstFlash?.maxBurst ?? 0;
+					const activeBurst = [...workerPool.values()].filter(w => isBurstWorker(w.workerId) && w.busy && !w.socket.destroyed).length;
+					const idleBurst = connectedBurst - activeBurst;
+					data.burstFlash = { connected: connectedBurst, total: totalBurst, max: maxBurst, active: activeBurst, idle: idleBurst };
+				}
 			}
 		} catch {
 			// Best-effort: if config load fails, skip dashboard fields
@@ -640,6 +947,30 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 			console.warn("[mind-worker] dashboardStaleMs must be >= 3000 — using default 30000");
 		}
 
+		// Parse burstFlash config block
+		const rawBurst = parsed.burstFlash || {};
+		const burstFlash: BurstFlashConfig = {
+			enabled: typeof rawBurst.enabled === "boolean" ? rawBurst.enabled : DEFAULT_BURST_FLASH_CONFIG.enabled,
+			model: typeof rawBurst.model === "string" && rawBurst.model.trim() ? rawBurst.model.trim() : DEFAULT_BURST_FLASH_CONFIG.model,
+			maxBurst: typeof rawBurst.maxBurst === "number" && rawBurst.maxBurst >= 0 && rawBurst.maxBurst <= 10
+				? rawBurst.maxBurst : DEFAULT_BURST_FLASH_CONFIG.maxBurst,
+			idleTtlMs: typeof rawBurst.idleTtlMs === "number" && rawBurst.idleTtlMs >= 10000
+				? rawBurst.idleTtlMs : DEFAULT_BURST_FLASH_CONFIG.idleTtlMs,
+			maxTasksPerWorker: typeof rawBurst.maxTasksPerWorker === "number" && rawBurst.maxTasksPerWorker >= 1 && rawBurst.maxTasksPerWorker <= 100
+				? rawBurst.maxTasksPerWorker : DEFAULT_BURST_FLASH_CONFIG.maxTasksPerWorker,
+			launchMode: (rawBurst.launchMode === "kitty" ? "kitty" : "headless") as "headless" | "kitty",
+			queuePressureThreshold: typeof rawBurst.queuePressureThreshold === "number" && rawBurst.queuePressureThreshold >= 1
+				? rawBurst.queuePressureThreshold : DEFAULT_BURST_FLASH_CONFIG.queuePressureThreshold,
+			spawnWaitMs: typeof rawBurst.spawnWaitMs === "number" && rawBurst.spawnWaitMs >= 500
+				? rawBurst.spawnWaitMs : DEFAULT_BURST_FLASH_CONFIG.spawnWaitMs,
+			killTimeoutMs: typeof rawBurst.killTimeoutMs === "number" && rawBurst.killTimeoutMs >= 500
+				? rawBurst.killTimeoutMs : DEFAULT_BURST_FLASH_CONFIG.killTimeoutMs,
+			logDetail: (rawBurst.logDetail === "full" ? "full" : "compact") as "compact" | "full",
+		};
+		if (burstFlash.enabled && burstFlash.maxBurst === 0) {
+			console.warn("[mind-worker] burstFlash.maxBurst=0 effectively disables burst spawning");
+		}
+
 		const wc = typeof parsed.workerCount === "number" && parsed.workerCount >= 1 && parsed.workerCount <= 10
 			? parsed.workerCount : DEFAULT_CONFIG.workerCount;
 
@@ -666,6 +997,7 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 			dashboardStaleMs: typeof parsed.dashboardStaleMs === "number" && parsed.dashboardStaleMs >= 3000
 				? parsed.dashboardStaleMs : DEFAULT_CONFIG.dashboardStaleMs,
 			dashboardLogResponses: parsed.dashboardLogResponses !== false,
+			burstFlash,
 		};
 		const resolved = resolveWorkerModels(config);
 		return { config, created: false, resolvedWorkers: resolved };
@@ -846,6 +1178,8 @@ function findIdleWorker(tier?: string): { workerId: string; connection: WorkerCo
 	for (const [wid, conn] of workerPool) {
 		if (!conn.busy && !conn.socket.destroyed) {
 			if (tier && conn.tier !== tier) continue;
+			// Skip stale burst workers whose state has been cleaned up
+			if (isBurstWorker(wid) && !burstWorkers.has(wid)) continue;
 			return { workerId: wid, connection: conn };
 		}
 	}
@@ -858,6 +1192,8 @@ function findAllIdleWorkers(tier?: string): Array<{ workerId: string; connection
 	for (const [wid, conn] of workerPool) {
 		if (!conn.busy && !conn.socket.destroyed) {
 			if (tier && conn.tier !== tier) continue;
+			// Skip stale burst workers whose state has been cleaned up
+			if (isBurstWorker(wid) && !burstWorkers.has(wid)) continue;
 			idle.push({ workerId: wid, connection: conn });
 		}
 	}
@@ -877,6 +1213,8 @@ function countBusyWorkers(): number {
 function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx: ExtensionContext): boolean {
 	if (pendingQueue.length === 0) return false;
 	if (connection.socket.destroyed) return false;
+	// Skip retired/stale burst workers whose state has been cleaned up
+	if (isBurstWorker(workerId) && !burstWorkers.has(workerId)) return false;
 
 	// Scan queue for first entry matching this worker's tier (or any if entry has no tier preference)
 	let matchIdx = -1;
@@ -898,6 +1236,11 @@ function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx:
 	connection.taskId = id;
 	taskWorkerMap.set(id, workerId);
 	trackTaskStart(id, workerId, connection.tier, entry.task.slice(0, 100), entry.cwd);
+	// Track burst worker task start
+	if (isBurstWorker(workerId)) {
+		onBurstWorkerTaskStart(workerId);
+		logBurstEvent(entry.cwd, workerId, "task-start", id);
+	}
 
 	if (entry.onUpdate) pendingUpdates.set(id, entry.onUpdate);
 
@@ -1051,20 +1394,44 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 						const workerTier = (msg.tier || "flash") as string;
 
 						// Tier-aware pool capacity guard (fallback to total maxWorkers if tier unknown)
-						const { resolvedWorkers } = loadConfig();
-						const tierWorkers = resolvedWorkers.filter(w => w.tier === workerTier).length;
-						const tierConnected = [...workerPool.values()].filter(w => w.tier === workerTier && !w.socket.destroyed).length;
-						if (tierWorkers === 0) {
-							// Tier not in resolved config (defensive) — use total pool limit
-							if (workerPool.size >= maxWorkers) {
-								sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${maxWorkers} workers already connected` });
+						const { config: cfg, resolvedWorkers } = loadConfig();
+						const isBurst = (msg.workerId || "").startsWith("burst-flash-");
+						if (isBurst) {
+							// Burst workers: enforce flash tier + respect burstFlash.maxBurst cap
+							if (!cfg.burstFlash.enabled) {
+								sendJson(socket, { type: "error", code: "POOL_FULL", message: "Burst flash disabled" });
 								socket.destroy();
 								return;
 							}
-						} else if (tierConnected >= tierWorkers) {
-							sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${tierWorkers} ${workerTier} workers already connected` });
-							socket.destroy();
-							return;
+							if (workerTier !== "flash") {
+								sendJson(socket, { type: "error", code: "TIER_MISMATCH", message: "Burst workers must be flash tier" });
+								socket.destroy();
+								return;
+							}
+							// Allow known spawned burst workers even if cap reached
+							if (!burstWorkers.has(msg.workerId)) {
+								const connectedBurst = [...workerPool.values()].filter(w => isBurstWorker(w.workerId) && !w.socket.destroyed).length;
+								if (connectedBurst >= cfg.burstFlash.maxBurst) {
+									sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${cfg.burstFlash.maxBurst} burst workers already connected` });
+									socket.destroy();
+									return;
+								}
+							}
+						} else {
+							const tierWorkers = resolvedWorkers.filter(w => w.tier === workerTier).length;
+							const tierConnected = [...workerPool.values()].filter(w => w.tier === workerTier && !w.socket.destroyed).length;
+							if (tierWorkers === 0) {
+								// Tier not in resolved config (defensive) — use total pool limit
+								if (workerPool.size >= maxWorkers) {
+									sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${maxWorkers} workers already connected` });
+									socket.destroy();
+									return;
+								}
+							} else if (tierConnected >= tierWorkers) {
+								sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${tierWorkers} ${workerTier} workers already connected` });
+								socket.destroy();
+								return;
+							}
 						}
 
 					// Launcher-path worker: validate generation
@@ -1098,6 +1465,11 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 							workerId: assignedWorkerId, connectedAt: Date.now(),
 							tier: workerTier,
 						});
+						// Mark burst worker as connected
+						if (isBurst) {
+							onBurstWorkerConnected(assignedWorkerId);
+							console.error(`[burst-flash] ${assignedWorkerId} connected to socket`);
+						}
 						// Dispatch any queued tasks to this new worker
 						if (pendingQueue.length > 0) {
 							dispatchNextQueued(assignedWorkerId, workerPool.get(assignedWorkerId)!, ctx);
@@ -1170,17 +1542,32 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 					if (!idle) {
 						const flashConnected = [...workerPool.values()].filter(w => w.tier === "flash" && !w.socket.destroyed).length;
 						if (flashConnected === 0) {
-							subdelegateTrackers.delete(flashTaskId);
-							subdelegateReverseMap.delete(msg.id);
-							sendJson(socket, { type: "subdelegate-response", id: msg.id, error: "No flash workers connected. Workers start automatically — retry shortly.", code: "NO_FLASH_WORKERS" });
-							return;
-						}
-						// All flash workers busy — queue the task
-						if (pendingQueue.length >= maxQueueSize) {
-							subdelegateTrackers.delete(flashTaskId);
-							subdelegateReverseMap.delete(msg.id);
-							sendJson(socket, { type: "subdelegate-response", id: msg.id, error: `All flash workers busy and queue full (${pendingQueue.length}/${maxQueueSize}). Retry later.`, code: "QUEUE_FULL" });
-							return;
+							// Check burst flash as fallback instead of immediate reject
+							const { config: subCfg } = loadConfig();
+							if (!subCfg.burstFlash.enabled || subCfg.burstFlash.maxBurst === 0) {
+								subdelegateTrackers.delete(flashTaskId);
+								subdelegateReverseMap.delete(msg.id);
+								sendJson(socket, { type: "subdelegate-response", id: msg.id, error: "No flash workers connected. Workers start automatically — retry shortly.", code: "NO_FLASH_WORKERS" });
+								return;
+							}
+							// Burst available — enqueue, but reject if queue full and burst cap reached
+							if (pendingQueue.length >= maxQueueSize) {
+								const connectedBurst = [...workerPool.values()].filter(w => isBurstWorker(w.workerId) && !w.socket.destroyed).length;
+								if (connectedBurst >= subCfg.burstFlash.maxBurst) {
+									subdelegateTrackers.delete(flashTaskId);
+									subdelegateReverseMap.delete(msg.id);
+									sendJson(socket, { type: "subdelegate-response", id: msg.id, error: `All flash workers busy and queue full (${pendingQueue.length}/${maxQueueSize}). Retry later.`, code: "QUEUE_FULL" });
+									return;
+								}
+							}
+						} else {
+							// Flash workers exist but all busy — queue if space
+							if (pendingQueue.length >= maxQueueSize) {
+								subdelegateTrackers.delete(flashTaskId);
+								subdelegateReverseMap.delete(msg.id);
+								sendJson(socket, { type: "subdelegate-response", id: msg.id, error: `All flash workers busy and queue full (${pendingQueue.length}/${maxQueueSize}). Retry later.`, code: "QUEUE_FULL" });
+								return;
+							}
 						}
 						// Enqueue for flash tier
 						pendingQueue.push({
@@ -1191,6 +1578,7 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 							context: msg.context,
 							tier: "flash",
 							ctx,
+							queuedAt: Date.now(),
 							resolve: (result) => {
 								const tracker = subdelegateTrackers.get(flashTaskId);
 								subdelegateTrackers.delete(flashTaskId);
@@ -1218,6 +1606,8 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 							cwd,
 						});
 						writeControlFileBusy(cwd);
+						// Try burst spawn for queued subdelegate (burst available or flash workers all busy)
+						trySpawnBurstFlash(cwd, ctx);
 						return;
 					}
 					// Dispatch to idle flash worker
@@ -1342,19 +1732,36 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 					}
 					return;
 				}
-				// ── Result / Error / Status messages ────────────────
+				// ── Result / Error messages ─────────────────────────
 				if ((msg.type === "result" || msg.type === "error") && msg.id) {
 					const resolve = pendingResolvers.get(msg.id);
 					if (resolve) {
 						pendingResolvers.delete(msg.id);
 						pendingUpdates.delete(msg.id);
 						taskWorkerMap.delete(msg.id);
-						// Mark this worker idle, then dispatch next queued task
+						// Burst: log task-done before resolving
+						if (assignedWorkerId && isBurstWorker(assignedWorkerId)) {
+							logBurstEvent(cwd, assignedWorkerId, "task-done", `${msg.id} ${msg.type}`);
+						}
+						// Mark this worker idle, then conditionally dispatch next queued task
 						if (assignedWorkerId && workerPool.has(assignedWorkerId)) {
 							const conn = workerPool.get(assignedWorkerId)!;
 							conn.busy = false;
 							conn.taskId = null;
-							dispatchNextQueued(assignedWorkerId, conn, ctx);
+							if (isBurstWorker(assignedWorkerId)) {
+								const state = burstWorkers.get(assignedWorkerId);
+								if (state && state.taskCount >= loadConfig().config.burstFlash.maxTasksPerWorker) {
+									retireBurstFlash(assignedWorkerId, "max-tasks");
+									// Spawn replacement burst if more flash-eligible work queued
+									if (pendingQueue.some(e => !e.tier || e.tier === "flash" || e.tier === "default")) {
+										trySpawnBurstFlash(cwd, ctx);
+									}
+								} else {
+									dispatchNextQueued(assignedWorkerId, conn, ctx);
+								}
+							} else {
+								dispatchNextQueued(assignedWorkerId, conn, ctx);
+							}
 						}
 						resolve(msg);
 					}
@@ -1369,6 +1776,11 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 							content: [{ type: "text", text: `[${label}] ${msg.phase || "status"}${msg.detail ? `: ${msg.detail}` : ""}` }],
 							details: {},
 						});
+					}
+					// Burst: log compact status with phase/detail
+					if (assignedWorkerId && isBurstWorker(assignedWorkerId)) {
+						const detail = msg.detail ? ` ${msg.detail}` : "";
+						logBurstEvent(cwd, assignedWorkerId, "status", `${msg.phase || "?"}${detail}`);
 					}
 				}
 			}),
@@ -2427,30 +2839,38 @@ async function executeFanout(
 				const idle = findIdleWorker(effectiveTier);
 				if (!idle) {
 					const connected = [...workerPool.values()].filter(w => !w.socket.destroyed).length;
+					const isFlashTier = !effectiveTier || effectiveTier === "flash" || effectiveTier === "default";
+					const { config: bCfg } = loadConfig();
+					const canBurst = isFlashTier && bCfg.burstFlash.enabled && bCfg.burstFlash.maxBurst > 0;
 					if (connected === 0) {
-						return {
-							content: [{ type: "text", text: "No workers connected. Workers start automatically." }],
-							isError: true,
-						};
-					}
-					// If tier specified, check if any worker of that tier exists
-					if (effectiveTier) {
-						const tierCount = [...workerPool.values()].filter(w => w.tier === effectiveTier && !w.socket.destroyed).length;
-						const tierBusy = [...workerPool.values()].filter(w => w.tier === effectiveTier && w.busy && !w.socket.destroyed).length;
-						if (tierCount === 0) {
+						if (canBurst) {
+							// No workers connected but burst flash available — queue for burst spawn
+						} else {
 							return {
-								content: [{ type: "text", text: `No ${effectiveTier} workers connected. Available tiers: ${[...new Set([...workerPool.values()].filter(w => !w.socket.destroyed).map(w => w.tier))].join(", ") || "(none)"}` }],
+								content: [{ type: "text", text: "No workers connected. Workers start automatically." }],
 								isError: true,
 							};
 						}
-						// Tier workers exist but all busy — queue for that tier
-						if (tierCount > 0 && tierCount === tierBusy) {
-							// Fall through to queue below
-						} else {
-							return {
-								content: [{ type: "text", text: `All ${effectiveTier} worker(s) busy (${tierBusy}/${tierCount}). Use "auto" or omit tier to queue for any available worker.` }],
-								isError: true,
-							};
+					} else {
+						// If tier specified, check if any worker of that tier exists
+						if (effectiveTier) {
+							const tierCount = [...workerPool.values()].filter(w => w.tier === effectiveTier && !w.socket.destroyed).length;
+							const tierBusy = [...workerPool.values()].filter(w => w.tier === effectiveTier && w.busy && !w.socket.destroyed).length;
+							if (tierCount === 0) {
+								return {
+									content: [{ type: "text", text: `No ${effectiveTier} workers connected. Available tiers: ${[...new Set([...workerPool.values()].filter(w => !w.socket.destroyed).map(w => w.tier))].join(", ") || "(none)"}` }],
+									isError: true,
+								};
+							}
+							// Tier workers exist but all busy — queue for that tier
+							if (tierCount > 0 && tierCount === tierBusy) {
+								// Fall through to queue below
+							} else {
+								return {
+									content: [{ type: "text", text: `All ${effectiveTier} worker(s) busy (${tierBusy}/${tierCount}). Use "auto" or omit tier to queue for any available worker.` }],
+									isError: true,
+								};
+							}
 						}
 					}
 					// Queue the task if within limit
@@ -2479,7 +2899,12 @@ async function executeFanout(
 							signal,
 							onUpdate,
 							cwd: ctx.cwd,
+							queuedAt: Date.now(),
 						});
+						// Trigger burst flash spawn if conditions met
+						if (!effectiveTier || effectiveTier === "flash" || effectiveTier === "default") {
+							trySpawnBurstFlash(ctx.cwd, ctx);
+						}
 						// If signal fires while queued, remove from queue and reject
 						if (signal) {
 							const onAbort = () => {
@@ -2515,6 +2940,11 @@ async function executeFanout(
 			connection.taskId = id;
 			taskWorkerMap.set(id, targetWorkerId);
 			trackTaskStart(id, targetWorkerId, connection.tier, params.task.slice(0, 100), ctx.cwd);
+			// Track burst worker task start (direct dispatch path)
+			if (isBurstWorker(targetWorkerId)) {
+				onBurstWorkerTaskStart(targetWorkerId);
+				logBurstEvent(ctx.cwd, targetWorkerId, "task-start", id);
+			}
 			writeControlFileBusy(ctx.cwd);
 
 			return new Promise((resolve) => {
