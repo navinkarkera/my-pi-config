@@ -1,15 +1,18 @@
 import { exec, execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, renameSync, createWriteStream } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, renameSync, createWriteStream } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
+
+/** Resolved path to the pi CLI binary via the installed package. */
+const PI_CLI = join(getPackageDir(), "dist", "cli.js");
 
 type Role = "none" | "mind" | "worker";
 
@@ -188,6 +191,22 @@ const taskWorkerMap = new Map<string, string>();
 let workerBusy = false;
 let workerTaskId: string | null = null;
 
+/** Launcher-path worker keepalive — prevents Node event-loop exit in headless/noninteractive mode. */
+let workerKeepaliveTimer: ReturnType<typeof setInterval> | null = null;
+const WORKER_KEEPALIVE_MS = 60_000;
+
+function startWorkerKeepalive(): void {
+	if (workerKeepaliveTimer) return;
+	workerKeepaliveTimer = setInterval(() => { /* noop keepalive — keeps event loop alive */ }, WORKER_KEEPALIVE_MS);
+}
+
+function stopWorkerKeepalive(): void {
+	if (workerKeepaliveTimer) {
+		clearInterval(workerKeepaliveTimer);
+		workerKeepaliveTimer = null;
+	}
+}
+
 /** Worker-side: pending subdelegate resolvers (strong worker waiting for flash result via mind). */
 interface SubdelegateWaiter {
 	resolve: (result: any) => void;
@@ -299,9 +318,15 @@ let burstIdleCheckTimer: ReturnType<typeof setInterval> | null = null;
 
 async function findKittyPanePid(title: string): Promise<{ pid: number; windowId: number } | null> {
 	return new Promise((resolve) => {
-		const child = spawn("kitty", ["@", "ls"], { stdio: ["ignore", "pipe", "pipe"], timeout: 5000 });
+		let child: import("node:child_process").ChildProcess;
+		try {
+			child = spawn("kitty", ["@", "ls"], { stdio: ["ignore", "pipe", "pipe"], timeout: 5000 });
+		} catch {
+			resolve(null);
+			return;
+		}
 		let stdout = "";
-		child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+		child.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
 		child.on("close", (code) => {
 			if (code !== 0) { resolve(null); return; }
 			try {
@@ -325,9 +350,13 @@ async function findKittyPanePid(title: string): Promise<{ pid: number; windowId:
 
 async function closeKittyPaneByTitle(title: string): Promise<void> {
 	return new Promise((resolve) => {
-		const child = spawn("kitty", ["@", "close-window", "--match", `title:${title}`], { stdio: "ignore", timeout: 5000 });
-		child.on("close", () => resolve());
-		child.on("error", () => resolve());
+		try {
+			const child = spawn("kitty", ["@", "close-window", "--match", `title:${title}`], { stdio: "ignore", timeout: 5000 });
+			child.on("close", () => resolve());
+			child.on("error", () => resolve());
+		} catch {
+			resolve();
+		}
 	});
 }
 
@@ -461,14 +490,21 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 		"--env", `PI_MIND_WORKER_GENERATION=${String(generation)}`,
 		"--env", `PI_MIND_WORKER_SESSION_DIR=${sessionDir}`,
 		"--env", `PATH=${process.env.PATH || ""}`,
-		"pi", "--model", model, "--session-dir", sessionDir,
+		PI_CLI, "--mode", "rpc", "--model", model, "--session-dir", sessionDir,
 	];
 	// Best-effort focus mind window before launching split
 	const mindTitle = `mind-${hash}`;
 	try {
-		spawn("kitty", ["@", "focus-window", "--match", `title:${mindTitle}`], { stdio: "ignore", timeout: 3000 });
+		const focusChild = spawn("kitty", ["@", "focus-window", "--match", `title:${mindTitle}`], { stdio: "ignore", timeout: 3000 });
+		focusChild.on("error", () => { /* best-effort */ });
 	} catch { /* best-effort */ }
-	const child = spawn("kitty", kittyArgs, { stdio: "ignore", timeout: 10000 });
+	let child: import("node:child_process").ChildProcess;
+	try {
+		child = spawn("kitty", kittyArgs, { stdio: "ignore", timeout: 10000 });
+	} catch (err: any) {
+		fallbackToHeadless(`kitty spawn threw synchronously: ${err.message}`);
+		return;
+	}
 	// Insert state first so workers list is accurate
 	const state: BurstWorkerState = {
 		workerId,
@@ -512,6 +548,8 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 			logBurstEvent(cwd, workerId, "pid-discovery-failed", "tracking by title only");
 			console.warn(`[burst-flash] ${workerId} PID discovery failed, tracking by title only`);
 		}
+	}).catch((err) => {
+		console.warn(`[burst-flash] ${workerId} PID discovery error: ${err?.message ?? err}`);
 	});
 	if (!burstIdleCheckTimer) {
 		burstIdleCheckTimer = setInterval(() => checkBurstIdleTtl(cwd), 5000);
@@ -612,11 +650,27 @@ interface SpawnHeadlessParams {
 
 function spawnBurstHeadless(p: SpawnHeadlessParams): void {
 	const { n, workerId, cwd, sessionDir, logPath, model, generation, env } = p;
-	const child = spawn("pi", ["--model", model, "--session-dir", sessionDir], {
-		env,
-		cwd,
-		stdio: ["pipe", "pipe", "pipe"],
-		detached: false,
+	let child: import("node:child_process").ChildProcess;
+	try {
+		child = spawn(PI_CLI, ["--mode", "rpc", "--model", model, "--session-dir", sessionDir], {
+			env,
+			cwd,
+			stdio: ["pipe", "pipe", "pipe"],
+			detached: false,
+		});
+	} catch (err: any) {
+		const syncErrMsg = `[burst-flash] ${workerId}: headless spawn threw synchronously: ${err.message}`;
+		console.error(syncErrMsg);
+		appendFileSync(logPath, syncErrMsg + "\n");
+		burstWorkers.delete(workerId);
+		return;
+	}
+	child.on("error", (err) => {
+		const errMsg = `[burst-flash] ${workerId}: headless spawn error: ${err.message}`;
+		console.error(errMsg);
+		appendFileSync(logPath, errMsg + "\n");
+		burstWorkers.delete(workerId);
+		try { require("node:fs").rmSync(sessionDir, { recursive: true, force: true }); } catch { /* ignore */ }
 	});
 	if (!child.pid) {
 		console.error(`[burst-flash] spawn failed: no pid for ${workerId}`);
@@ -640,6 +694,7 @@ function spawnBurstHeadless(p: SpawnHeadlessParams): void {
 	};
 	burstWorkers.set(workerId, state);
 	const logStream = createWriteStream(logPath, { flags: "a" });
+	logStream.on("error", (err) => console.warn(`[burst-flash] ${workerId}: log stream error: ${err.message}`));
 	if (child.stdout) child.stdout.pipe(logStream, { end: false });
 	if (child.stderr) child.stderr.pipe(logStream, { end: false });
 	child.on("exit", (code, signal) => {
@@ -675,6 +730,46 @@ function onBurstWorkerTaskStart(workerId: string): void {
 		state.lastEvent = `task-start (#${state.taskCount})`;
 		state.lastEventAt = Date.now();
 	}
+}
+
+const burstRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** Clear all pending burst-retry timers. Call on mind shutdown. */
+function clearBurstRetryTimers(): void {
+	for (const timer of burstRetryTimers.values()) clearTimeout(timer);
+	burstRetryTimers.clear();
+}
+
+/** Attempt burst spawn immediately, then retry after spawnWaitMs. Delayed callback
+ *  spawns min(queued - reserved, available slots) where reserved = pending or idle
+ *  burst workers. Deduplicates retries per cwd. */
+function trySpawnBurstFlashWithRetry(cwd: string, ctx: ExtensionContext): void {
+	trySpawnBurstFlash(cwd, ctx);
+	// Schedule delayed retry that can spawn multiple burst workers
+	const { config } = loadConfig();
+	if (!config.burstFlash.enabled) return;
+	const key = cwd;
+	// Don't postpone an existing timer — let it fire at its original time
+	if (burstRetryTimers.has(key)) return;
+	const timer = setTimeout(() => {
+		burstRetryTimers.delete(key);
+		const { config: cfg } = loadConfig();
+		const queued = countFlashEligibleQueued(cwd);
+		// Reserved = burst workers pending connection or connected idle (not busy)
+		let reserved = 0;
+		for (const workerId of burstWorkers.keys()) {
+			const conn = workerPool.get(workerId);
+			if (!conn || !conn.busy) reserved++;
+		}
+		const available = cfg.burstFlash.maxBurst - countBurstWorkers();
+		const attempts = Math.max(0, Math.min(queued - reserved, available));
+		for (let i = 0; i < attempts; i++) {
+			const before = countBurstWorkers();
+			trySpawnBurstFlash(cwd, ctx);
+			if (countBurstWorkers() === before) break;
+		}
+	}, config.burstFlash.spawnWaitMs);
+	burstRetryTimers.set(key, timer);
 }
 
 function getResultsLogPath(cwd: string): string {
@@ -1366,6 +1461,7 @@ function countBusyWorkers(): number {
 
 /** Pop next queued task (matching worker tier) and dispatch to given idle worker. Returns true if dispatched. */
 function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx: ExtensionContext): boolean {
+	if (connection.busy) return false;
 	if (pendingQueue.length === 0) return false;
 	if (connection.socket.destroyed) return false;
 	// Skip retired/stale burst workers whose state has been cleaned up
@@ -1761,8 +1857,8 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 							cwd,
 						});
 						writeControlFileBusy(cwd);
-						// Try burst spawn for queued subdelegate (burst available or flash workers all busy)
-						trySpawnBurstFlash(cwd, ctx);
+						// Try burst flash spawn (immediate + delayed retry) for queued subdelegate
+						trySpawnBurstFlashWithRetry(cwd, ctx);
 						return;
 					}
 					// Dispatch to idle flash worker
@@ -1811,13 +1907,6 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 						if (tracker) subdelegateReverseMap.delete(tracker.subdelegateId);
 						pendingUpdates.delete(flashTaskId);
 						taskWorkerMap.delete(flashTaskId);
-						if (workerPool.has(flashWorkerId)) {
-							const conn = workerPool.get(flashWorkerId)!;
-							conn.busy = false;
-							conn.taskId = null;
-							dispatchNextQueued(flashWorkerId, conn, ctx);
-						}
-						writeControlFileIdle(cwd);
 						if (tracker && !tracker.requesterSocket.destroyed) {
 							if (resultMsg.type === "error") {
 								sendJson(tracker.requesterSocket, {
@@ -1918,6 +2007,7 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 								dispatchNextQueued(assignedWorkerId, conn, ctx);
 							}
 						}
+						writeControlFileIdle(cwd);
 						resolve(msg);
 					}
 					return;
@@ -2031,6 +2121,7 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 
 function stopMindServer(cwd: string, ctx: ExtensionContext): void {
 	stopDashboardHeartbeat();
+	clearBurstRetryTimers();
 	// Retire all burst flash workers before stopping
 	retireAllBurstFlash("mind-stopped");
 	// Fail queued tasks first
@@ -2077,6 +2168,14 @@ async function spawnWorkerInKitty(cwd: string): Promise<void> {
 	}
 }
 
+/** Safe ctx.ui wrappers — swallow stale-context errors so socket handlers don't crash workers. */
+function safeUiNotify(ctx: ExtensionContext, msg: string, level?: "info" | "warning" | "error" | "success"): void {
+	try { ctx.ui.notify(msg, level); } catch { /* stale ctx — ignore */ }
+}
+function safeUiStatus(ctx: ExtensionContext, key: string, value?: string): void {
+	try { ctx.ui.setStatus(key, value); } catch { /* stale ctx — ignore */ }
+}
+
 async function connectWorker(
 	cwd: string,
 	ctx: ExtensionContext,
@@ -2096,7 +2195,7 @@ async function connectWorker(
 		// Pre-connect generation check: compare env expectation vs manifest
 		const expectedGen = LAUNCHER_GENERATION;
 		if (expectedGen !== null && generation !== 0 && generation !== expectedGen) {
-			ctx.ui.notify(
+			safeUiNotify(ctx,
 				`Generation mismatch: manifest=${generation}, expected=${expectedGen}. Stale worker from prior reset.`,
 				"error",
 			);
@@ -2112,8 +2211,8 @@ async function connectWorker(
 			socket.on("connect", () => {
 				connected = true;
 				workerSocket = socket;
-				ctx.ui.setStatus("mind-worker", "🟢 worker");
-				ctx.ui.notify("Connected to mind", "success");
+				safeUiStatus(ctx, "mind-worker", "🟢 worker");
+				safeUiNotify(ctx, "Connected to mind", "success");
 
 				// Send generation handshake with workerId and tier
 				const workerTier = LAUNCHER_WORKER_TIER || "flash";
@@ -2137,7 +2236,7 @@ async function connectWorker(
 
 					// Intercept generation mismatch error from mind
 					if (msg.type === "error" && msg.code === "GENERATION_MISMATCH") {
-						ctx.ui.notify(`Mind rejected: ${msg.message}`, "error");
+						safeUiNotify(ctx, `Mind rejected: ${msg.message}`, "error");
 						process.exit(1);
 						return;
 					}
@@ -2148,7 +2247,7 @@ async function connectWorker(
 
 			socket.on("close", () => {
 				workerSocket = null;
-				ctx.ui.setStatus("mind-worker", undefined);
+				safeUiStatus(ctx, "mind-worker", undefined);
 				if (currentRole === "worker") {
 					// Launcher-path worker exits immediately on disconnect
 					process.exit(0);
@@ -2159,7 +2258,7 @@ async function connectWorker(
 				socket.destroy();
 				if (!connected) {
 					// Launcher path: do NOT unlink socket — launcher owns lifecycle
-					ctx.ui.notify(`Socket error: ${err.message}`, "error");
+					safeUiNotify(ctx, `Socket error: ${err.message}`, "error");
 					// Connection failed — worker exits
 					process.exit(1);
 				}
@@ -2184,8 +2283,8 @@ async function connectWorker(
 			socket.on("connect", () => {
 				connected = true;
 				workerSocket = socket;
-				ctx.ui.setStatus("mind-worker", "🟢 worker");
-				ctx.ui.notify("Connected to mind", "success");
+				safeUiStatus(ctx, "mind-worker", "🟢 worker");
+				safeUiNotify(ctx, "Connected to mind", "success");
 				resolve(true);
 			});
 
@@ -2200,9 +2299,9 @@ async function connectWorker(
 
 			socket.on("close", () => {
 				workerSocket = null;
-				ctx.ui.setStatus("mind-worker", undefined);
+				safeUiStatus(ctx, "mind-worker", undefined);
 				if (currentRole === "worker") {
-					ctx.ui.notify("Mind disconnected. Waiting...", "warning");
+					safeUiNotify(ctx, "Mind disconnected. Waiting...", "warning");
 					setTimeout(tryConnect, 500);
 				}
 			});
@@ -2215,7 +2314,7 @@ async function connectWorker(
 					}
 					attempt += 1;
 					if (attempt >= maxAttempts) {
-						ctx.ui.notify("Failed to connect. Run /be-mind first.", "error");
+						safeUiNotify(ctx, "Failed to connect. Run /be-mind first.", "error");
 						resolve(false);
 						return;
 					}
@@ -2228,6 +2327,7 @@ async function connectWorker(
 }
 
 function disconnectWorker(ctx: ExtensionContext): void {
+	stopWorkerKeepalive();
 	// Fail any pending subdelegate responses
 	for (const [subdelegateId, waiter] of subdelegateWaiters) {
 		clearTimeout(waiter.timeoutId);
@@ -2244,7 +2344,7 @@ function disconnectWorker(ctx: ExtensionContext): void {
 	}
 	workerBusy = false;
 	workerTaskId = null;
-	ctx.ui.setStatus("mind-worker", undefined);
+	safeUiStatus(ctx, "mind-worker", undefined);
 }
 
 function buildWorkerPrompt(task: string, step?: number, plan?: string, context?: string): string {
@@ -2462,8 +2562,11 @@ async function activateWorkerRole(ctx: ExtensionContext, pi: ExtensionAPI): Prom
 	}
 	await setModelFromId(pi, ctx, workerModel);
 	pi.setThinkingLevel(WORKER_THINKING_LEVEL);
+	// Launcher-path workers in headless mode need a keepalive to prevent event-loop exit
+	if (LAUNCHER_ROLE_FLAG === "worker") startWorkerKeepalive();
 	const connected = await connectWorker(ctx.cwd, ctx, createWorkerHandler(pi));
 	if (!connected) {
+		stopWorkerKeepalive();
 		currentRole = "none";
 		return;
 	}
@@ -3058,9 +3161,9 @@ async function executeFanout(
 							cwd: ctx.cwd,
 							queuedAt: Date.now(),
 						});
-						// Trigger burst flash spawn if conditions met
+						// Trigger burst flash spawn if conditions met (immediate + delayed retry)
 						if (!effectiveTier || effectiveTier === "flash" || effectiveTier === "default") {
-							trySpawnBurstFlash(ctx.cwd, ctx);
+							trySpawnBurstFlashWithRetry(ctx.cwd, ctx);
 						}
 						// If signal fires while queued, remove from queue and reject
 						if (signal) {
@@ -3311,12 +3414,14 @@ async function executeFanout(
 		const { config, resolvedWorkers } = loadConfig();
 		const flashCount = resolvedWorkers.filter(w => w.tier === "flash").length;
 		const strongCount = resolvedWorkers.filter(w => w.tier === "strong").length;
+		const burstMax = config.burstFlash.enabled ? config.burstFlash.maxBurst : 0;
+		const burstDesc = burstMax > 0 ? ` Burst flash: up to ${burstMax} extra flash workers auto-spawn for queued flash-tier tasks when static flash workers are busy.` : "";
 
 		let tierDesc = "";
 		if (flashCount > 0 && strongCount > 0) {
-			tierDesc = `${flashCount} flash workers (fast/cheap — scoped tasks: grep, single-file edits, run tests, builds) + ${strongCount} strong worker (deep reasoning — multi-file refactors, architecture, debugging).`;
+			tierDesc = `${flashCount} flash + ${strongCount} strong workers.` + burstDesc;
 		} else {
-			tierDesc = `${resolvedWorkers.length} workers available (each handles 1 task at a time).`;
+			tierDesc = `${resolvedWorkers.length} workers available.` + burstDesc;
 		}
 
 		return {
@@ -3328,10 +3433,12 @@ async function executeFanout(
 				"Default: parallel-first. Saturate all idle workers whenever tasks are independent.\n" +
 				"Preflight rule: before every non-trivial task, decompose it into independent chunks and saturate all idle workers immediately.\n" +
 				"Use delegate for implementation, edits, test runs, builds.\n" +
-				"Use delegate(tier='flash') for scoped, single-file tasks — faster and cheaper.\n" +
-				"Use delegate(tier='strong') for multi-file refactors, architecture decisions, debugging, reviews, or any correctness-sensitive work.\n" +
-				"Workers can assist with reviews, but Mind owns final review and verdict.\n" +
-				"Use read/git/ripgrep for code review and evidence gathering.\n" +
+				"Use delegate(tier='flash') for ALL scoped/simple tasks — anything that does not require multi-file architecture, deep debugging, or correctness-sensitive reasoning.\n" +
+				"Do not hold back flash delegates because static flash workers are busy — queued flash-tier tasks auto-spawn burst workers up to configured max.\n" +
+				"Parallelize/queue independent flash work liberally; burst workers activate from queue pressure.\n" +
+				"Strong tier: reserved only for multi-file refactors, architecture decisions, complex debugging, correctness-sensitive work.\n" +
+				"When in doubt between flash and strong, choose strong; flash is fast but shallow.\n" +
+				"Mind: planning, final review/verdict, lightweight read/git/ripgrep checks only.\n" +
 				"Never use write/edit/bash/grep/find directly in mind mode.\n" +
 				"Parallel-by-default: independent tasks (separate files, separate searches, separate assertions) fan out across all idle workers in the same turn. This is the expected default — not a special pattern.\n" +
 				"Sequential exception: only dependent or overlapping file edits stay sequential — one delegate call at a time on the same files, waiting for each result before the next.\n" +

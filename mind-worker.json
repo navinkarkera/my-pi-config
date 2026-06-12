@@ -7,7 +7,7 @@
   "ntfyTopic": "nrk_mangalpete_legion_ai_reminders",
   "mindModel": "openai-codex/gpt-5.5",
   "workerModels": [
-    { "model": "opencode-go/deepseek-v4-flash", "count": 2, "tier": "flash" },
+    { "model": "opencode-go/deepseek-v4-flash", "count": 1, "tier": "flash" },
     { "model": "opencode-go/qwen3.7-plus", "count": 1, "tier": "strong" }
   ],
   "workerModel": "opencode-go/deepseek-v4-flash",
@@ -18,5 +18,17 @@
   "dashboardLogResponses": true,
   "dashboardRetention": 200,
   "dashboardHeartbeatMs": 10000,
-  "dashboardStaleMs": 30000
+  "dashboardStaleMs": 30000,
+  "burstFlash": {
+    "enabled": true,
+    "model": "opencode-go/deepseek-v4-flash",
+    "maxBurst": 3,
+    "idleTtlMs": 180000,
+    "maxTasksPerWorker": 3,
+    "launchMode": "headless",
+    "queuePressureThreshold": 1,
+    "spawnWaitMs": 1000,
+    "killTimeoutMs": 2000,
+    "logDetail": "compact"
+  }
 }
