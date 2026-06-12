@@ -282,10 +282,13 @@ interface BurstWorkerState {
 	taskCount: number;
 	sessionDir: string;
 	logPath: string;
-	process: import("node:child_process").ChildProcess;
+	process: import("node:child_process").ChildProcess | null;
 	connectedAt: number;
 	lastEvent: string;
 	lastEventAt: number;
+	launchMode: "headless" | "kitty";
+	paneTitle: string | null;
+	kittyWindowId: number | null;
 }
 
 const burstWorkers = new Map<string, BurstWorkerState>();
@@ -293,6 +296,49 @@ let burstCounter = 0;
 let burstIdleCheckTimer: ReturnType<typeof setInterval> | null = null;
 
 // ── Burst flash helpers ──────────────────────────────────────────────────────
+
+async function findKittyPanePid(title: string): Promise<{ pid: number; windowId: number } | null> {
+	return new Promise((resolve) => {
+		const child = spawn("kitty", ["@", "ls"], { stdio: ["ignore", "pipe", "pipe"], timeout: 5000 });
+		let stdout = "";
+		child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+		child.on("close", (code) => {
+			if (code !== 0) { resolve(null); return; }
+			try {
+				const osWindows = JSON.parse(stdout);
+				for (const osWin of osWindows) {
+					for (const tab of osWin.tabs || []) {
+						for (const w of tab.windows || []) {
+							if (w.title === title) {
+								resolve({ pid: w.pid, windowId: w.id });
+								return;
+							}
+						}
+					}
+				}
+			} catch { /* parse error */ }
+			resolve(null);
+		});
+		child.on("error", () => resolve(null));
+	});
+}
+
+async function closeKittyPaneByTitle(title: string): Promise<void> {
+	return new Promise((resolve) => {
+		const child = spawn("kitty", ["@", "close-window", "--match", `title:${title}`], { stdio: "ignore", timeout: 5000 });
+		child.on("close", () => resolve());
+		child.on("error", () => resolve());
+	});
+}
+
+async function discoverBurstKittyPane(title: string, retries = 10, intervalMs = 500): Promise<{ pid: number; windowId: number } | null> {
+	for (let i = 0; i < retries; i++) {
+		const result = await findKittyPanePid(title);
+		if (result) return result;
+		await new Promise(r => setTimeout(r, intervalMs));
+	}
+	return null;
+}
 
 function getBurstFlashLogPath(cwd: string, n: number): string {
 	return join(getStateDir(), `${getCwdHash(cwd)}-burst-flash-${n}.log`);
@@ -388,52 +434,85 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 	env.PI_MIND_WORKER_GENERATION = String(generation);
 	env.PI_MIND_WORKER_SESSION_DIR = sessionDir;
 	const model = config.burstFlash.model;
-	const args = ["--model", model, "--session-dir", sessionDir];
-	const spawnStdio: Array<"pipe" | "ignore"> = ["pipe", "pipe", "pipe"];
-	if (config.burstFlash.launchMode === "kitty") {
-		console.error(`[burst-flash] launchMode=kitty not implemented, using headless for ${workerId}`);
-	}
-	const child = spawn("pi", args, {
-		env,
-		cwd,
-		stdio: spawnStdio,
-		detached: false,
-	});
-	if (!child.pid) {
-		console.error(`[burst-flash] spawn failed: no pid for ${workerId}`);
+	const hash = getCwdHash(cwd);
+	const paneTitle = `burst-flash-${hash}-${n}`;
+	// Decide: kitty or headless?
+	if (config.burstFlash.launchMode !== "kitty") {
+		spawnBurstHeadless({ n, workerId, cwd, sessionDir, logPath, model, generation, env });
 		return;
 	}
+	// ── Kitty launch path ──
+	let fellBack = false;
+	const fallbackToHeadless = (reason: string) => {
+		if (fellBack) return;
+		fellBack = true;
+		console.error(`[burst-flash] ${workerId}: ${reason}, falling back to headless`);
+		burstWorkers.delete(workerId);
+		spawnBurstHeadless({ n, workerId, cwd, sessionDir, logPath, model, generation, env });
+	};
+	const kittyArgs = [
+		"@", "launch",
+		"--location", "hsplit",
+		"--title", paneTitle,
+		"--cwd", cwd,
+		"--env", `PI_MIND_WORKER_ROLE=worker`,
+		"--env", `PI_MIND_WORKER_TIER=flash`,
+		"--env", `PI_MIND_WORKER_ID=${workerId}`,
+		"--env", `PI_MIND_WORKER_GENERATION=${String(generation)}`,
+		"--env", `PI_MIND_WORKER_SESSION_DIR=${sessionDir}`,
+		"--env", `PATH=${process.env.PATH || ""}`,
+		"pi", "--model", model, "--session-dir", sessionDir,
+	];
+	// Best-effort focus mind window before launching split
+	const mindTitle = `mind-${hash}`;
+	try {
+		spawn("kitty", ["@", "focus-window", "--match", `title:${mindTitle}`], { stdio: "ignore", timeout: 3000 });
+	} catch { /* best-effort */ }
+	const child = spawn("kitty", kittyArgs, { stdio: "ignore", timeout: 10000 });
+	// Insert state first so workers list is accurate
 	const state: BurstWorkerState = {
 		workerId,
-		pid: child.pid,
+		pid: 0,
 		spawnedAt: Date.now(),
 		lastTaskAt: Date.now(),
 		taskCount: 0,
 		sessionDir,
 		logPath,
-		process: child,
+		process: null,
 		connectedAt: 0,
-		lastEvent: "spawned",
+		lastEvent: "spawned (kitty)",
 		lastEventAt: Date.now(),
+		launchMode: "kitty",
+		paneTitle,
+		kittyWindowId: null,
 	};
 	burstWorkers.set(workerId, state);
-	// Pipe stdout/stderr to log via write stream (end:false so one stream closing doesn't end the destination)
-	const logStream = createWriteStream(logPath, { flags: "a" });
-	if (child.stdout) child.stdout.pipe(logStream, { end: false });
-	if (child.stderr) child.stderr.pipe(logStream, { end: false });
-	child.on("exit", (code, signal) => {
-		const reason = signal ? `signal=${signal}` : `code=${code}`;
-		state.lastEvent = `exited ${reason}`;
-		state.lastEventAt = Date.now();
-		console.error(`[burst-flash] ${workerId} exited code=${code} signal=${signal}`);
-		logStream.end();
-		burstWorkers.delete(workerId);
-		// Cleanup session dir best-effort
-		try { require("node:fs").rmSync(sessionDir, { recursive: true, force: true }); } catch { /* ignore */ }
+	logBurstEvent(cwd, workerId, "spawned", `mode=kitty title=${paneTitle} model=${model}`);
+	console.error(`[burst-flash] spawned ${workerId} in kitty pane ${paneTitle}`);
+	child.on("error", (err) => fallbackToHeadless(`kitty spawn error: ${err.message}`));
+	child.on("close", (code) => {
+		if (code !== 0) fallbackToHeadless(`kitty @ launch exit code ${code}`);
 	});
-	logBurstEvent(cwd, workerId, "spawned", `pid=${child.pid} model=${model}`);
-	console.error(`[burst-flash] spawned ${workerId} pid=${child.pid}`);
-	// Start idle check timer if not running
+	// Discover PID asynchronously (abort if fell back or state no longer kitty)
+	discoverBurstKittyPane(paneTitle, 10, 500).then((result) => {
+		if (fellBack) return;
+		if (!burstWorkers.has(workerId)) return;
+		const s = burstWorkers.get(workerId)!;
+		if (s.launchMode !== "kitty") return;
+		if (result) {
+			s.pid = result.pid;
+			s.kittyWindowId = result.windowId;
+			s.lastEvent = `pid discovered: ${result.pid}`;
+			s.lastEventAt = Date.now();
+			logBurstEvent(cwd, workerId, "pid-discovered", `pid=${result.pid} windowId=${result.windowId}`);
+			console.error(`[burst-flash] ${workerId} pid=${result.pid} windowId=${result.windowId}`);
+		} else {
+			s.lastEvent = "pid discovery failed";
+			s.lastEventAt = Date.now();
+			logBurstEvent(cwd, workerId, "pid-discovery-failed", "tracking by title only");
+			console.warn(`[burst-flash] ${workerId} PID discovery failed, tracking by title only`);
+		}
+	});
 	if (!burstIdleCheckTimer) {
 		burstIdleCheckTimer = setInterval(() => checkBurstIdleTtl(cwd), 5000);
 	}
@@ -479,22 +558,36 @@ function retireBurstFlash(workerId: string, reason: string): void {
 	state.lastEventAt = Date.now();
 	console.error(`[burst-flash] retiring ${workerId} reason=${reason} tasks=${state.taskCount}`);
 	logBurstEvent("", workerId, "retire", reason);
-	// Stop sequence: socket shutdown -> SIGTERM -> SIGKILL
+	// Stop sequence: socket shutdown -> (kitty close if kitty mode) -> SIGTERM -> SIGKILL
 	const conn = workerPool.get(workerId);
 	if (conn && !conn.socket.destroyed) {
 		try { conn.socket.end(); } catch { /* ignore */ }
 	}
 	const { config } = loadConfig();
-	setTimeout(() => {
-		if (!state.process.killed) {
-			try { state.process.kill("SIGTERM"); } catch { /* ignore */ }
-		}
+	if (state.launchMode === "kitty" && state.paneTitle) {
+		// Kitty mode: close pane, then kill PID if known
+		closeKittyPaneByTitle(state.paneTitle).catch(() => {});
 		setTimeout(() => {
-			if (!state.process.killed) {
-				try { state.process.kill("SIGKILL"); } catch { /* ignore */ }
+			if (state.pid > 0) {
+				try { process.kill(state.pid, "SIGTERM"); } catch { /* ignore */ }
+				setTimeout(() => {
+					try { process.kill(state.pid, "SIGKILL"); } catch { /* ignore */ }
+				}, config.burstFlash.killTimeoutMs);
 			}
-		}, config.burstFlash.killTimeoutMs);
-	}, 500); // Give socket close a moment
+		}, 500);
+	} else {
+		// Headless mode: existing logic
+		setTimeout(() => {
+			if (state.process && !state.process.killed) {
+				try { state.process.kill("SIGTERM"); } catch { /* ignore */ }
+			}
+			setTimeout(() => {
+				if (state.process && !state.process.killed) {
+					try { state.process.kill("SIGKILL"); } catch { /* ignore */ }
+				}
+			}, config.burstFlash.killTimeoutMs);
+		}, 500); // Give socket close a moment
+	}
 	burstWorkers.delete(workerId);
 	// Cleanup session dir best-effort
 	try { require("node:fs").rmSync(state.sessionDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -503,6 +596,65 @@ function retireBurstFlash(workerId: string, reason: string): void {
 function retireAllBurstFlash(reason: string): void {
 	for (const workerId of [...burstWorkers.keys()]) {
 		retireBurstFlash(workerId, reason);
+	}
+}
+
+interface SpawnHeadlessParams {
+	n: number;
+	workerId: string;
+	cwd: string;
+	sessionDir: string;
+	logPath: string;
+	model: string;
+	generation: number;
+	env: Record<string, string>;
+}
+
+function spawnBurstHeadless(p: SpawnHeadlessParams): void {
+	const { n, workerId, cwd, sessionDir, logPath, model, generation, env } = p;
+	const child = spawn("pi", ["--model", model, "--session-dir", sessionDir], {
+		env,
+		cwd,
+		stdio: ["pipe", "pipe", "pipe"],
+		detached: false,
+	});
+	if (!child.pid) {
+		console.error(`[burst-flash] spawn failed: no pid for ${workerId}`);
+		return;
+	}
+	const state: BurstWorkerState = {
+		workerId,
+		pid: child.pid,
+		spawnedAt: Date.now(),
+		lastTaskAt: Date.now(),
+		taskCount: 0,
+		sessionDir,
+		logPath,
+		process: child,
+		connectedAt: 0,
+		lastEvent: "spawned",
+		lastEventAt: Date.now(),
+		launchMode: "headless",
+		paneTitle: null,
+		kittyWindowId: null,
+	};
+	burstWorkers.set(workerId, state);
+	const logStream = createWriteStream(logPath, { flags: "a" });
+	if (child.stdout) child.stdout.pipe(logStream, { end: false });
+	if (child.stderr) child.stderr.pipe(logStream, { end: false });
+	child.on("exit", (code, signal) => {
+		const reason = signal ? `signal=${signal}` : `code=${code}`;
+		state.lastEvent = `exited ${reason}`;
+		state.lastEventAt = Date.now();
+		console.error(`[burst-flash] ${workerId} exited code=${code} signal=${signal}`);
+		logStream.end();
+		burstWorkers.delete(workerId);
+		try { require("node:fs").rmSync(sessionDir, { recursive: true, force: true }); } catch { /* ignore */ }
+	});
+	logBurstEvent(cwd, workerId, "spawned", `pid=${child.pid} model=${model}`);
+	console.error(`[burst-flash] spawned ${workerId} pid=${child.pid}`);
+	if (!burstIdleCheckTimer) {
+		burstIdleCheckTimer = setInterval(() => checkBurstIdleTtl(cwd), 5000);
 	}
 }
 
@@ -769,6 +921,9 @@ function writeControlFileStatus(cwd: string, status: string, message?: string): 
 								base.taskCount = state.taskCount;
 								base.lastEvent = state.lastEvent;
 								base.lastEventAt = state.lastEventAt;
+								base.launchMode = state.launchMode;
+								base.paneTitle = state.paneTitle;
+								base.kittyWindowId = state.kittyWindowId;
 							}
 						}
 						return base;
@@ -1876,6 +2031,8 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 
 function stopMindServer(cwd: string, ctx: ExtensionContext): void {
 	stopDashboardHeartbeat();
+	// Retire all burst flash workers before stopping
+	retireAllBurstFlash("mind-stopped");
 	// Fail queued tasks first
 	failPendingTasks("Mind stopped", "STOP");
 	// Destroy all worker connections
