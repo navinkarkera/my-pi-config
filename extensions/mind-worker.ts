@@ -2700,7 +2700,7 @@ function generateLanes(intent: string, task: string): FanoutLane[] {
 	switch (intent) {
 		case "review":
 			return [
-				{ label: "deep-review", tier: "strong", prompt: `[Deep Review Lane]\nTask: ${task}\n\nSCOPE: Correctness, design, security, edge cases. Read-only analysis.\nDO NOT: Run tests, check coverage, analyze config — other lanes handle those.\nReturn structured output:\n- **Findings**: list with severity (critical/high/medium/low), confidence (high/medium/low), evidence (file:line).\n- **Risks/Unknowns**: what could go wrong, what's unclear.` },
+				{ label: "deep-review", tier: "strong", prompt: `[Deep Review Lane]\nTask: ${task}\n\nSCOPE: Correctness, design, security, edge cases. Use direct tools for investigation as needed.\nDO NOT: Duplicate work from test-evidence or config-risks lanes — those run in parallel.\nReturn structured output:\n- **Findings**: list with severity (critical/high/medium/low), confidence (high/medium/low), evidence (file:line).\n- **Risks/Unknowns**: what could go wrong, what's unclear.` },
 				{ label: "test-evidence", tier: "flash", prompt: `[Test & Evidence Lane]\nTask: ${task}\n\nSCOPE: Run tests, check test coverage gaps, verify assertions. Read-only analysis.\nDO NOT: Review design/security, analyze config — other lanes handle those.\nReturn structured output:\n- **Tests/Commands Run**: list with exit codes and key output.\n- **Coverage Risks**: untested paths, missing assertions.` },
 				{ label: "config-risks", tier: "flash", prompt: `[Config & Risky Patterns Lane]\nTask: ${task}\n\nSCOPE: Configuration issues, risky patterns (hardcoded secrets, missing validation, unsafe ops). Read-only analysis.\nDO NOT: Review design/security, run tests — other lanes handle those.\nReturn structured output:\n- **Findings**: list with severity, confidence, evidence (file:line).\n- **Risks/Unknowns**: insecure defaults, missing env vars.` },
 			];
@@ -2719,7 +2719,7 @@ function generateLanes(intent: string, task: string): FanoutLane[] {
 		case "debug":
 		case "implement":
 			return [
-				{ label: "deep-analysis", tier: "strong", prompt: `[Deep Analysis Lane]\nTask: ${task}\n\nSCOPE: Deep reasoning, root cause analysis, design implications.\nDO NOT: Gather evidence, run tests — other lanes handle those.\nReturn:\n- **Analysis**: with evidence and confidence levels.\n- **Recommendations**: concrete next steps.` },
+				{ label: "deep-analysis", tier: "strong", prompt: `[Deep Analysis Lane — Primary]\nTask: ${task}\n\nSCOPE: Perform the core work. Use direct tools (bash, edit, write) for the main task. Delegate to flash via delegate(tier='flash') ONLY for genuinely independent parallel subtasks (separate files, separate searches, concurrent test runs).\nDO NOT: Decompose into many tiny pieces — batch related work. If flash is busy/queue full, do the work yourself.\nReturn:\n- **Results**: evidence, diff, observations from your own work and any flash delegates.\n- **Synthesis**: final merged output.` },
 				{ label: "evidence-gather", tier: "flash", prompt: `[Evidence Gathering Lane]\nTask: ${task}\n\nSCOPE: Grep for relevant code, read key files, gather context.\nDO NOT: Deep analysis, run tests — other lanes handle those.\nReturn: concise findings with file paths and line numbers.` },
 				{ label: "test-validate", tier: "flash", prompt: `[Test & Validate Lane]\nTask: ${task}\n\nSCOPE: Run relevant tests, check current behavior.\nDO NOT: Deep analysis, gather evidence — other lanes handle those.\nReturn:\n- **Commands Run**: exact commands with exit codes.\n- **Observations**: current behavior, regressions.` },
 			];
@@ -3318,8 +3318,8 @@ async function executeFanout(
 			command: Type.String({ description: "Git subcommand, e.g. 'status -sb' or 'diff -- src/file.ts'" }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (currentRole !== "mind") {
-				return { content: [{ type: "text", text: "git tool only in mind mode" }], isError: true };
+			if (currentRole !== "mind" && !(currentRole === "worker" && LAUNCHER_WORKER_TIER === "strong")) {
+				return { content: [{ type: "text", text: "git tool only in mind mode or strong-worker mode" }], isError: true };
 			}
 			const command = params.command?.trim() || "";
 			if (!isSafeGitSubcommand(command)) {
@@ -3349,8 +3349,8 @@ async function executeFanout(
 			contextLines: Type.Optional(Type.Number({ description: "Context lines around matches" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (currentRole !== "mind") {
-				return { content: [{ type: "text", text: "ripgrep tool only in mind mode" }], isError: true };
+			if (currentRole !== "mind" && !(currentRole === "worker" && LAUNCHER_WORKER_TIER === "strong")) {
+				return { content: [{ type: "text", text: "ripgrep tool only in mind mode or strong-worker mode" }], isError: true };
 			}
 
 			const args = ["--line-number", "--no-heading", "--color", "never"];
@@ -3381,29 +3381,22 @@ async function executeFanout(
 			return {
 				systemPrompt:
 					event.systemPrompt +
-					"\n\n[STRONG WORKER MODE — Subdelegate to Flash Workers]\n" +
-					"You are a strong-tier worker with deep reasoning capabilities (multi-file refactors, architecture, debugging).\n" +
-					"You have the `delegate` tool to subdelegate scoped tasks to flash workers via delegate(tier='flash').\n" +
-					"You also have all normal direct tools (bash, read, edit, write, git, ripgrep, etc.) — use them inline for trivial one-off checks (single file read, quick grep). Reserve delegate for multi-step or scoped work.\n" +
+					"\n\n[STRONG WORKER MODE — Direct Tools + Selective Flash Delegation]\n" +
+					"You are a strong-tier worker. You have full access to all tools (bash, edit, write, read, ripgrep, git, delegate).\n" +
+					"Key guidelines:\n" +
+					"  1. Use direct tools (bash, edit, write, etc.) freely for your own task — you are NOT orchestration-only.\n" +
+					"  2. Delegate to flash workers via delegate(tier='flash') ONLY for genuinely independent parallel subtasks — separate files, separate searches, separate test runs that can run concurrently.\n" +
+					"  3. Do NOT delegate sequential or dependent work. Do not decompose a simple task into many tiny pieces; batch related work into a single delegate call or do it yourself.\n" +
+					"  4. Synthesize all results into a single cohesive response.\n" +
 					"\n" +
-					"When to subdelegate to flash workers:\n" +
-					"  • Simple file reads, grep/ripgrep searches, single-file edits, test runs, builds\n" +
-					"  • Any scoped, single-purpose task that does not require architectural reasoning\n" +
-					"  • Independent subtasks — fan out to multiple flash workers in parallel by default, not sequential\n" +
-					"  • Pass shared context via `plan` and `context` params — use these to share plan state, running summaries, or design decisions\n" +
+					"Avoid delegate retry loops:\n" +
+					"  • If delegate returns an error (queue full, all flash busy, timeout), do NOT immediately retry.\n" +
+					"  • Instead, do the work yourself using direct tools. Retry delegation only after meaningful progress or when the queue has had time to drain.\n" +
+					"  • If a subdelegate times out, handle it yourself rather than re-delegating the same work.\n" +
 					"\n" +
-					"When NOT to subdelegate (handle yourself):\n" +
-					"  • Multi-file refactors, architecture decisions, complex debugging, correctness-sensitive work\n" +
-					"  • Tasks requiring deep reasoning, cross-file understanding, or where output quality is critical\n" +
-					"\n" +
-					"Queue & error handling:\n" +
-					"  • If all flash workers are busy, the task queues and dispatches when a flash worker becomes idle\n" +
-					"  • If queue is full (queue limit depends on worker count), delegate returns an error — retry later\n" +
-					"  • Each subdelegate has a timeout (120s by default). If no response in time, the subdelegate fails with timeout error.\n" +
-					"  • If the parent task is aborted, all pending subdelegates are aborted automatically.\n" +
-					"\n" +
+					"Pass shared context to flash via `plan` and `context` params when delegating.\n" +
 					"Flash workers cannot delegate further — you are the top of the delegation chain.\n" +
-					"Never attempt to delegate to 'strong' tier; only flash workers are available for subdelegation.\n",
+					"Never delegate to 'strong' tier; only flash workers are available for subdelegation.\n",
 			};
 		}
 		if (currentRole !== "mind" && launcherBootHint !== "mind") return;
@@ -3436,8 +3429,6 @@ async function executeFanout(
 				"Use delegate(tier='flash') for ALL scoped/simple tasks — anything that does not require multi-file architecture, deep debugging, or correctness-sensitive reasoning.\n" +
 				"Do not hold back flash delegates because static flash workers are busy — queued flash-tier tasks auto-spawn burst workers up to configured max.\n" +
 				"Parallelize/queue independent flash work liberally; burst workers activate from queue pressure.\n" +
-				"Strong tier: reserved only for multi-file refactors, architecture decisions, complex debugging, correctness-sensitive work.\n" +
-				"When in doubt between flash and strong, choose strong; flash is fast but shallow.\n" +
 				"Mind: planning, final review/verdict, lightweight read/git/ripgrep checks only.\n" +
 				"Never use write/edit/bash/grep/find directly in mind mode.\n" +
 				"Parallel-by-default: independent tasks (separate files, separate searches, separate assertions) fan out across all idle workers in the same turn. This is the expected default — not a special pattern.\n" +
@@ -3451,6 +3442,10 @@ async function executeFanout(
 				"If investigation is extensive (many files, repeated searches, or large outputs), delegate to worker and request concise summary with evidence.\n" +
 				"If multiple file reads are needed, delegate worker to read files and write concise summary to temporary file, then read that file from mind.\n" +
 				"If search scope is large, delegate worker to run ripgrep/searches and write concise findings to temporary file, then read that file from mind.\n" +
+				(strongCount > 0
+					? "Strong tier: complex/deep reasoning, multi-file architecture, and correctness-sensitive tasks. Strong may use direct tools (bash, edit, write).\n" +
+					  "Flash tier: scoped/simple tasks, test runs, evidence gathering, independent implementation chunks. Prefer flash for anything that does NOT require strong's deep context.\n"
+					: "") +
 				planSection,
 		};
 	});
