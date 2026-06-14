@@ -8,6 +8,7 @@
   "mindModel": "openai-codex/gpt-5.5",
   "workerModels": [
     { "model": "opencode-go/deepseek-v4-flash", "count": 2, "tier": "flash" },
+    { "model": "opencode-go/minimax-m3", "count": 1, "tier": "strong" }
   ],
   "workerModel": "opencode-go/deepseek-v4-flash",
   "resetTimeout": 5,
