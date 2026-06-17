@@ -1,6 +1,6 @@
 {
   "quietStartup": true,
-  "lastChangelogVersion": "0.79.3",
+  "lastChangelogVersion": "0.79.6",
   "defaultProvider": "opencode-go",
   "defaultModel": "deepseek-v4-flash",
   "defaultThinkingLevel": "xhigh",
@@ -18,7 +18,8 @@
     "npm:pi-web-access",
     "npm:@codexstar/pi-listen",
     "npm:pi-nvim",
-    "npm:@llblab/pi-telegram"
+    "npm:@llblab/pi-telegram",
+    "git:github.com/DietrichGebert/ponytail"
   ],
   "hideThinkingBlock": true,
   "steeringMode": "one-at-a-time",
@@ -51,5 +52,6 @@
       "completedAt": "2026-05-09T12:24:16.898Z",
       "source": "migration"
     }
-  }
+  },
+  "theme": "dark"
 }
