@@ -1251,7 +1251,9 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 		};
 		const resolved = resolveWorkerModels(config);
 		return { config, created: false, resolvedWorkers: resolved };
-	} catch {
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		console.warn(`[mind-worker] Failed to parse ${path}: ${msg}. Falling back to DEFAULT_CONFIG.`);
 		const resolved = resolveWorkerModels(DEFAULT_CONFIG);
 		return { config: DEFAULT_CONFIG, created: false, resolvedWorkers: resolved };
 	}
