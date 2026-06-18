@@ -5,7 +5,7 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const execAsync = promisify(exec);
@@ -2566,6 +2566,20 @@ async function activateWorkerRole(ctx: ExtensionContext, pi: ExtensionAPI): Prom
 	pi.setThinkingLevel(WORKER_THINKING_LEVEL);
 	// Launcher-path workers in headless mode need a keepalive to prevent event-loop exit
 	if (LAUNCHER_ROLE_FLAG === "worker") startWorkerKeepalive();
+
+	// Launcher-path worker: hide prompt/editor since worker communicates via mind socket
+	if (LAUNCHER_ROLE_FLAG === "worker") {
+		ctx.ui.setEditorComponent((_tui, theme, keybindings) =>
+			new (class extends CustomEditor {
+				render(width: number) { return []; }
+				handleInput(data: string) {
+					if (data.length === 1 && data >= " ") return;
+					super.handleInput(data);
+				}
+			})(_tui, theme, keybindings)
+		);
+	}
+
 	const connected = await connectWorker(ctx.cwd, ctx, createWorkerHandler(pi));
 	if (!connected) {
 		stopWorkerKeepalive();
@@ -2622,6 +2636,7 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 				return;
 			}
 			disconnectWorker(ctx);
+			ctx.ui.setEditorComponent(undefined);
 			if (defaultTools) pi.setActiveTools(defaultTools);
 			currentRole = "none";
 			pi.appendEntry("mind-worker-role", { role: "none", cwd: ctx.cwd });
@@ -3562,6 +3577,7 @@ async function executeFanout(
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		ctx.ui.setEditorComponent(undefined);
 		if (currentRole === "mind") stopMindServer(ctx.cwd, ctx);
 		if (currentRole === "worker") disconnectWorker(ctx);
 		failPendingTasks("Session ended", "SESSION_END");
