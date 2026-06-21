@@ -65,7 +65,7 @@ interface BurstFlashConfig {
 }
 
 interface SocketMsg {
-	type: "task" | "result" | "error" | "status" | "abort" | "ping" | "pong" | "handshake" | "subdelegate-request" | "subdelegate-response";
+	type: "task" | "result" | "error" | "status" | "abort" | "ping" | "pong" | "handshake" | "subdelegate-request" | "subdelegate-response" | "shutdown";
 	id?: string;
 	task?: string;
 	step?: number;
@@ -1734,6 +1734,10 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 						if (isBurst) {
 							onBurstWorkerConnected(assignedWorkerId);
 							console.error(`[burst-flash] ${assignedWorkerId} connected to socket`);
+							// Restart idle check timer if it was paused during suspend
+							if (!burstIdleCheckTimer && burstWorkers.size > 0) {
+								burstIdleCheckTimer = setInterval(() => checkBurstIdleTtl(cwd), 5000);
+							}
 						}
 						// Dispatch any queued tasks to this new worker
 						if (pendingQueue.length > 0) {
@@ -2140,10 +2144,33 @@ function stopMindServer(cwd: string, ctx: ExtensionContext): void {
 	retireAllBurstFlash("mind-stopped");
 	// Fail queued tasks first
 	failPendingTasks("Mind stopped", "STOP");
-	// Destroy all worker connections
+	// Notify all workers of intentional shutdown so they don't reconnect forever
 	for (const [, conn] of workerPool) {
-		try { conn.socket.destroy(); } catch { /* ignore */ }
+		try {
+			sendJson(conn.socket, { type: "shutdown" });
+			conn.socket.end();
+		} catch { /* ignore */ }
 	}
+	teardownMindServer(cwd, ctx);
+}
+
+/** Teardown socket/server — no burst retire, no shutdown message */
+function suspendMindServer(cwd: string, ctx: ExtensionContext): void {
+	stopDashboardHeartbeat();
+	clearBurstRetryTimers();
+	// Pause burst idle check — workerPool is empty, don't let it delete burstWorkers
+	if (burstIdleCheckTimer) {
+		clearInterval(burstIdleCheckTimer);
+		burstIdleCheckTimer = null;
+	}
+	failPendingTasks("Mind suspended", "SUSPEND");
+	for (const [, conn] of workerPool) {
+		try { conn.socket.end(); } catch { /* ignore */ }
+	}
+	teardownMindServer(cwd, ctx);
+}
+
+function teardownMindServer(cwd: string, ctx: ExtensionContext): void {
 	workerPool.clear();
 	taskWorkerMap.clear();
 	asyncTaskWorkerMap.clear();
@@ -2256,27 +2283,35 @@ async function connectWorker(
 						return;
 					}
 
+					// Intentional shutdown — /stop-mind, don't reconnect
+					if (msg.type === "shutdown") {
+						process.exit(0);
+						return;
+					}
+
 					handler(msg, socket, ctx).catch(() => {});
 				}),
 			);
 
 			socket.on("close", () => {
+				// If workerSocket already differs, session_start already connected a
+				// replacement — don't start a second reconnect that would race.
+				if (workerSocket !== socket) return;
 				workerSocket = null;
 				safeUiStatus(ctx, "mind-worker", undefined);
 				if (currentRole === "worker") {
-					// Launcher-path worker exits immediately on disconnect
-					process.exit(0);
+					// Reconnect after transient disconnect (mind restart/reset)
+					setTimeout(
+						() => connectWorker(ctx.cwd, ctx, handler),
+						500,
+					);
 				}
 			});
 
 			socket.on("error", (err: any) => {
-				socket.destroy();
-				if (!connected) {
-					// Launcher path: do NOT unlink socket — launcher owns lifecycle
-					safeUiNotify(ctx, `Socket error: ${err.message}`, "error");
-					// Connection failed — worker exits
-					process.exit(1);
-				}
+				// Launcher path: do NOT unlink socket — launcher owns lifecycle
+				// close handler will reconnect; no retry here to avoid duplicate scheduling
+				safeUiNotify(ctx, `Socket error: ${err.message}`, "error");
 			});
 		});
 	}
@@ -2308,11 +2343,18 @@ async function connectWorker(
 				parseLines((line) => {
 					let msg: SocketMsg;
 					try { msg = JSON.parse(line); } catch { return; }
+					// Intentional shutdown — don't reconnect
+					if (msg.type === "shutdown") {
+						currentRole = "none";
+						return;
+					}
 					handler(msg, socket, ctx).catch(() => {});
 				}),
 			);
 
 			socket.on("close", () => {
+				// If workerSocket already differs, session_start connected a replacement
+				if (workerSocket !== socket) return;
 				workerSocket = null;
 				safeUiStatus(ctx, "mind-worker", undefined);
 				if (currentRole === "worker") {
@@ -3836,7 +3878,7 @@ async function executeFanout(
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		ctx.ui.setEditorComponent(undefined);
-		if (currentRole === "mind") stopMindServer(ctx.cwd, ctx);
+		if (currentRole === "mind") suspendMindServer(ctx.cwd, ctx);
 		if (currentRole === "worker") disconnectWorker(ctx);
 		failPendingTasks("Session ended", "SESSION_END");
 		currentRole = "none";
