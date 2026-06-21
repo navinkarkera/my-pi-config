@@ -2534,10 +2534,7 @@ async function activateMindRole(ctx: ExtensionContext, pi: ExtensionAPI): Promis
 		void spawnWorkerInKitty(ctx.cwd).catch(() => {});
 	}
 
-	// Launcher path: fresh boot, never write restore metadata
-	if (!LAUNCHER_ROLE_FLAG) {
-		pi.appendEntry("mind-worker-role", { role: "mind", cwd: ctx.cwd });
-	}
+	pi.appendEntry("mind-worker-role", { role: "mind", cwd: ctx.cwd });
 
 	// Boot hint consumed — clear so before_agent_start no longer treats CLi flag as current role
 	launcherBootHint = null;
