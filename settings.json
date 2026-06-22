@@ -1,9 +1,9 @@
 {
   "quietStartup": true,
-  "lastChangelogVersion": "0.79.9",
-  "defaultProvider": "openai-codex",
-  "defaultModel": "gpt-5.4",
-  "defaultThinkingLevel": "high",
+  "lastChangelogVersion": "0.79.10",
+  "defaultProvider": "opencode-go",
+  "defaultModel": "deepseek-v4-flash",
+  "defaultThinkingLevel": "xhigh",
   "enabledModels": [
     "openai-codex/gpt-5.4",
     "openai-codex/gpt-5.5",

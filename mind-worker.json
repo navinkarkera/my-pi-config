@@ -5,9 +5,10 @@
   "workerTaskStrictness": "strict",
   "notifyOnMindIdle": true,
   "ntfyTopic": "nrk_mangalpete_legion_ai_reminders",
-  "mindModel": "openai-codex/gpt-5.5",
+  "mindModel": "openai-codex/gpt-5.4",
   "workerModels": [
-    { "model": "opencode-go/deepseek-v4-flash", "count": 3, "tier": "flash" }
+    { "model": "opencode-go/deepseek-v4-flash", "count": 3, "tier": "flash" },
+    { "model": "opencode-go/deepseek-v4-pro", "count": 1, "tier": "strong" }
   ],
   "workerModel": "opencode-go/deepseek-v4-flash",
   "resetTimeout": 5,
