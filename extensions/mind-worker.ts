@@ -41,6 +41,7 @@ interface MindWorkerConfig {
 	ntfyServer: string;
 	resetTimeout: number;
 	kittyEnabled: boolean;
+	kittyLayout?: string;
 	workerCount: number;
 	workerModels?: Array<{ model: string; count: number; tier?: string }>;
 	dashboardEnabled: boolean;
@@ -113,6 +114,7 @@ const DEFAULT_CONFIG: MindWorkerConfig = {
 	ntfyServer: "https://ntfy.sh",
 	resetTimeout: 5,
 	kittyEnabled: true,
+	kittyLayout: undefined,
 	workerCount: 3,
 	workerModels: undefined,
 	dashboardEnabled: true,
@@ -1240,6 +1242,14 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 				? parsed.resetTimeout : DEFAULT_CONFIG.resetTimeout,
 			kittyEnabled: typeof parsed.kittyEnabled === "boolean"
 				? parsed.kittyEnabled : DEFAULT_CONFIG.kittyEnabled,
+			kittyLayout: (() => {
+				const v = parsed.kittyLayout;
+				if (typeof v === "string" && v !== "default" && v !== "mind-split-workers-tab") {
+					console.warn(`[mind-worker] kittyLayout "${v}" invalid — must be "default" or "mind-split-workers-tab"`);
+					return undefined;
+				}
+				return typeof v === "string" ? v : undefined;
+			})(),
 			workerCount: wc,
 			workerModels: parsed.workerModels,
 			dashboardEnabled: parsed.dashboardEnabled !== false,

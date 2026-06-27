@@ -13,6 +13,7 @@
   "workerModel": "opencode-go/deepseek-v4-flash",
   "resetTimeout": 5,
   "kittyEnabled": true,
+  "kittyLayout": "mind-split-workers-tab",
   "workerCount": 3,
   "dashboardEnabled": true,
   "dashboardLogResponses": true,
