@@ -11,6 +11,7 @@
     { "model": "opencode-go/deepseek-v4-pro", "count": 1, "tier": "strong" }
   ],
   "workerModel": "opencode-go/deepseek-v4-flash",
+  "terminalBackend": "herdr",
   "resetTimeout": 5,
   "kittyEnabled": true,
   "kittyLayout": "mind-split-workers-tab",
