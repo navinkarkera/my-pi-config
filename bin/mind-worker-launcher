@@ -15,9 +15,9 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 
 if [ "$BACKEND" = "herdr" ]; then
-	HERDR_LAUNCHER="$AGENT_DIR/lib/mind-worker/herdr-launcher.sh"
+	HERDR_LAUNCHER="$AGENT_DIR/lib/mind-worker/herdr-launcher.mjs"
 	if [ -f "$HERDR_LAUNCHER" ]; then
-		exec bash "$HERDR_LAUNCHER" "$@"
+		exec $NODE "$HERDR_LAUNCHER" "$@"
 	else
 		echo "ERROR: herdr launcher not found at $HERDR_LAUNCHER" >&2
 		exit 1
