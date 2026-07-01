@@ -6,18 +6,44 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_DIR="$SCRIPT_DIR/.."
 CONFIG_FILE="$AGENT_DIR/mind-worker.json"
-NODE="mise x node@26 -- node"
+NODE_CMD=(mise x node@26 -- node)
+
+# Parse --background flag (consumed here, not passed to launcher)
+BACKGROUND_FLAG=0
+PASSTHROUGH_ARGS=()
+for arg in "$@"; do
+  if [ "$arg" = "--background" ]; then
+    BACKGROUND_FLAG=1
+  else
+    PASSTHROUGH_ARGS+=("$arg")
+  fi
+done
+set -- "${PASSTHROUGH_ARGS[@]}"
+
+# Also check env var
+if [ "${MIND_WORKER_LAUNCHER_BACKGROUND:-}" = "1" ]; then
+  BACKGROUND_FLAG=1
+fi
 
 # Check for herdr backend config
 BACKEND=""
 if [ -f "$CONFIG_FILE" ]; then
-	BACKEND="$($NODE -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf-8")).terminalBackend||"")}catch{console.log("")}' "$CONFIG_FILE" 2>/dev/null)"
+	BACKEND="$("${NODE_CMD[@]}" -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf-8")).terminalBackend||"")}catch{console.log("")}' "$CONFIG_FILE" 2>/dev/null)"
 fi
 
 if [ "$BACKEND" = "herdr" ]; then
 	HERDR_LAUNCHER="$AGENT_DIR/lib/mind-worker/herdr-launcher.mjs"
 	if [ -f "$HERDR_LAUNCHER" ]; then
-		exec $NODE "$HERDR_LAUNCHER" "$@"
+		if [ "$BACKGROUND_FLAG" = "1" ]; then
+			LOG_FILE="$AGENT_DIR/mindworker/herdr-launcher-background.log"
+			mkdir -p "$(dirname "$LOG_FILE")"
+			MIND_WORKER_HERDR_BACKGROUND=1 nohup "${NODE_CMD[@]}" "$HERDR_LAUNCHER" "$@" < /dev/null >> "$LOG_FILE" 2>&1 &
+			BG_PID=$!
+			disown "$BG_PID" || true
+			echo "Background mind-worker launcher started (PID: $BG_PID)" >&2
+			exit 0
+		fi
+		exec "${NODE_CMD[@]}" "$HERDR_LAUNCHER" "$@"
 	else
 		echo "ERROR: herdr launcher not found at $HERDR_LAUNCHER" >&2
 		exit 1
@@ -32,4 +58,4 @@ if [ ! -f "$HELPER" ]; then
 	exit 1
 fi
 
-exec $NODE "$HELPER" "$@"
+exec "${NODE_CMD[@]}" "$HELPER" "$@"
