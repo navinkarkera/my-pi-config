@@ -1,8 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Thin shell wrapper — resolves helper path and delegates to TS/JS helper.
+# Thin shell wrapper — dispatches to herdr launcher when terminalBackend == "herdr",
+# otherwise falls back to the default node (kitty) launcher.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENT_DIR="$SCRIPT_DIR/.."
+CONFIG_FILE="$AGENT_DIR/mind-worker.json"
+NODE="mise x node@26 -- node"
+
+# Check for herdr backend config
+BACKEND=""
+if [ -f "$CONFIG_FILE" ]; then
+	BACKEND="$($NODE -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf-8")).terminalBackend||"")}catch{console.log("")}' "$CONFIG_FILE" 2>/dev/null)"
+fi
+
+if [ "$BACKEND" = "herdr" ]; then
+	HERDR_LAUNCHER="$AGENT_DIR/lib/mind-worker/herdr-launcher.sh"
+	if [ -f "$HERDR_LAUNCHER" ]; then
+		exec bash "$HERDR_LAUNCHER" "$@"
+	else
+		echo "ERROR: herdr launcher not found at $HERDR_LAUNCHER" >&2
+		exit 1
+	fi
+fi
+
+# Default: delegate to existing node (kitty) launcher
 HELPER="$SCRIPT_DIR/../lib/mind-worker/mind-worker-launcher.mjs"
 
 if [ ! -f "$HELPER" ]; then
@@ -10,4 +32,4 @@ if [ ! -f "$HELPER" ]; then
 	exit 1
 fi
 
-exec node "$HELPER" "$@"
+exec $NODE "$HELPER" "$@"
