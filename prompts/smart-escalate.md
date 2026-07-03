@@ -31,6 +31,18 @@ Use Herdr to call a smarter model when any of these happen:
 
 Do not escalate for simple edits, formatting, obvious bug fixes, small refactors, or routine file reading.
 
+## Available smart models
+
+Use the appropriate model based on the difficulty and risk of the question:
+
+| Priority | Model | When to use |
+|----------|-------|-------------|
+| 1 (default) | `opencode-go/deepseek-v4-pro` | Routine architecture questions, code reviews, small refactor plans |
+| 2 | `opencode-go/glm-5.2` | Harder design decisions, tricky bugs, moderate-risk changes |
+| 3 | `openai-codex/gpt-5.5` | Critical architecture, security/auth, concurrency, data migrations, or when two prior escalations didn't resolve the issue |
+
+Start at the lowest tier that matches the problem. Don't burn the smartest model on routine questions.
+
 ## How to use Herdr for escalation
 
 When escalation is needed, use the Herdr skill to create or reuse a separate smart-review session inside the current Herdr workspace.
