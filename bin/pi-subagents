@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
-exec mise x node@26 -- pi --tools read,subagent --append-system-prompt "$agent_dir/APPEND_SUBAGENTS.md" "$@"
+exec mise x node@26 -- pi --tools read,find,ls,edit,write,subagent,questionnaire --append-system-prompt "$agent_dir/APPEND_SUBAGENTS.md" "$@"
