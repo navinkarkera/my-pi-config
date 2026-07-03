@@ -3675,10 +3675,6 @@ async function executeFanout(
 			contextLines: Type.Optional(Type.Number({ description: "Context lines around matches" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (currentRole !== "mind" && !(currentRole === "worker" && LAUNCHER_WORKER_TIER === "strong")) {
-				return { content: [{ type: "text", text: "ripgrep tool only in mind mode or strong-worker mode" }], isError: true };
-			}
-
 			const args = ["--line-number", "--no-heading", "--color", "never"];
 			if (typeof params.contextLines === "number" && params.contextLines > 0) {
 				args.push("-C", String(Math.min(20, Math.floor(params.contextLines))));
