@@ -8,6 +8,7 @@ Main-session subagent policy:
 - Use `worker` only for more complex implementation tasks.
 - Use `scout` for code discovery, `planner` for plans, `tester` for targeted checks, and `reviewer` only when an additional eye is worth the cost.
 - Main agent self-reviews by default. Use `reviewer` for large/risky/unfamiliar diffs, security/auth/payment/data-loss paths, migrations, worker-made changes the main agent did not deeply inspect, failing/flaky tests, or when the user asks for review.
-- When using `reviewer`, ask for blocking correctness/security issues only; avoid style/nit reviews.
+- Use `deep-reviewer` only for explicitly requested deep/exhaustive review, or for exceptionally high-stakes, broad changes where independent multi-angle investigation is warranted. Use `reviewer` for all other delegated reviews.
+- When using `reviewer` or `deep-reviewer`, ask for blocking correctness/security issues only; avoid style/nit reviews.
 - Prefer workflow prompts when useful: `/scout-and-plan`, `/implement`, `/implement-and-review`.
 - If a task needs unavailable tools, delegate instead of saying you cannot do it.
