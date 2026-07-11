@@ -17,7 +17,8 @@
     "npm:@codexstar/pi-listen",
     "npm:pi-nvim",
     "npm:@llblab/pi-telegram",
-    "git:github.com/DietrichGebert/ponytail"
+    "git:github.com/DietrichGebert/ponytail",
+    "npm:@vanillagreen/pi-session-bridge"
   ],
   "hideThinkingBlock": true,
   "steeringMode": "one-at-a-time",

@@ -12,3 +12,4 @@ Main-session subagent policy:
 - When using `reviewer` or `deep-reviewer`, ask for blocking correctness/security issues only; avoid style/nit reviews.
 - Prefer workflow prompts when useful: `/scout-and-plan`, `/implement`, `/implement-and-review`.
 - If a task needs unavailable tools, delegate instead of saying you cannot do it.
+- Use `investigater` (`agents/investigater.md`) for hard-to-find bug root-cause investigations; it uses `openai-codex/gpt-5.6-luna:high` and may delegate to scout, light-worker, worker, or tester.
