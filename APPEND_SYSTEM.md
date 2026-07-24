@@ -27,5 +27,5 @@ Commands:
 - `commands` — list slash commands the target session exposes.
 - `/bridge:ping <text>` (via `send`) — no-LLM connectivity probe.
 
-Installed at `~/.pi/agent/bin/pi-bridge` (global) or `<project>/.pi/bin/pi-bridge` (project).
+Installed at `~/.local/bin/pi-bridge` (global).
 <!-- vstack:append-system @vanillagreen/pi-session-bridge end -->
