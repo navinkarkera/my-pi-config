@@ -41,16 +41,6 @@ pi install npm:@llblab/pi-telegram
 
 Installed package caches live in `git/` and `npm/` — both gitignored.
 
-## Mind-worker launcher
-
-`bin/mind-worker-launcher` and its runtime files (`mind-worker-launcher.mjs`,
-`kitty-adapter.mjs`, `supervisor.mjs`) are vendored under
-`lib/mind-worker/` — safe to commit and portable across clones.
-
-The `git/mind-worker-rebuild/` directory is a reinstalled package cache.
-Scripts that hardcode paths into `git/` will break on a fresh clone.
-All tracked runtime paths resolve under `lib/` instead.
-
 ## Ignored files
 
 | Pattern | Reason |
@@ -61,9 +51,6 @@ All tracked runtime paths resolve under `lib/` instead.
 | `tmp/` | Temp artifacts |
 | `locks.json` | Runtime lock |
 | `run-history.jsonl` | Runtime log |
-| `mindworker/*.{sock,mind-control,manifest,plan,pending}*` | Worker ephemeral state |
-
-`mind-worker.json` at repo root is portable config — not ignored.
 
 ## Local models
 
