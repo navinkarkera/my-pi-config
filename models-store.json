@@ -492,7 +492,7 @@
         "maxTokens": 131072
       }
     ],
-    "checkedAt": 1785840746363,
+    "checkedAt": 1785946643898,
     "lastModified": 1785760817000,
     "etag": "W/\"9acd354f1fe084eec04a65a7ad727beb\""
   },
@@ -741,7 +741,7 @@
         }
       }
     ],
-    "checkedAt": 1785840742084,
+    "checkedAt": 1786078313227,
     "lastModified": 1785760814000,
     "etag": "W/\"400cac2d73673d9fff4c7d0ed22691b0\""
   },
@@ -1686,7 +1686,7 @@
       {
         "id": "grok-4.5",
         "name": "Grok 4.5",
-        "api": "openai-completions",
+        "api": "openai-responses",
         "provider": "github-copilot",
         "baseUrl": "https://api.individual.githubcopilot.com",
         "reasoning": true,
@@ -1717,10 +1717,14 @@
           "Editor-Plugin-Version": "copilot-chat/0.35.0",
           "Copilot-Integration-Id": "vscode-chat"
         },
-        "compat": {
-          "supportsStore": false,
-          "supportsDeveloperRole": false,
-          "supportsReasoningEffort": false
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "xhigh": null,
+          "max": null
         }
       },
       {
@@ -1789,8 +1793,8 @@
         }
       }
     ],
-    "checkedAt": 1785840748541,
-    "lastModified": 1785832783000,
-    "etag": "W/\"6deff5119ac5bffe8fd793fd0e562401\""
+    "checkedAt": 1786078312438,
+    "lastModified": 1785841793000,
+    "etag": "W/\"4fb0e6b4a542b895ae29356eb82b4952\""
   }
 }
