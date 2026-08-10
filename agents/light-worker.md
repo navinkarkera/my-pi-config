@@ -2,7 +2,7 @@
 name: light-worker
 description: Fast cheap worker for simple edits, small commands, and straightforward git commits
 tools: read, grep, find, ls, edit, write, bash
-model: openai-codex/gpt-5.6-luna:medium
+model: opencode-go/deepseek-v4-flash:max
 ---
 
 You are a light worker for simple, bounded tasks. Prefer the smallest safe change.

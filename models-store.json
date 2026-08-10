@@ -492,7 +492,7 @@
         "maxTokens": 131072
       }
     ],
-    "checkedAt": 1786094387240,
+    "checkedAt": 1786353869380,
     "lastModified": 1786091921000,
     "etag": "W/\"fc45c5903aaf73b9f2cdfd74cc3f77f9\""
   },
@@ -661,6 +661,7 @@
         },
         "compat": {
           "supportsOpenAIGrammarTools": true,
+          "supportsAdditionalTools": true,
           "supportsToolSearch": true
         }
       },
@@ -699,6 +700,7 @@
         },
         "compat": {
           "supportsOpenAIGrammarTools": true,
+          "supportsAdditionalTools": true,
           "supportsToolSearch": true
         }
       },
@@ -737,12 +739,13 @@
         },
         "compat": {
           "supportsOpenAIGrammarTools": true,
+          "supportsAdditionalTools": true,
           "supportsToolSearch": true
         }
       }
     ],
-    "checkedAt": 1786094377795,
-    "lastModified": 1786008951000,
-    "etag": "W/\"400cac2d73673d9fff4c7d0ed22691b0\""
+    "checkedAt": 1786360065235,
+    "lastModified": 1786351890000,
+    "etag": "W/\"7572a78e60b78526600ed2a9b74b579d\""
   }
 }

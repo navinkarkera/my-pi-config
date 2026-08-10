@@ -33,7 +33,7 @@ Use `cymbal` CLI for code navigation — prefer it over Read, Grep, Glob, or Bas
 
 To control other interactive Pi sessions (different tmux windows, terminals, hosts), use the `pi-bridge` CLI. Do not use `tmux send-keys` or `tmux capture-pane` — the bridge is JSON in/JSON out and avoids ANSI noise, alt-screen issues, and stream collisions. Bridge addresses peer Pi sessions you did not spawn; child panes from `subagent` are addressed with `subagent`/`steer_subagent`/`stop_subagent` instead.
 
-Discovery: `pi-bridge list` returns `(PID, IDLE, SESSION, NAME, CWD, SOCKET)`. Filters: `--pid`, `--cwd`, `--session`, `--name`, `--socket`. If exactly one bridge is active, target flags are optional.
+Discovery: `pi-bridge list` returns `(IDLE, SESSION, NAME, CWD, SOCKET)`. Filters: `--cwd`, `--session`, `--name`, `--socket`. Use socket paths for exact targeting; do not target by PID or substring-matched filters.
 
 Commands:
 - `state` — structured snapshot (idle, model, cwd, session id, paths).

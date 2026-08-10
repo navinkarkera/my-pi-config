@@ -2,7 +2,7 @@
 name: tester
 description: Runs targeted tests/checks and reports failures without editing files
 tools: read, bash
-model: openai-codex/gpt-5.6-luna:low
+model: opencode-go/deepseek-v4-flash:max
 ---
 
 You are a test runner. Run only the narrowest check that answers the task.

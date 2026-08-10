@@ -1,9 +1,9 @@
 {
   "quietStartup": true,
-  "lastChangelogVersion": "0.84.0",
-  "defaultProvider": "openai-codex",
-  "defaultModel": "gpt-5.6-luna",
-  "defaultThinkingLevel": "low",
+  "lastChangelogVersion": "0.84.1",
+  "defaultProvider": "opencode-go",
+  "defaultModel": "deepseek-v4-flash",
+  "defaultThinkingLevel": "high",
   "enabledModels": [
     "openai-codex/gpt-5.4-mini",
     "opencode-go/deepseek-v4-flash",
@@ -16,7 +16,6 @@
     "npm:pi-web-access",
     "npm:@codexstar/pi-listen",
     "npm:pi-nvim",
-    "npm:@llblab/pi-telegram",
     "git:github.com/DietrichGebert/ponytail",
     "npm:@vanillagreen/pi-session-bridge",
     "npm:pi-discord-remote"
