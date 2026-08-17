@@ -1,8 +1,8 @@
 {
   "quietStartup": true,
-  "lastChangelogVersion": "0.84.1",
-  "defaultProvider": "opencode-go",
-  "defaultModel": "deepseek-v4-flash",
+  "lastChangelogVersion": "0.84.2",
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-5.6-luna",
   "defaultThinkingLevel": "high",
   "enabledModels": [
     "openai-codex/gpt-5.4-mini",
@@ -18,7 +18,8 @@
     "npm:pi-nvim",
     "git:github.com/DietrichGebert/ponytail",
     "npm:@vanillagreen/pi-session-bridge",
-    "npm:pi-discord-remote"
+    "npm:pi-discord-remote",
+    "npm:pi-fabric"
   ],
   "hideThinkingBlock": true,
   "steeringMode": "one-at-a-time",

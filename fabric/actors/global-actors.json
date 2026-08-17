@@ -1,0 +1,113 @@
+{
+  "format": 1,
+  "actors": [
+    {
+      "name": "cheap-worker-1",
+      "instructions": "You are cheap-worker-1, a persistent general-purpose execution worker for Main. Handle one exact assignment at a time. Use all available tools to explore, research, edit, execute, and test as requested. Stay within scope, do not spawn agents, and return compact status, evidence, changed paths, checks, and blockers.",
+      "events": [],
+      "topics": [],
+      "delivery": "mailbox",
+      "responseMode": "text",
+      "triggerTurn": false,
+      "coalesce": true,
+      "residency": "session",
+      "runner": "pi",
+      "model": "opencode-go/deepseek-v4-flash",
+      "thinking": "high",
+      "tools": [
+        "read",
+        "bash",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "extensions": true,
+      "id": "0fa8dd27cf714400a75e6e01723c3679",
+      "createdAt": 1786951240658,
+      "updatedAt": 1786951395615
+    },
+    {
+      "name": "cheap-worker-2",
+      "instructions": "You are cheap-worker-2, a persistent general-purpose execution worker for Main. Handle one exact assignment at a time. Use all available tools to explore, research, edit, execute, and test as requested. Stay within scope, do not spawn agents, and return compact status, evidence, changed paths, checks, and blockers.",
+      "events": [],
+      "topics": [],
+      "delivery": "mailbox",
+      "responseMode": "text",
+      "triggerTurn": false,
+      "coalesce": true,
+      "residency": "session",
+      "runner": "pi",
+      "model": "opencode-go/deepseek-v4-flash",
+      "thinking": "high",
+      "tools": [
+        "read",
+        "bash",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "extensions": true,
+      "id": "5233a5f884b74c14b1a37762b8a2330b",
+      "createdAt": 1786951240659,
+      "updatedAt": 1786951395616
+    },
+    {
+      "name": "smart-worker-deepseek",
+      "instructions": "You are smart-worker-deepseek, a persistent high-reasoning execution worker for Main. Handle one bounded difficult analysis, root-cause debugging, complex implementation, or rigorous review assignment at a time. Use all available tools, stay within scope, do not spawn agents, verify material claims and changes, and return compact status, evidence, changed paths, checks, risks, and blockers.",
+      "events": [],
+      "topics": [],
+      "delivery": "mailbox",
+      "responseMode": "text",
+      "triggerTurn": false,
+      "coalesce": true,
+      "residency": "session",
+      "runner": "pi",
+      "model": "opencode-go/deepseek-v4-pro",
+      "thinking": "high",
+      "tools": [
+        "read",
+        "bash",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "extensions": true,
+      "id": "6db92e8676aa45bcae02ff9a990ca90f",
+      "createdAt": 1786951240660,
+      "updatedAt": 1786951240660
+    },
+    {
+      "name": "smart-worker-luna",
+      "instructions": "You are smart-worker-luna, a persistent high-reasoning execution worker for Main. Handle one bounded difficult analysis, root-cause debugging, complex implementation, or rigorous review assignment at a time. Use all available tools, stay within scope, do not spawn agents, verify material claims and changes, and return compact status, evidence, changed paths, checks, risks, and blockers.",
+      "events": [],
+      "topics": [],
+      "delivery": "mailbox",
+      "responseMode": "text",
+      "triggerTurn": false,
+      "coalesce": true,
+      "residency": "session",
+      "runner": "pi",
+      "model": "openai-codex/gpt-5.6-luna",
+      "thinking": "high",
+      "tools": [
+        "read",
+        "bash",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls"
+      ],
+      "extensions": true,
+      "id": "193801563d1b47859f0ab7b1c79115a1",
+      "createdAt": 1786951240670,
+      "updatedAt": 1786951240670
+    }
+  ]
+}
