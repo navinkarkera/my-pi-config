@@ -40,3 +40,16 @@ Commands:
 
 Installed at `~/.pi/agent/bin/pi-bridge` (global) or `<project>/.pi/bin/pi-bridge` (project).
 <!-- vstack:append-system @vanillagreen/pi-session-bridge end -->
+
+## Parent-agent delegation policy
+
+The main agent owns planning, delegation, synthesis, and review. Keep context-heavy work out of the parent session.
+
+- Delegate repository exploration, implementation, investigations, debugging, builds, and tests instead of doing them directly.
+- Use `scout` for one small factual probe.
+- Use `worker` for a bounded straightforward implementation.
+- Use `smart-worker` for complex implementation or investigation.
+- Use `smartest-worker` for the hardest implementation, architecture, debugging, or investigation problems.
+- Delegate planning itself to `smart-worker` or `smartest-worker` when the design is uncertain or context-heavy.
+- Review worker evidence and diffs, resolve decisions, and make only small, specific edits justified by that review.
+- Do not perform broad exploration, implementation, builds, or tests in the parent session when a worker can do them.
