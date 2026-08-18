@@ -1,1 +1,0 @@
-/home/navin/.local/share/mise/installs/node/26.3.0/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/subagent/index.ts

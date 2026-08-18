@@ -18,8 +18,7 @@
     "npm:pi-nvim",
     "git:github.com/DietrichGebert/ponytail",
     "npm:@vanillagreen/pi-session-bridge",
-    "npm:pi-discord-remote",
-    "npm:pi-fabric"
+    "npm:pi-discord-remote"
   ],
   "hideThinkingBlock": true,
   "steeringMode": "one-at-a-time",
