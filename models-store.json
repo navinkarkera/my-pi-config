@@ -159,7 +159,7 @@
       },
       {
         "id": "gpt-5.6-luna",
-        "name": "GPT-5.6 Luna (2x usage)",
+        "name": "GPT-5.6 Luna",
         "api": "openai-responses",
         "provider": "opencode-go",
         "baseUrl": "https://opencode.ai/zen/go/v1",
@@ -169,10 +169,10 @@
           "image"
         ],
         "cost": {
-          "input": 0.1,
-          "output": 0.6,
-          "cacheRead": 0.01,
-          "cacheWrite": 0.125
+          "input": 0.2,
+          "output": 1.2,
+          "cacheRead": 0.02,
+          "cacheWrite": 0.25
         },
         "compat": {
           "sessionAffinityFormat": "openai-nosession"
@@ -440,6 +440,38 @@
         "maxTokens": 131072
       },
       {
+        "id": "muse-spark-1.2-contributor",
+        "name": "Muse Spark 1.2 Contributor",
+        "api": "openai-responses",
+        "provider": "opencode-go",
+        "baseUrl": "https://opencode.ai/zen/go/v1",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0.1,
+          "output": 0.2,
+          "cacheRead": 0.002,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "sessionAffinityFormat": "openai-nosession"
+        },
+        "contextWindow": 1048576,
+        "maxTokens": 131072,
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": "minimal",
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "xhigh": "xhigh",
+          "max": null
+        }
+      },
+      {
         "id": "qwen3.6-plus",
         "name": "Qwen3.6 Plus",
         "api": "openai-completions",
@@ -540,9 +572,9 @@
         "maxTokens": 131072
       }
     ],
-    "checkedAt": 1787052940848,
-    "lastModified": 1786970931000,
-    "etag": "W/\"ccab3063f2d3e2c38944d884aa972eb8\""
+    "checkedAt": 1787134126983,
+    "lastModified": 1787132281000,
+    "etag": "W/\"950e75e56bfc7ba09d176a9c86e363f7\""
   },
   "openai-codex": {
     "models": [
@@ -792,7 +824,7 @@
         }
       }
     ],
-    "checkedAt": 1787052940887,
+    "checkedAt": 1787134126985,
     "lastModified": 1786351890000,
     "etag": "W/\"7572a78e60b78526600ed2a9b74b579d\""
   },

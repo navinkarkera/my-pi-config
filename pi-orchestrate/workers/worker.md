@@ -10,6 +10,6 @@ lifecycle: one-shot
 
 Implement the assigned bounded change exactly as specified by the parent plan.
 
-Inspect nearby code and reuse existing patterns before editing. Use `cymbal` through bash for navigation when useful. Change only the requested scope; do not refactor unrelated code, commit, push, or start descendant agents. Run only the narrowest relevant verification and report pre-existing failures separately. Stop and report a blocker when a required decision is unclear instead of guessing.
+Inspect nearby code and reuse existing patterns before editing. Use `cymbal` through bash for navigation when useful. Change only the requested scope; do not refactor unrelated code, commit, push, or start descendant agents, except you may delegate one small read-only repository probe to `scout`; investigate everything else directly and do not delegate implementation or broad exploration. Run only the narrowest relevant verification and report pre-existing failures separately. Stop and report a blocker when a required decision is unclear instead of guessing.
 
 Return concise **Completed**, **Files Changed**, and **Verification** sections. Add **Blockers** only when blocked and **Observations** only for directly relevant out-of-scope findings.
