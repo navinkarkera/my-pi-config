@@ -5,12 +5,14 @@
   "defaultModel": "gpt-5.6-luna",
   "defaultThinkingLevel": "high",
   "enabledModels": [
-    "openai-codex/gpt-5.4-mini",
-    "opencode-go/deepseek-v4-flash",
     "opencode-go/deepseek-v4-pro",
     "opencode-go/minimax-m3",
     "openai-codex/gpt-5.6-sol",
-    "openai-codex/gpt-5.6-luna"
+    "openai-codex/gpt-5.6-luna",
+    "openai-codex/gpt-5.6-terra",
+    "opencode-go/qwen3.7-max",
+    "opencode-go/glm-5.3",
+    "opencode-go/gpt-5.6-luna"
   ],
   "enableSkillCommands": true,
   "packages": [
@@ -20,7 +22,8 @@
     "git:github.com/DietrichGebert/ponytail",
     "npm:@vanillagreen/pi-session-bridge",
     "npm:pi-discord-remote",
-    "npm:@zachwill/pi-orchestrate"
+    "npm:@zachwill/pi-orchestrate",
+    "npm:@toddzheng024/code-eye"
   ],
   "hideThinkingBlock": true,
   "steeringMode": "one-at-a-time",
