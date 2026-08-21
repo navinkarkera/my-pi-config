@@ -223,7 +223,7 @@
       },
       {
         "id": "hy3",
-        "name": "Hy3",
+        "name": "Hy3 (8x usage)",
         "api": "openai-completions",
         "provider": "opencode-go",
         "baseUrl": "https://opencode.ai/zen/go/v1",
@@ -232,9 +232,9 @@
           "text"
         ],
         "cost": {
-          "input": 0.14,
-          "output": 0.58,
-          "cacheRead": 0.035,
+          "input": 0.0175,
+          "output": 0.0725,
+          "cacheRead": 0.004375,
           "cacheWrite": 0
         },
         "compat": {
@@ -572,9 +572,9 @@
         "maxTokens": 131072
       }
     ],
-    "checkedAt": 1787134126983,
-    "lastModified": 1787132281000,
-    "etag": "W/\"950e75e56bfc7ba09d176a9c86e363f7\""
+    "checkedAt": 1787288105787,
+    "lastModified": 1787216322000,
+    "etag": "W/\"74f5fa7b296425daebf1f74d1fcd25ad\""
   },
   "openai-codex": {
     "models": [
@@ -824,7 +824,7 @@
         }
       }
     ],
-    "checkedAt": 1787134126985,
+    "checkedAt": 1787288105793,
     "lastModified": 1786351890000,
     "etag": "W/\"7572a78e60b78526600ed2a9b74b579d\""
   },
@@ -1842,6 +1842,50 @@
         }
       },
       {
+        "id": "grok-4.6",
+        "name": "Grok 4.6",
+        "api": "openai-responses",
+        "provider": "github-copilot",
+        "baseUrl": "https://api.individual.githubcopilot.com",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 2,
+          "output": 6,
+          "cacheRead": 0.5,
+          "cacheWrite": 0,
+          "tiers": [
+            {
+              "inputTokensAbove": 200000,
+              "input": 4,
+              "output": 12,
+              "cacheRead": 1,
+              "cacheWrite": 0
+            }
+          ]
+        },
+        "contextWindow": 500000,
+        "maxTokens": 128000,
+        "headers": {
+          "User-Agent": "GitHubCopilotChat/0.35.0",
+          "Editor-Version": "vscode/1.107.0",
+          "Editor-Plugin-Version": "copilot-chat/0.35.0",
+          "Copilot-Integration-Id": "vscode-chat"
+        },
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "xhigh": "xhigh",
+          "max": null
+        }
+      },
+      {
         "id": "kimi-k2.7-code",
         "name": "Kimi K2.7 Code",
         "api": "openai-completions",
@@ -1973,8 +2017,8 @@
         }
       }
     ],
-    "checkedAt": 1786949392587,
-    "lastModified": 1786699890000,
-    "etag": "W/\"dbb04999e34c6bf22cda3e27c2c4bf35\""
+    "checkedAt": 1787288105778,
+    "lastModified": 1787141930000,
+    "etag": "W/\"a40015128dd4e54e523e60c506bac306\""
   }
 }

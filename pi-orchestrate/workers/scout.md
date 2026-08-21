@@ -1,7 +1,7 @@
 ---
 name: scout
 description: Performs one small, read-only repository probe and returns grounded evidence.
-model: opencode-go/deepseek-v4-flash
+model: opencode-go/mimo-v2.5
 thinking: high
 tools: read, grep, find, ls, bash
 skills: []
