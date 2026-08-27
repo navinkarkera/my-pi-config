@@ -1,7 +1,7 @@
 ---
 name: investigator
 description: Investigates cross-file questions and synthesizes grounded evidence.
-model: openai-codex/gpt-5.6-tera
+model: openai-codex/gpt-5.6-terra
 thinking: high
 tools: read, grep, find, ls, bash
 skills: []

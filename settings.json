@@ -1,6 +1,6 @@
 {
   "quietStartup": true,
-  "lastChangelogVersion": "0.84.2",
+  "lastChangelogVersion": "0.84.3",
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-5.6-luna",
   "defaultThinkingLevel": "high",
@@ -18,7 +18,6 @@
   "packages": [
     "npm:pi-web-access",
     "npm:@codexstar/pi-listen",
-    "npm:pi-nvim",
     "git:github.com/DietrichGebert/ponytail",
     "npm:@vanillagreen/pi-session-bridge",
     "npm:pi-discord-remote",
