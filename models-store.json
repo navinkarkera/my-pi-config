@@ -192,6 +192,40 @@
         }
       },
       {
+        "id": "glm-5.3-flash",
+        "name": "GLM-5.3-Flash (2x usage)",
+        "api": "openai-completions",
+        "provider": "opencode-go",
+        "baseUrl": "https://opencode.ai/zen/go/v1",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0.075,
+          "output": 0.25,
+          "cacheRead": 0.015,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "supportsStore": false,
+          "supportsDeveloperRole": false,
+          "maxTokensField": "max_tokens"
+        },
+        "contextWindow": 1000000,
+        "maxTokens": 131072,
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": null,
+          "high": "high",
+          "xhigh": null,
+          "max": "max"
+        }
+      },
+      {
         "id": "gpt-5.6-luna",
         "name": "GPT-5.6 Luna",
         "api": "openai-responses",
@@ -257,7 +291,7 @@
       },
       {
         "id": "hy3",
-        "name": "Hy3 (8x usage)",
+        "name": "Hy3",
         "api": "openai-completions",
         "provider": "opencode-go",
         "baseUrl": "https://opencode.ai/zen/go/v1",
@@ -266,9 +300,9 @@
           "text"
         ],
         "cost": {
-          "input": 0.0175,
-          "output": 0.0725,
-          "cacheRead": 0.004375,
+          "input": 0.14,
+          "output": 0.58,
+          "cacheRead": 0.035,
           "cacheWrite": 0
         },
         "compat": {
@@ -282,6 +316,39 @@
           "off": "none",
           "minimal": null,
           "low": "low",
+          "medium": null,
+          "high": "high",
+          "xhigh": null,
+          "max": null
+        }
+      },
+      {
+        "id": "hy4-preview",
+        "name": "Hy4 preview",
+        "api": "openai-completions",
+        "provider": "opencode-go",
+        "baseUrl": "https://opencode.ai/zen/go/v1",
+        "reasoning": true,
+        "input": [
+          "text"
+        ],
+        "cost": {
+          "input": 0.834,
+          "output": 2.501,
+          "cacheRead": 0.042,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "supportsStore": false,
+          "supportsDeveloperRole": false,
+          "maxTokensField": "max_tokens"
+        },
+        "contextWindow": 1024000,
+        "maxTokens": 64000,
+        "thinkingLevelMap": {
+          "off": "none",
+          "minimal": null,
+          "low": null,
           "medium": null,
           "high": "high",
           "xhigh": null,
@@ -530,40 +597,6 @@
         }
       },
       {
-        "id": "ox-alpha-free",
-        "name": "Ox Alpha Free (Unlimited)",
-        "api": "openai-completions",
-        "provider": "opencode-go",
-        "baseUrl": "https://opencode.ai/zen/go/v1",
-        "reasoning": true,
-        "input": [
-          "text",
-          "image"
-        ],
-        "cost": {
-          "input": 0,
-          "output": 0,
-          "cacheRead": 0,
-          "cacheWrite": 0
-        },
-        "compat": {
-          "supportsStore": false,
-          "supportsDeveloperRole": false,
-          "maxTokensField": "max_tokens"
-        },
-        "contextWindow": 1000000,
-        "maxTokens": 131072,
-        "thinkingLevelMap": {
-          "off": null,
-          "minimal": null,
-          "low": "low",
-          "medium": null,
-          "high": "high",
-          "xhigh": null,
-          "max": "max"
-        }
-      },
-      {
         "id": "qwen3.6-plus",
         "name": "Qwen3.6 Plus",
         "api": "openai-completions",
@@ -639,6 +672,26 @@
         "maxTokens": 65536
       },
       {
+        "id": "qwen3.8-flash",
+        "name": "Qwen3.8 Flash",
+        "api": "anthropic-messages",
+        "provider": "opencode-go",
+        "baseUrl": "https://opencode.ai/zen/go",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0.15,
+          "output": 0.47,
+          "cacheRead": 0.016,
+          "cacheWrite": 0.2
+        },
+        "contextWindow": 1000000,
+        "maxTokens": 131072
+      },
+      {
         "id": "qwen3.8-max",
         "name": "Qwen3.8 Max",
         "api": "openai-completions",
@@ -661,12 +714,21 @@
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 1000000,
-        "maxTokens": 131072
+        "maxTokens": 131072,
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": "medium",
+          "high": null,
+          "xhigh": "xhigh",
+          "max": null
+        }
       }
     ],
-    "checkedAt": 1787807050659,
-    "lastModified": 1787740211000,
-    "etag": "W/\"30a10572fb95efd8d75992ce8c1019e2\""
+    "checkedAt": 1788270034536,
+    "lastModified": 1788165509000,
+    "etag": "W/\"c4b6fef889a423288047c3526fe8eb47\""
   },
   "openai-codex": {
     "models": [
@@ -916,7 +978,7 @@
         }
       }
     ],
-    "checkedAt": 1787807050632,
+    "checkedAt": 1788270034541,
     "lastModified": 1786351890000,
     "etag": "W/\"7572a78e60b78526600ed2a9b74b579d\""
   },

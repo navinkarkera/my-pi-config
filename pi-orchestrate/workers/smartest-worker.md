@@ -2,7 +2,7 @@
 name: smartest-worker
 description: Handles the hardest implementation, architecture, debugging, and investigation problems; surfaces routine scopes for the MiniMax M3 worker.
 model: openai-codex/gpt-5.6-sol
-thinking: high
+thinking: medium
 tools: read, bash, edit, write, grep, find, ls
 skills: []
 lifecycle: one-shot

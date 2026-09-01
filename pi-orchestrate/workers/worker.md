@@ -1,7 +1,7 @@
 ---
 name: worker
 description: MiniMax M3 leaf worker for bounded context gathering, mechanical edits, focused verification, and straightforward implementation from an explicit plan.
-model: opencode-go/minimax-m3
+model: opencode-go/qwen3.8-flash
 thinking: high
 tools: read, bash, edit, write, grep, find, ls
 skills: []
