@@ -77,7 +77,7 @@ function setNiriUrgent(urgent: boolean): void {
 		const piWindows = windows.filter(
 			(w): w is NiriWindow => typeof w === "object" && w !== null && (w as NiriWindow).app_id === "ProjectPi",
 		);
-		const win = piWindows.find((w) => w.pid === process.pid) ?? piWindows[0];
+		const win = piWindows.find((w) => w.pid === process.ppid) ?? piWindows[0];
 		const id = typeof win?.id === "number" && Number.isInteger(win.id) ? win.id : undefined;
 		if (id === undefined) return;
 		const action = urgent ? "set-window-urgent" : "unset-window-urgent";
