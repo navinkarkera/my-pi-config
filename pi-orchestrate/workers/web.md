@@ -1,8 +1,8 @@
 ---
 name: web
 description: Researches the public web with one or more Codex searches and returns a source-grounded synthesis.
-model: opencode-go/qwen3.8-flash
-thinking: high
+model: openai-codex/gpt-5.6-luna
+thinking: medium
 tools: bash
 skills: []
 lifecycle: one-shot

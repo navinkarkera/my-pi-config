@@ -1,8 +1,8 @@
 ---
 name: worker
-description: MiniMax M3 leaf worker for bounded context gathering, mechanical edits, focused verification, and straightforward implementation from an explicit plan.
-model: opencode-go/qwen3.8-flash
-thinking: high
+description: Luna leaf worker for bounded context gathering, mechanical edits, focused verification, and straightforward implementation from an explicit plan.
+model: openai-codex/gpt-5.6-luna
+thinking: medium
 tools: read, bash, edit, write, grep, find, ls
 skills: []
 lifecycle: one-shot
