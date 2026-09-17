@@ -20,7 +20,7 @@
     "npm:@codexstar/pi-listen",
     "git:github.com/DietrichGebert/ponytail",
     "npm:pi-discord-remote",
-    "npm:@zachwill/pi-orchestrate"
+    "npm:pi-repl-py"
   ],
   "hideThinkingBlock": true,
   "steeringMode": "one-at-a-time",
