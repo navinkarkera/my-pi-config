@@ -1,4 +1,6 @@
-helper_description = """browse — read files, search with rg, find files with fd, and query cymbal."""
+helper_description = """browse — file/code navigation and git wrappers.
+Use browse.read_file(...), browse.search_text(...), browse.find_files(...), browse.cymbal(...), and browse.git(...).
+Instead of: subprocess.run(...) for routine repository inspection."""
 
 from pathlib import Path as _Path
 import subprocess as _subprocess
@@ -72,3 +74,21 @@ def cymbal(*args):
     if not args:
         raise ValueError("cymbal requires a command")
     return _run(["cymbal", *(str(arg) for arg in args)])
+
+
+def git(*args):
+    """Run a git subcommand in the session cwd and return raw stdout."""
+    if not args:
+        raise ValueError("git requires a command")
+    return _run(["git", *(str(arg) for arg in args)])
+
+
+class _Browse:
+    read_file = staticmethod(read_file)
+    search_text = staticmethod(search_text)
+    find_files = staticmethod(find_files)
+    cymbal = staticmethod(cymbal)
+    git = staticmethod(git)
+
+
+browse = _Browse()

@@ -16,4 +16,4 @@ You are running `pi --repl`. The only agent tool is `execute`, backed by one per
 - For all other repositories don't commit or push without user instructions.
 - Never run full test suites.
 - Be concise. Show file paths clearly.
-- Use preloaded `read_file`, `search_text`, `find_files`, and `cymbal` helpers for common file and code navigation; use `fd`, `rg`, or `cymbal` directly through `subprocess.run(...)` when their full CLI surface is needed.
+- Always use the preloaded `browse` helper first for reading files, searching, code navigation, and git operations. Do not use `subprocess.run(...)` for `fd`, `rg`, `cymbal`, or `git` unless `browse` cannot perform the operation; when bypassing it, state why.
