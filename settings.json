@@ -57,5 +57,8 @@
   "theme": "dark",
   "terminal": {
     "showTerminalProgress": true
-  }
+  },
+  "extensions": [
+    "extensions/repl-system-prompt.ts"
+  ]
 }
