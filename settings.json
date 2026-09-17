@@ -20,7 +20,8 @@
     "npm:@codexstar/pi-listen",
     "git:github.com/DietrichGebert/ponytail",
     "npm:pi-discord-remote",
-    "npm:pi-repl-py"
+    "npm:pi-repl-py",
+    "npm:billion-context-pi"
   ],
   "hideThinkingBlock": true,
   "steeringMode": "one-at-a-time",
