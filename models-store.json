@@ -277,7 +277,9 @@
           "cacheWrite": 0.25
         },
         "compat": {
-          "sessionAffinityFormat": "openai-nosession"
+          "sessionAffinityFormat": "openai-nosession",
+          "supportsMidConvoSystemMessages": true,
+          "supportsAdditionalTools": true
         },
         "contextWindow": 1050000,
         "maxTokens": 128000,
@@ -467,7 +469,9 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
-          "maxTokensField": "max_tokens"
+          "maxTokensField": "max_tokens",
+          "supportsMidConvoSystemMessages": true,
+          "supportsMidConvoToolAdditions": true
         },
         "contextWindow": 1048576,
         "maxTokens": 131072,
@@ -790,11 +794,31 @@
           "xhigh": "xhigh",
           "max": null
         }
+      },
+      {
+        "id": "union-alpha",
+        "name": "Union Alpha Free",
+        "api": "anthropic-messages",
+        "provider": "opencode-go",
+        "baseUrl": "https://opencode.ai/zen/go",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0
+        },
+        "contextWindow": 262144,
+        "maxTokens": 131072
       }
     ],
-    "checkedAt": 1789121063620,
-    "lastModified": 1789115703000,
-    "etag": "W/\"5123cf08c50ab97da3bda970be0ebe41\""
+    "checkedAt": 1789646778923,
+    "lastModified": 1789639746000,
+    "etag": "W/\"b949ea60fd96ecc3ac173ae8614d3979\""
   },
   "openai-codex": {
     "models": [
@@ -858,7 +882,8 @@
         },
         "compat": {
           "supportsOpenAIGrammarTools": true,
-          "supportsToolSearch": true
+          "supportsToolSearch": true,
+          "supportsMidConvoSystemMessages": true
         }
       },
       {
@@ -897,7 +922,8 @@
         "compat": {
           "supportsOpenAIGrammarTools": true,
           "supportsAdditionalTools": true,
-          "supportsToolSearch": true
+          "supportsToolSearch": true,
+          "supportsMidConvoSystemMessages": true
         }
       },
       {
@@ -936,7 +962,8 @@
         "compat": {
           "supportsOpenAIGrammarTools": true,
           "supportsAdditionalTools": true,
-          "supportsToolSearch": true
+          "supportsToolSearch": true,
+          "supportsMidConvoSystemMessages": true
         }
       },
       {
@@ -975,7 +1002,8 @@
         "compat": {
           "supportsOpenAIGrammarTools": true,
           "supportsAdditionalTools": true,
-          "supportsToolSearch": true
+          "supportsToolSearch": true,
+          "supportsMidConvoSystemMessages": true
         }
       },
       {
@@ -1018,13 +1046,14 @@
         "compat": {
           "supportsOpenAIGrammarTools": true,
           "supportsAdditionalTools": true,
-          "supportsToolSearch": true
+          "supportsToolSearch": true,
+          "supportsMidConvoSystemMessages": true
         }
       }
     ],
-    "checkedAt": 1789121063622,
-    "lastModified": 1789115701000,
-    "etag": "W/\"70d0125796d9c9e1f7b38bbf967d0bc7\""
+    "checkedAt": 1789646779020,
+    "lastModified": 1789639744000,
+    "etag": "W/\"611b646eb8fe726a315a1544235fa980\""
   },
   "github-copilot": {
     "models": [
