@@ -7,7 +7,8 @@ git/
 npm/
 
 # === RUNTIME STATE ===
-/pi-repl/
+/pi-repl/*
+!/pi-repl/helpers/
 locks.json
 run-history.jsonl
 sessions/
