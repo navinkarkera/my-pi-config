@@ -108,6 +108,15 @@
         "provider": "opencode-go",
         "baseUrl": "https://opencode.ai/zen/go/v1",
         "reasoning": true,
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": null,
+          "high": "high",
+          "xhigh": null,
+          "max": "max"
+        },
         "input": [
           "text",
           "image"
@@ -126,14 +135,7 @@
           "thinkingFormat": "deepseek"
         },
         "contextWindow": 1000000,
-        "maxTokens": 384000,
-        "thinkingLevelMap": {
-          "minimal": null,
-          "low": null,
-          "medium": null,
-          "high": "high",
-          "max": "max"
-        }
+        "maxTokens": 384000
       },
       {
         "id": "glm-5.1",
@@ -794,31 +796,11 @@
           "xhigh": "xhigh",
           "max": null
         }
-      },
-      {
-        "id": "union-alpha",
-        "name": "Union Alpha Free",
-        "api": "anthropic-messages",
-        "provider": "opencode-go",
-        "baseUrl": "https://opencode.ai/zen/go",
-        "reasoning": true,
-        "input": [
-          "text",
-          "image"
-        ],
-        "cost": {
-          "input": 0,
-          "output": 0,
-          "cacheRead": 0,
-          "cacheWrite": 0
-        },
-        "contextWindow": 262144,
-        "maxTokens": 131072
       }
     ],
-    "checkedAt": 1789646778923,
-    "lastModified": 1789639746000,
-    "etag": "W/\"b949ea60fd96ecc3ac173ae8614d3979\""
+    "checkedAt": 1789879221097,
+    "lastModified": 1789721377000,
+    "etag": "W/\"f4171f848c30f4fcefc03369183bdbe3\""
   },
   "openai-codex": {
     "models": [
@@ -1051,7 +1033,7 @@
         }
       }
     ],
-    "checkedAt": 1789646779020,
+    "checkedAt": 1789879221547,
     "lastModified": 1789639744000,
     "etag": "W/\"611b646eb8fe726a315a1544235fa980\""
   },
