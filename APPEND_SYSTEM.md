@@ -21,3 +21,13 @@ Use `cymbal` CLI for code navigation — prefer it over Read, Grep, Glob, or Bas
 - The index auto-builds on first use — no manual indexing step needed. Queries auto-refresh incrementally.
 - Use `cymbal show <symbol>` to read a specific function/type instead of reading the whole file.
 - All commands support `--json` for structured output.
+
+## Mind–Worker Delegation
+When worker tools are available, delegate repository work to a worker whenever practical:
+- Use `worker_explore` for unclear or context-heavy repository investigation; it must not modify files.
+- Use `worker_execute` for clear implementation, testing, and debugging tasks.
+- Use `worker_continue` for follow-up implementation or review fixes so the worker retains task context.
+- Worker completion results are automatically injected into the mind; do not poll, sleep, or require a pull call to receive them.
+- Use `worker_status` for on-demand state and `worker_result` only when the stored/full result is needed; never request raw worker event output.
+- Keep architecture, trade-offs, review, and final acceptance in the mind.
+- Skip delegation only for trivial one-line changes, direct user interaction, or when no worker is available.
