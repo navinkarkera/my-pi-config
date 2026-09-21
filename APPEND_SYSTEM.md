@@ -24,9 +24,9 @@ Use `cymbal` CLI for code navigation — prefer it over Read, Grep, Glob, or Bas
 
 ## Mind–Worker Delegation
 When worker tools are available, delegate repository work to a worker whenever practical:
-- Use `worker_explore` for unclear or context-heavy repository investigation; it must not modify files.
-- Use `worker_execute` for clear implementation, testing, and debugging tasks.
-- Use `worker_continue` for follow-up implementation or review fixes so the worker retains task context.
+- Use `worker` for repository investigation, implementation, testing, debugging, and follow-up instructions; it reuses the same worker session when possible.
+- Use `worker_stop` to stop the current worker process.
+- Use `worker_restart` to restart it, optionally with a new task; restarting creates a fresh process and does not preserve in-memory context.
 - Worker completion results are automatically injected into the mind; do not poll, sleep, or require a pull call to receive them.
 - Use `worker_status` for on-demand state and `worker_result` only when the stored/full result is needed; never request raw worker event output.
 - Keep architecture, trade-offs, review, and final acceptance in the mind.

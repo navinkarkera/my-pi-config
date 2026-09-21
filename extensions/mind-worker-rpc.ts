@@ -8,11 +8,6 @@ const TaskParams = Type.Object({
   cwd: Type.Optional(Type.String({ description: "Repository working directory" })),
 });
 
-const ContinueParams = Type.Object({
-  task_id: Type.String({ description: "Worker task ID" }),
-  instruction: Type.String({ description: "The next instruction for the same worker session" }),
-});
-
 const TaskIdParams = Type.Object({
   task_id: Type.String({ description: "Worker task ID" }),
 });
@@ -31,7 +26,18 @@ function formatContext(contextUsage) {
 }
 
 export default function mindWorkerRpc(pi) {
+  let ui;
+
+  function updateWorkerStatus(task) {
+    if (!ui) return;
+    const done = task.status === "completed" || task.status === "waiting";
+    const color = task.status === "failed" ? "error" : task.status === "aborted" ? "warning" : done ? "success" : "accent";
+    const icon = task.status === "failed" ? "✗" : task.status === "aborted" ? "!" : done ? "✓" : "●";
+    ui.setStatus("mind-worker", ui.theme.fg(color, `${icon} ${task.id}: ${task.status}`));
+  }
+
   const manager = new WorkerManager({
+    onStatus: updateWorkerStatus,
     onComplete(task, result) {
       const summary = result.summary.length > 8_000 ? `${result.summary.slice(0, 8_000)}\n[summary truncated]` : result.summary;
       pi.sendMessage(
@@ -46,20 +52,26 @@ export default function mindWorkerRpc(pi) {
     },
   });
 
+  pi.on("session_start", (_event, ctx) => {
+    ui = ctx.mode === "tui" ? ctx.ui : undefined;
+  });
+
   pi.on("session_shutdown", async () => {
+    ui?.setStatus("mind-worker", undefined);
+    ui = undefined;
     await manager.close();
   });
 
   pi.registerTool({
-    name: "worker_explore",
-    label: "Worker explore",
-    description: "Start an asynchronous read-only repository exploration in a separate Pi RPC worker.",
+    name: "worker",
+    label: "Worker",
+    description: "Give the worker a task, reusing its existing session when possible.",
     parameters: TaskParams,
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        const task = await manager.createExploreTask(params.task, params.cwd || ctx.cwd);
-        const message = `Explore only. Do not modify files.\n\nTask:\n${params.task}`;
-        return textResult(`Started worker task ${task.id}.\n\nWorker message:\n${message}`, { taskId: task.id, status: task.status, message });
+        const task = await manager.run(params.task, params.cwd || ctx.cwd);
+        const action = task.reused ? "Reused" : "Started";
+        return textResult(`${action} worker task ${task.id}.`, { taskId: task.id, status: task.status });
       } catch (error) {
         return errorResult(error);
       }
@@ -67,15 +79,14 @@ export default function mindWorkerRpc(pi) {
   });
 
   pi.registerTool({
-    name: "worker_execute",
-    label: "Worker execute",
-    description: "Start an asynchronous implementation task in a separate Pi RPC worker.",
-    parameters: TaskParams,
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    name: "worker_stop",
+    label: "Stop worker",
+    description: "Stop the current worker process.",
+    parameters: Type.Object({}),
+    async execute() {
       try {
-        const task = await manager.createExecuteTask(params.task, params.cwd || ctx.cwd);
-        const message = `Implement the requested change and run relevant tests.\n\nTask:\n${params.task}`;
-        return textResult(`Started worker task ${task.id}.\n\nWorker message:\n${message}`, { taskId: task.id, status: task.status, message });
+        const task = await manager.stop();
+        return textResult(task ? `Stopped worker task ${task.id}.` : "No worker is running.", task || {});
       } catch (error) {
         return errorResult(error);
       }
@@ -83,14 +94,17 @@ export default function mindWorkerRpc(pi) {
   });
 
   pi.registerTool({
-    name: "worker_continue",
-    label: "Worker continue",
-    description: "Send a follow-up instruction to the same worker task and preserve its context.",
-    parameters: ContinueParams,
+    name: "worker_restart",
+    label: "Restart worker",
+    description: "Restart the worker process, optionally with a new task.",
+    parameters: Type.Object({
+      task: Type.Optional(Type.String({ description: "Optional task; defaults to the previous task" })),
+      cwd: Type.Optional(Type.String({ description: "Optional repository working directory" })),
+    }),
     async execute(_id, params) {
       try {
-        const task = await manager.continueTask(params.task_id, params.instruction);
-        return textResult(`Continued worker task ${task.id}.`, { taskId: task.id, status: task.status });
+        const task = await manager.restart(params.task, params.cwd);
+        return textResult(`Restarted worker task ${task.id}.`, { taskId: task.id, status: task.status });
       } catch (error) {
         return errorResult(error);
       }
