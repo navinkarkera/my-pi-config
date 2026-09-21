@@ -20,6 +20,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens",
           "requiresReasoningContentOnAssistantMessages": true,
           "thinkingFormat": "deepseek"
@@ -54,6 +55,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens",
           "requiresReasoningContentOnAssistantMessages": true,
           "thinkingFormat": "deepseek"
@@ -66,6 +68,16 @@
           "medium": null,
           "high": "high",
           "max": "max"
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       },
       {
@@ -87,6 +99,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens",
           "requiresReasoningContentOnAssistantMessages": true,
           "thinkingFormat": "deepseek"
@@ -130,12 +143,23 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens",
           "requiresReasoningContentOnAssistantMessages": true,
           "thinkingFormat": "deepseek"
         },
         "contextWindow": 1000000,
-        "maxTokens": 384000
+        "maxTokens": 384000,
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
       },
       {
         "id": "glm-5.1",
@@ -156,6 +180,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 202752,
@@ -180,6 +205,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 1000000,
@@ -213,6 +239,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 1000000,
@@ -247,6 +274,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 1000000,
@@ -259,6 +287,16 @@
           "high": "high",
           "xhigh": null,
           "max": "max"
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       },
       {
@@ -293,6 +331,16 @@
           "high": "high",
           "xhigh": "xhigh",
           "max": "max"
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       },
       {
@@ -325,6 +373,16 @@
           "high": "high",
           "xhigh": "xhigh",
           "max": null
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       },
       {
@@ -346,6 +404,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 256000,
@@ -379,6 +438,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 1024000,
@@ -413,6 +473,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "thinkingFormat": "deepseek",
           "supportsReasoningEffort": false,
           "maxTokensField": "max_tokens",
@@ -424,6 +485,16 @@
           "minimal": null,
           "low": null,
           "medium": null
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       },
       {
@@ -446,10 +517,21 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 262144,
-        "maxTokens": 262144
+        "maxTokens": 262144,
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
       },
       {
         "id": "kimi-k3",
@@ -471,6 +553,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens",
           "supportsMidConvoSystemMessages": true,
           "supportsMidConvoToolAdditions": true
@@ -485,6 +568,16 @@
           "high": null,
           "xhigh": null,
           "max": "max"
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       },
       {
@@ -506,6 +599,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 1000000,
@@ -531,10 +625,21 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 1000000,
-        "maxTokens": 128000
+        "maxTokens": 128000,
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
       },
       {
         "id": "mimo-v2.5-pro",
@@ -555,6 +660,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 1048576,
@@ -574,11 +680,12 @@
           "input": 0.3,
           "output": 1.2,
           "cacheRead": 0.06,
-          "cacheWrite": 0
+          "cacheWrite": 0.375
         },
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 204800,
@@ -602,7 +709,17 @@
           "cacheWrite": 0
         },
         "contextWindow": 1000000,
-        "maxTokens": 131072
+        "maxTokens": 131072,
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
       },
       {
         "id": "muse-spark-1.2-contributor",
@@ -634,6 +751,16 @@
           "high": "high",
           "xhigh": "xhigh",
           "max": null
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       },
       {
@@ -666,6 +793,16 @@
           "high": "high",
           "xhigh": "xhigh",
           "max": null
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       },
       {
@@ -688,11 +825,22 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "thinkingFormat": "qwen",
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 1000000,
-        "maxTokens": 65536
+        "maxTokens": 65536,
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
       },
       {
         "id": "qwen3.7-max",
@@ -713,6 +861,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 1000000,
@@ -738,10 +887,21 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 1000000,
-        "maxTokens": 65536
+        "maxTokens": 65536,
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
       },
       {
         "id": "qwen3.8-flash",
@@ -761,7 +921,17 @@
           "cacheWrite": 0.2
         },
         "contextWindow": 1000000,
-        "maxTokens": 131072
+        "maxTokens": 131072,
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        }
       },
       {
         "id": "qwen3.8-max",
@@ -783,6 +953,7 @@
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
         "contextWindow": 1000000,
@@ -795,12 +966,22 @@
           "high": null,
           "xhigh": "xhigh",
           "max": null
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       }
     ],
-    "checkedAt": 1789879221097,
-    "lastModified": 1789721377000,
-    "etag": "W/\"f4171f848c30f4fcefc03369183bdbe3\""
+    "checkedAt": 1790007486636,
+    "lastModified": 1789979789000,
+    "etag": "W/\"71b7707f6e07e305077adab86f1a0147\""
   },
   "openai-codex": {
     "models": [
@@ -866,6 +1047,16 @@
           "supportsOpenAIGrammarTools": true,
           "supportsToolSearch": true,
           "supportsMidConvoSystemMessages": true
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       },
       {
@@ -906,6 +1097,16 @@
           "supportsAdditionalTools": true,
           "supportsToolSearch": true,
           "supportsMidConvoSystemMessages": true
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       },
       {
@@ -946,6 +1147,16 @@
           "supportsAdditionalTools": true,
           "supportsToolSearch": true,
           "supportsMidConvoSystemMessages": true
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       },
       {
@@ -986,6 +1197,16 @@
           "supportsAdditionalTools": true,
           "supportsToolSearch": true,
           "supportsMidConvoSystemMessages": true
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       },
       {
@@ -1030,12 +1251,22 @@
           "supportsAdditionalTools": true,
           "supportsToolSearch": true,
           "supportsMidConvoSystemMessages": true
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         }
       }
     ],
-    "checkedAt": 1789879221547,
-    "lastModified": 1789639744000,
-    "etag": "W/\"611b646eb8fe726a315a1544235fa980\""
+    "checkedAt": 1790007486651,
+    "lastModified": 1789979786000,
+    "etag": "W/\"b77f14c4e92d579ef47bdd13a1cc6d04\""
   },
   "github-copilot": {
     "models": [
