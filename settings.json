@@ -1,6 +1,6 @@
 {
   "quietStartup": true,
-  "lastChangelogVersion": "0.86.1",
+  "lastChangelogVersion": "0.87.0",
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-5.6-luna",
   "defaultThinkingLevel": "high",
@@ -20,7 +20,7 @@
     "npm:@codexstar/pi-listen",
     "git:github.com/DietrichGebert/ponytail",
     "npm:pi-discord-remote",
-    "npm:billion-context-pi"
+    "npm:@zachwill/pi-orchestrate"
   ],
   "hideThinkingBlock": true,
   "steeringMode": "one-at-a-time",

@@ -5,6 +5,20 @@ You can also refer to documents contained in ai-notes/<current_dir_name> folder
 
 ---
 
+## Interactive Worker
+
+Use the `worker` for substantive delegated work that benefits from retained context: gathering repository context, implementing exact changes, running targeted verification, or iterating on a result. Do trivial work directly when delegation would cost more than it saves.
+
+- A new worker receives no parent conversation. Give it a self-contained brief with the objective, relevant context, owned paths, constraints, acceptance criteria, and expected report.
+- State whether an assignment is read-only or permits edits. Give concurrent workers non-overlapping write scopes.
+- The worker has all supported file and shell tools, can use `cymbal` through `bash`, and cannot start nested workers.
+- Ask for narrow verification; do not request a full test suite unless it is necessary for the task.
+- After a worker returns, use `interactive_send` for related follow-up, correction, or verification so it retains context. Do not start a replacement worker for the same thread.
+- Inspect consequential edits and evidence yourself. The main agent owns integration and the final result.
+- Close the interactive worker when its work is accepted and no follow-up is needed.
+
+---
+
 ## Code Exploration Policy
 Use `cymbal` CLI for code navigation — prefer it over Read, Grep, Glob, or Bash for code exploration.
 - **New to a repo?**: `cymbal structure` — entry points, hotspots, central packages. Start here.
@@ -21,13 +35,3 @@ Use `cymbal` CLI for code navigation — prefer it over Read, Grep, Glob, or Bas
 - The index auto-builds on first use — no manual indexing step needed. Queries auto-refresh incrementally.
 - Use `cymbal show <symbol>` to read a specific function/type instead of reading the whole file.
 - All commands support `--json` for structured output.
-
-## Mind–Worker Delegation
-When worker tools are available, delegate repository work to a worker whenever practical:
-- Use `worker` for repository investigation, implementation, testing, debugging, and follow-up instructions; it reuses the same worker session when possible.
-- Use `worker_stop` to stop the current worker process.
-- Use `worker_restart` to restart it, optionally with a new task; restarting creates a fresh process and does not preserve in-memory context.
-- Worker completion results are automatically injected into the mind; do not poll, sleep, or require a pull call to receive them.
-- Use `worker_status` for on-demand state and `worker_result` only when the stored/full result is needed; never request raw worker event output.
-- Keep architecture, trade-offs, review, and final acceptance in the mind.
-- Skip delegation only for trivial one-line changes, direct user interaction, or when no worker is available.
