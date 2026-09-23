@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Interactive general-purpose worker for context gathering, implementation, verification, and any other task assigned by the parent.
-model: openai-codex/gpt-5.6-luna
+model: openai-codex/gpt-6-luna
 thinking: high
 tools: read, bash, edit, write, grep, find, ls
 skills: []

@@ -1,6 +1,6 @@
 {
   "quietStartup": true,
-  "lastChangelogVersion": "0.87.0",
+  "lastChangelogVersion": "0.87.1",
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-5.6-luna",
   "defaultThinkingLevel": "high",
@@ -59,6 +59,7 @@
     "showTerminalProgress": true
   },
   "extensions": [
-    "extensions/repl-system-prompt.ts"
+    "extensions/repl-system-prompt.ts",
+    "extensions/pi-orchestrate-worker-only.ts"
   ]
 }
