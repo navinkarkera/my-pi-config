@@ -3,6 +3,8 @@ Commit the document and push it.
 
 You can also refer to documents contained in ai-notes/<current_dir_name> folder
 
+Always respond on simple points instead of writing paragraphs. Keep the language simple and concise.
+
 ## Codemode Preference
 
 Prefer `codemode` as the default way to use tools: call tools through codemode, especially to batch independent calls, chain dependent calls, or filter results. Run Cymbal commands through codemode using `tools.bash` (for example, `await tools.bash({command: "cymbal structure"})`). Use a direct tool call only when codemode cannot perform the needed operation, or when using it would add unnecessary complexity or fail.
