@@ -19,7 +19,8 @@
     "git:github.com/DietrichGebert/ponytail",
     "npm:pi-discord-remote",
     "npm:@zachwill/pi-orchestrate",
-    "npm:pi-nvim-context"
+    "npm:pi-nvim-context",
+    "npm:pi-advisor-flow"
   ],
   "hideThinkingBlock": true,
   "steeringMode": "one-at-a-time",
