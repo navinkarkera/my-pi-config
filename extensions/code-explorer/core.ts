@@ -4,12 +4,13 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync
 import { homedir } from 'node:os';
 import { basename, isAbsolute, join, relative, resolve } from 'node:path';
 
-export type Action = 'files' | 'text' | 'ast' | 'symbol' | 'references' | 'impact';
-export interface Request { action: Action; query: string; scope?: string; language?: string; maxResults?: number }
+export type Action = 'files' | 'text' | 'ast' | 'symbol' | 'references' | 'impact' | 'map';
+export interface Request { action: Action; query?: string; scope?: string; language?: string; maxResults?: number; maxTokens?: number; maxFiles?: number }
 export interface Answer {
   backend: 'rg' | 'ast-grep' | 'cymbal' | 'none';
   repo: string; command?: string; output: string;
   warning?: string; truncated?: boolean; fileCount?: number;
+  tokensApprox?: number; mappedFiles?: number; symbolCount?: number;
 }
 
 const SOURCE_GLOB = '*.{py,pyi,go,rs,js,jsx,ts,tsx,java,c,cc,cpp,h,hpp,cs,rb,php,kt,kts,swift,lua,scala,ex,exs}';
@@ -23,6 +24,10 @@ const COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const SIZE_TIMEOUT_MS = 6_000;
 const SEARCH_TIMEOUT_MS = 10_000;
 const CYMBAL_TIMEOUT_MS = 15_000;
+const MAP_TIMEOUT_MS = 12_000;
+const MAP_DEFAULT_FILES = 60;
+const MAP_DEFAULT_TOKENS = 1024;
+const MAX_MAP_SOURCE_BYTES = 512 * 1024;
 export const MAX_FILES = 2000;
 
 interface Entry { count?: number; countedAt?: number; disabledUntil?: number; reason?: string }
@@ -126,6 +131,51 @@ function trimOutput(value: string, limit: number): string {
   return lines.length > limit ? lines.slice(0, limit).join('\n') + `\n[Output limited to ${limit} lines]` : value;
 }
 
+/** Render ast-grep's NDJSON outline deterministically; budget is approximate chars/4, not model-token exact. */
+export function compactOutline(raw: string, root: string, scope: string, maxTokens = MAP_DEFAULT_TOKENS): {
+  output: string; mappedFiles: number; symbolCount: number; tokensApprox: number; truncated: boolean;
+} {
+  const budget = Math.max(128, Math.min(4096, Math.floor(maxTokens))) * 4;
+  const relScope = relative(root, scope).replaceAll('\\', '/') || '.';
+  const lines: string[] = [`# Code map: ${relScope}`];
+  let symbols = 0, files = 0, truncated = false;
+  let used = lines[0].length + 1;
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let parsed: any;
+    try { parsed = JSON.parse(line); }
+    catch { throw new Error('ast-grep returned incomplete/invalid JSON stream; try a smaller scope'); }
+    if (!parsed || !Array.isArray(parsed.items)) continue;
+    const p = String(parsed.path ?? '(unknown)');
+    const filePath = isAbsolute(p) ? relative(root, p) : p;
+    const safePath = filePath.replaceAll('\\', '/');
+    const items: string[] = [];
+    for (const item of parsed.items) {
+      if (!item || typeof item !== 'object') continue;
+      const name = typeof item.name === 'string' ? item.name.replace(/\s+/g, ' ').slice(0, 120) : '';
+      if (!name) continue;
+      const lineNumber = (item.range?.start?.line ?? 0) + 1; // ast-grep uses 0-based lines
+      const kind = typeof item.symbolType === 'string' ? item.symbolType : 'symbol';
+      const signature = typeof item.signature === 'string' ? item.signature.replace(/\s+/g, ' ').slice(0, 140) : '';
+      const members = Array.isArray(item.members)
+        ? item.members.filter((x: any) => x && typeof x.name === 'string').slice(0, 10).map((x: any) => x.name).join(', ')
+        : '';
+      items.push(`  ${lineNumber}: ${kind} ${name}${signature && signature !== name ? ` — ${signature}` : ''}${members ? ` [${members}]` : ''}`);
+    }
+    if (items.length === 0) continue;
+    const heading = `${safePath}\n`;
+    if (used + heading.length > budget) { truncated = true; break; }
+    lines.push(safePath); used += heading.length; files++;
+    for (const entry of items) {
+      if (used + entry.length + 1 > budget) { truncated = true; break; }
+      lines.push(entry); used += entry.length + 1; symbols++;
+    }
+    if (truncated) break;
+  }
+  if (files === 0 && !truncated) return { output: '# Code map: no symbols found', mappedFiles: 0, symbolCount: 0, tokensApprox: 7, truncated: false };
+  return { output: lines.join('\n'), mappedFiles: files, symbolCount: symbols, tokensApprox: Math.ceil(used / 4), truncated };
+}
+
 export class Explorer {
   private cache = getDisk();
   private astBin: string | null | undefined;
@@ -170,6 +220,73 @@ export class Explorer {
     }
     return (this.astBin = null);
   }
+  private async map(req: Request, root: string, scope: string, signal?: AbortSignal): Promise<Answer> {
+    // Critically, *never* pass a whole directory to ast-grep. Enumerate a
+    // bounded list of candidate files using rg first, then pass explicit paths.
+    const maxFiles = Math.max(1, Math.min(120, req.maxFiles ?? MAP_DEFAULT_FILES));
+    const maxTokens = Math.max(128, Math.min(4096, req.maxTokens ?? MAP_DEFAULT_TOKENS));
+    const language = req.language?.toLowerCase();
+    const opts = ['--files', '-g', SOURCE_GLOB];
+    if (language && LANG_GLOBS[language]) opts.push('-g', LANG_GLOBS[language]);
+    let files: string[];
+    if (statSync(scope).isFile()) {
+      // For explicit files, we accept the file and let ast-grep report unsupported languages.
+      files = [scope];
+    } else {
+      const scan = await run('rg', [...opts, scope], root, {
+        countOnly: false, timeoutMs: SIZE_TIMEOUT_MS, maxLines: maxFiles + 1,
+        maxBytes: 32_000, signal,
+      });
+      if (scan.missing) return { backend: 'none', repo: root, output: 'ripgrep is required to enumerate the map safely.' };
+      if (scan.cancelled) return { backend: 'none', repo: root, output: 'Cancelled.' };
+      if (scan.timedOut) return { backend: 'none', repo: root, output: 'File enumeration timed out; narrow the map scope.' };
+      if (scan.code !== 0 && scan.code !== 1 && !scan.truncated)
+        return { backend: 'none', repo: root, output: `File enumeration failed: ${scan.stderr}` };
+      if (scan.truncated) return { backend: 'none', repo: root,
+        output: `Map scope contains more than ${maxFiles} source files (or exceeded output limits). Narrow scope or explicitly raise maxFiles up to 120.`, truncated: true };
+      files = scan.stdout.trim().split('\n').filter(Boolean);
+      if (files.length > maxFiles) return { backend: 'none', repo: root,
+        output: `Map scope contains more than ${maxFiles} source files. Narrow scope.`, truncated: true };
+      files = files.map(p => resolve(root, p));
+    }
+    if (files.length === 0) return { backend: 'none', repo: root, output: 'No non-ignored source files in the requested scope.' };
+    // Avoid parsing giant generated/single-file sources. Fail closed so the
+    // result isn't incorrectly interpreted as a complete map.
+    for (const file of files) {
+      try {
+        if (statSync(file).size > MAX_MAP_SOURCE_BYTES) return { backend: 'none', repo: root,
+          output: `Source file exceeds 512 KiB: ${relative(root, file)}. Narrow scope or inspect that file directly.` };
+      } catch { return { backend: 'none', repo: root, output: `Source file vanished or is unreadable: ${relative(root, file)}.` }; }
+    }
+    files.sort();
+    const exe = await this.astCommand(root, signal);
+    if (!exe) return { backend: 'none', repo: root,
+      output: 'ast-grep CLI with outline support is required. Install recent ast-grep (the sg command must identify as ast-grep), or use a Pi-native ast_grep_outline tool.' };
+    const args = ['outline', '--items', 'structure', '--view', 'digest', '--json=stream', '--threads', '2'];
+    const filter = (req.query ?? '').trim();
+    if (filter) {
+      if (filter.length > 120) return { backend: 'none', repo: root, output: 'Map filter must be at most 120 characters.' };
+      args.push('--match', '(?i)' + filter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    }
+    args.push(...files);
+    const out = await run(exe, args, root, {
+      timeoutMs: MAP_TIMEOUT_MS, maxBytes: 450_000, maxLines: 1000, signal,
+    });
+    if (out.cancelled) return { backend: 'none', repo: root, output: 'Cancelled.' };
+    if (out.timedOut) return { backend: 'none', repo: root, output: 'Outline timed out; narrow the map scope.' };
+    if (out.missing) return { backend: 'none', repo: root, output: out.stderr };
+    if (out.truncated) return { backend: 'none', repo: root, output: 'Outline raw output exceeded safety limit; narrow the map scope.', truncated: true };
+    if (out.code !== 0) return { backend: 'none', repo: root, output: `ast-grep outline failed: ${out.stderr || out.stdout}`, warning: 'Check that the installed ast-grep CLI supports outline and --json=stream.' };
+    try {
+      const map = compactOutline(out.stdout, root, scope, maxTokens);
+      return {backend:'ast-grep',repo:root,output:map.output,truncated:map.truncated,
+        mappedFiles:map.mappedFiles, symbolCount:map.symbolCount, tokensApprox:map.tokensApprox,
+        warning: map.truncated ? 'Map truncated to token budget: narrow scope or increase maxTokens. No repository-wide index was created.'
+          : 'Syntax-only outline, not a resolved reference/call graph. No repository-wide index was created.'};
+    } catch (e) {
+      return { backend: 'none', repo: root, output: String(e) };
+    }
+  }
   private async searchRg(action: 'files'|'text'|'symbol'|'references'|'impact', query: string, root: string, scope: string, lang: string | undefined, max: number, signal?: AbortSignal): Promise<Answer> {
     const args = action === 'files' ? ['--files'] : ['-n', '-F', '--max-columns', '240', '--max-columns-preview'];
     if (lang && LANG_GLOBS[lang]) args.push('-g', LANG_GLOBS[lang]);
@@ -212,7 +329,8 @@ export class Explorer {
     const root = repositoryRoot(cwd);
     let scope: string;
     try { scope = scopedPath(cwd, root, req.scope); } catch (e) { return { backend:'none',repo:root,output:String(e) }; }
-    const query = req.query.trim();
+    if (req.action === 'map') return this.map(req, root, scope, signal);
+    const query = (req.query ?? '').trim();
     if (!query || query.length > 500) return { backend:'none',repo:root,output:'Provide a query of 1–500 characters.' };
     const max = Math.max(1, Math.min(80, req.maxResults ?? 40));
     const lang = req.language?.toLowerCase();

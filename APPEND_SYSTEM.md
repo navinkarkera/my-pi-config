@@ -5,27 +5,66 @@ You can also refer to documents contained in ai-notes/<current_dir_name> folder
 
 Always respond on simple points instead of writing paragraphs. Keep the language simple and concise.
 
-## Code exploration (Pi 1.0 codemode-first)
+## Codemode preference
 
-Use `codemode` for code exploration whenever possible. Keep operations inside one codemode script when they form a coherent task; filter and summarize intermediate results before printing them with `text()`. For independent searches use `Promise.allSettled()`. Avoid large raw dumps and repeated repository scans.
+Prefer **codemode** as the default interface for tools whenever possible. Use it to batch independent operations, chain dependent operations, and filter results *before* putting them in the model context. Call a tool directly only when codemode cannot perform the operation or would introduce needless overhead.
 
-- For a known file and line range, use `tools.read` directly inside codemode.
-- For filenames, exact text, and symbol/impact lookups, prefer `tools.code_explore({action, query, scope?, language?, maxResults?})` inside codemode. It routes requests to ripgrep or Cymbal depending on task and repository size/health.
-- For AST-aware structural matching, prefer the installed Pi-native `tools.ast_grep_search` if available. Discover its arguments with `describeTool("ast_grep_search")`. Otherwise use `tools.code_explore({action:"ast", query:pattern, language, scope})` if the `sg` or `ast-grep` executable is installed.
-- Never run Cymbal directly through `tools.bash` as an alternate way around `code_explore` safety checks. In particular, skip Cymbal in `edx-platform` or where the extension reports it ineligible.
-- Scope searches to the smallest likely subtree. Use bounded output and return concise, cited file:line locations. Treat ripgrep/AST fallback references as candidates, not a complete type-resolved call graph.
-- Use `tools.bash` via codemode for shell tasks where specialized tools are not available. Do not make edits just to answer read-only code questions.
+- For coherent multi-step tasks, favor one self-contained codemode script that gathers evidence, performs necessary actions in order, verifies results, and returns a concise summary. Do not make a series of tool calls solely to pass intermediate output back through the model.
+- Use `Promise.allSettled()` when independent calls can fail separately. Sequence dependent calls and stop on error. Inspect error and exit information; never claim success without verification.
+- Keep `text()` output small and relevant. Filter structured tool results in the script rather than returning large raw results.
+- For Git changes, stage only explicitly relevant paths and inspect the resulting diff or commit. Do not stage unrelated work.
 
-Example codemode script:
+## Code exploration policy
+
+Choose the least expensive tool that can answer the question. **Keep searches scoped, bounded, and read-only.** Do not index a large repository just to answer a narrow question.
+
+### Tool selection
+
+- **Known file or line range:** Use `tools.read` through codemode. Read only the relevant portion; no map is necessary.
+- **Unfamiliar module or directory:** Use `tools.code_explore({ action: "map", scope: "specific/subtree", maxFiles: 60, maxTokens: 1024 })`. This produces a syntax-level outline of symbols, signatures, and source locations without a persistent index. For a large repository, find a likely subtree first; do not map its root.
+- **Find filenames or literal text:** Use `tools.code_explore({ action: "files" | "text", query: "...", scope: "..." })` or scoped `rg` through `tools.bash`. Prefer `rg -F` for literal searches and `rg -l` when only matching filenames are needed.
+- **AST patterns:** Prefer the installed Pi-native `ast_grep_search` tool via codemode, checking its schema with `describeTool("ast_grep_search")` when needed. Use `code_explore({ action: "ast", ... })` as a fallback. AST matching is syntactic, not type-resolved.
+- **Symbol references or change impact:** Use `tools.code_explore({ action: "symbol" | "references" | "impact", query: "...", scope: "..." })`. It may choose Cymbal only in small, healthy repositories. **Never run Cymbal directly to bypass size and timeout safeguards**, particularly in `edx-platform`.
+- **Existing changes or tests:** Start with the affected files and a bounded Git diff. Run the smallest appropriate lint or test command before expanding scope.
+
+### RTK and command output
+
+- Call shell commands through `tools.bash` inside codemode. When RTK's Pi integration is installed, let it compress supported Git, build, lint, and test output. Do not build a second output-rewriting layer inside Code Explorer.
+- Request uncompressed output when exact stack traces, full diffs, complete logs, or security-relevant evidence are needed.
+- RTK does not replace validation: inspect exit codes and preserve enough detail to explain failures.
+
+### Search and mapping discipline
+
+- Start in the narrowest plausible subtree, then expand only when evidence requires it. Respect `.gitignore` and avoid generated files, virtual environments, dependencies, caches, and build outputs.
+- Do not dump whole files, giant diffs, or hundreds of search hits into context. Find candidate paths first, then read bounded spans or inspect a few relevant symbols.
+- Map limits are safety controls: by default a directory with more than 60 eligible files is refused. `maxTokens` limits approximate *output*, not the number of bytes scanned. Narrow the scope instead of repeatedly increasing caps.
+- A syntax map, grep match, or AST match is not proof of a complete call graph. Dynamic dispatch, aliases, reflection, and imports may require additional verification.
+- If a tool is unavailable or fails, use a simpler scoped fallback. Do not repeatedly retry failed indexing or install new tools without approval.
+
+### Codemode examples
 
 ```js
-const res = await tools.code_explore({
-  action: "references",
-  query: "publish_event",
-  scope: "openedx/core",
-  language: "python",
-  maxResults: 25,
+// Inspect a bounded directory structure; does not invoke Cymbal.
+const map = await tools.code_explore({
+  action: "map",
+  scope: "openedx/core/djangoapps/content_libraries",
+  maxFiles: 60,
+  maxTokens: 1024,
 });
-text({backend: res.backend, truncated: res.truncated, warning: res.warning,
-      matches: res.output.split("\n").slice(0, 25).join("\n")});
+text({ backend: map.backend, truncated: map.truncated, warning: map.warning, map: map.output });
+```
+
+```js
+// Run independent targeted checks and return only useful summaries.
+const checks = await Promise.allSettled([
+  tools.bash({ command: "git diff --check" }),
+  tools.bash({ command: "git status --short" }),
+]);
+checks.forEach((r, i) => {
+  if (r.status === "fulfilled") {
+    text({ check: i, exitCode: r.value.exit_code, output: r.value.output.slice(0, 2000) });
+  } else {
+    text({ check: i, error: String(r.reason) });
+  }
+});
 ```

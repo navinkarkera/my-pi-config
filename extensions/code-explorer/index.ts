@@ -15,8 +15,8 @@ export default function codeExplorer(pi: ExtensionAPI) {
     exposure: 'codemode',
     namespace: {
       name: 'code-explorer',
-      description: 'Bounded, read-only code navigation. Uses ripgrep for text/files and Cymbal for symbol relationships only if repo size and health allow it.',
-      instructions: 'Call tools.code_explore({...}) from codemode. It returns structured {backend, repo, output, warning?, truncated, fileCount?}. For AST queries use the already-installed Pi ast_grep_search tool directly when available; code_explore action=ast is a CLI fallback. Filter outputs in the codemode script before text(). Never bypass the Cymbal size/timeout safeguards with tools.bash.',
+      description: 'Scoped repository maps via ast-grep; bounded text/file search via rg; Cymbal relationships only if repo size and health allow it.',
+      instructions: 'Call tools.code_explore({...}) from codemode. Use action=map with an explicit scope for a bounded, syntax-only symbol overview; no query required. It refuses more than 60 source files by default, limits output to ~1024 tokens, and never indexes the whole repo. For AST searches, use Pi native ast_grep_search if available. Prefer narrow paths and filter structured outputs before text(). Never bypass Cymbal limits through bash.',
     },
     annotations: {
       readOnlyHint: true,
@@ -24,12 +24,12 @@ export default function codeExplorer(pi: ExtensionAPI) {
       idempotentHint: true,
       openWorldHint: false,
     },
-    description: 'Bounded code navigation: find files and text with ripgrep; AST matches with ast-grep; symbols, references and impact with Cymbal only on small, healthy repositories. Automatically falls back on huge repos such as edx-platform, and caches repository size and Cymbal failures. No writes or indexing initiated explicitly.',
-    promptSnippet: 'Use code_explore inside codemode for bounded rg/Cymbal exploration; call an available native ast_grep_search tool for AST queries.',
+    description: 'Bounded code navigation: action=map generates a small directory/file symbol map using ast-grep outline (no index); files/text use ripgrep; symbols/references/impact use Cymbal only on small, healthy repos. Outputs are bounded; edx-platform never runs Cymbal.',
+    promptSnippet: 'Use code_explore via codemode; map action gives a bounded, syntax-only file/directory overview, no indexing. Native ast_grep_search handles patterns.',
     promptGuidelines: [
-      'Inside codemode, prefer tools.code_explore for exploratory text/file/symbol/impact searches. Use tools.read for known file ranges.',
-      'Use code_explore action=files for names, text for literals, and symbol/references/impact for relationships. Prefer the Pi ast_grep_search tool for structural queries if available; otherwise code_explore action=ast works with an installed CLI. Never call Cymbal directly on large repositories.',
-      'References and impact results from rg/ast-grep are candidates, not a type-resolved call graph.',
+      'Inside codemode, use tools.code_explore({action:"map",scope:"narrow/subtree"}) for a lightweight bounded structural map. Prefer read for known files/line ranges.',
+      'Use action=files for names, text for literals, map for directory/file outlines, and symbol/references/impact for relationships. Use native ast_grep_search for structural patterns when available. Never call Cymbal directly on large repositories.',
+      'Map uses ast-grep outline and refuses overly large directory scans; provide a narrower scope instead. Syntax-only results and text matches are not type-resolved call graphs.',
     ],
     outputSchema: Type.Object({
       backend: StringEnum(['rg', 'ast-grep', 'cymbal', 'none'] as const),
@@ -38,15 +38,20 @@ export default function codeExplorer(pi: ExtensionAPI) {
       warning: Type.Optional(Type.String()),
       truncated: Type.Boolean(),
       fileCount: Type.Optional(Type.Integer()),
+      tokensApprox: Type.Optional(Type.Integer()),
+      mappedFiles: Type.Optional(Type.Integer()),
+      symbolCount: Type.Optional(Type.Integer()),
     }),
     parameters: Type.Object({
-      action: StringEnum(['files', 'text', 'ast', 'symbol', 'references', 'impact'] as const, {
-        description: 'files=filename search; text=literal search; ast=structural pattern; symbol/references/impact=try Cymbal if safe, otherwise bounded search',
+      action: StringEnum(['files', 'text', 'ast', 'symbol', 'references', 'impact', 'map'] as const, {
+        description: 'map=bounded ast-grep outline of scope; files=filename search; text=literal; ast=structural pattern; symbol/references/impact=Cymbal if safe, otherwise bounded search',
       }),
-      query: Type.String({ description: 'Literal text, symbol name, filename fragment, or ast-grep pattern' }),
+      query: Type.Optional(Type.String({ description: 'Text/symbol/filename/pattern; optional for action=map, where it filters outline symbols' })),
       scope: Type.Optional(Type.String({ description: 'Relative file/directory within repo, default current directory; use a narrow scope where possible' })),
       language: Type.Optional(Type.String({ description: 'Language for ast-grep (required for ast): python, typescript, javascript, tsx, etc. Also narrows rg results for supported languages.' })),
       maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 80, description: 'Limit result lines (default 40)' })),
+      maxTokens: Type.Optional(Type.Integer({ minimum: 128, maximum: 4096, description: 'For map only: approximate output token budget (default 1024)' })),
+      maxFiles: Type.Optional(Type.Integer({ minimum: 1, maximum: 120, description: 'For map only: maximum source files scanned (default 60); larger scopes are refused' })),
     }),
     async execute(_id, params, signal, _update, ctx) {
       const answer = await explorer.explore(params, ctx.cwd, signal);
@@ -59,6 +64,9 @@ export default function codeExplorer(pi: ExtensionAPI) {
         ...(answer.warning ? { warning: answer.warning } : {}),
         truncated: Boolean(answer.truncated),
         ...(answer.fileCount !== undefined ? { fileCount: answer.fileCount } : {}),
+        ...(answer.tokensApprox !== undefined ? { tokensApprox: answer.tokensApprox } : {}),
+        ...(answer.mappedFiles !== undefined ? { mappedFiles: answer.mappedFiles } : {}),
+        ...(answer.symbolCount !== undefined ? { symbolCount: answer.symbolCount } : {}),
       };
       const trunc = answer.truncated ? '\n[Output truncated; narrow scope or query]' : '';
       return {
