@@ -7,6 +7,9 @@
   "defaultTools": [
     "+codemode"
   ],
+  "codemode": {
+    "mode": "only"
+  },
   "enabledModels": [
     "openai/gpt-6-luna",
     "openai/gpt-6-sol",
