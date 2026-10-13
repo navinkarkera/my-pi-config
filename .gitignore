@@ -19,3 +19,12 @@ tmp/
 /pi-discord-remote/config.json
 /.pi
 /.billion-context-pi-update-check-749f6fc76d80
+/bin
+/pi-web
+/pi-web-run
+/pi-web-session-index.json
+/pi-web-session-state.json
+/pi-web-version
+/pi-web.sqlite
+/pi-web.sqlite-shm
+/pi-web.sqlite-wal
