@@ -30,3 +30,5 @@ tmp/
 /pi-web.sqlite
 /pi-web.sqlite-shm
 /pi-web.sqlite-wal
+/mindworker
+/missions

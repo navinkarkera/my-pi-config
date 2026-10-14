@@ -1,0 +1,36 @@
+{
+  "timeout": 6000,
+  "statusStream": true,
+  "autoSpawnWorker": true,
+  "workerTaskStrictness": "strict",
+  "notifyOnMindIdle": true,
+  "ntfyTopic": "nrk_mangalpete_legion_ai_reminders",
+  "mindModel": "openai/gpt-6.1-sol",
+  "workerModels": [
+    { "model": "openai/gpt-6-luna", "count": 3, "tier": "flash" },
+    { "model": "openai/gpt-6-luna", "count": 0, "tier": "strong" }
+  ],
+  "workerModel": "openai/gpt-6-luna",
+  "terminalBackend": "herdr",
+  "resetTimeout": 5,
+  "kittyEnabled": false,
+  "kittyLayout": "mind-split-workers-tab",
+  "workerCount": 3,
+  "dashboardEnabled": true,
+  "dashboardLogResponses": true,
+  "dashboardRetention": 200,
+  "dashboardHeartbeatMs": 10000,
+  "dashboardStaleMs": 30000,
+  "burstFlash": {
+    "enabled": true,
+    "model": "openai/gpt-6-luna",
+    "maxBurst": 5,
+    "idleTtlMs": 180000,
+    "maxTasksPerWorker": 3,
+    "launchMode": "headless",
+    "queuePressureThreshold": 1,
+    "spawnWaitMs": 1000,
+    "killTimeoutMs": 2000,
+    "logDetail": "compact"
+  }
+}
