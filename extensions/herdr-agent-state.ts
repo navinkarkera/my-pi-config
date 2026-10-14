@@ -1,9 +1,12 @@
-// local fork; `herdr integration install pi` can overwrite this file.
+// installed by herdr
+// managed by herdr; reinstalling or updating the integration overwrites this file.
+// add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=8
+// HERDR_INTEGRATION_VERSION=9
 // @ts-nocheck
 
 import net from "node:net";
+import path from "node:path";
 
 const HERDR_ENV = process.env.HERDR_ENV;
 const socketPath = process.env.HERDR_SOCKET_PATH;
@@ -72,7 +75,10 @@ function updateSessionRef(ctx: any): void {
   try {
     const file = ctx?.sessionManager?.getSessionFile?.();
     currentAgentSessionPath =
-      typeof file === "string" && file.startsWith("/") ? file : undefined;
+      typeof file === "string" &&
+      (path.posix.isAbsolute(file) || path.win32.isAbsolute(file))
+        ? file
+        : undefined;
   } catch {
     currentAgentSessionPath = undefined;
   }
@@ -176,24 +182,17 @@ export default function (pi) {
   }
 
   let agentActive = false;
-  let orchestrationActive = false;
   let blockedCount = 0;
-  let customPromptCount = 0;
   let blockedMessage: string | undefined;
-  let customPromptMessage: string | undefined;
-  let orchestrationUnsubscribe: (() => void) | undefined;
   let lastState: AgentState | undefined;
   let lastMessage: string | undefined;
   let rootSession = false;
 
   function desiredState() {
-    if (blockedCount > 0 || customPromptCount > 0) {
-      return {
-        state: "blocked" as const,
-        message: blockedCount > 0 ? blockedMessage : customPromptMessage,
-      };
+    if (blockedCount > 0) {
+      return { state: "blocked" as const, message: blockedMessage };
     }
-    if (agentActive || orchestrationActive) {
+    if (agentActive) {
       return { state: "working" as const, message: undefined };
     }
     return { state: "idle" as const, message: undefined };
@@ -208,26 +207,6 @@ export default function (pi) {
     lastMessage = next.message;
     queueState(next.state, next.message);
   }
-
-  pi.on("ui_prompt_start", (event) => {
-    if (!rootSession || event?.kind !== "custom") {
-      return;
-    }
-    customPromptCount += 1;
-    customPromptMessage = event?.label || event?.title || "Questionnaire";
-    publishState();
-  });
-
-  pi.on("ui_prompt_end", () => {
-    if (!rootSession) {
-      return;
-    }
-    customPromptCount = Math.max(0, customPromptCount - 1);
-    if (customPromptCount === 0) {
-      customPromptMessage = undefined;
-    }
-    publishState();
-  });
 
   pi.events.on("herdr:blocked", (data) => {
     if (!rootSession) {
@@ -247,36 +226,6 @@ export default function (pi) {
     publishState();
   });
 
-  async function attachOrchestration(ownerSessionId: string): Promise<void> {
-    try {
-      const { getProcessHost } = await import(
-        "../npm/node_modules/@zachwill/pi-orchestrate/extension/parent/process-host.ts"
-      );
-      const host = getProcessHost();
-      if (!host || !rootSession || currentAgentSessionId !== ownerSessionId) {
-        return;
-      }
-
-      const updateOrchestrationState = (snapshot: any) => {
-        if (!rootSession || currentAgentSessionId !== ownerSessionId) {
-          return;
-        }
-        orchestrationActive = snapshot?.runs?.some(
-          (run: any) => run?.ownerSessionId === ownerSessionId && run?.state === "running",
-        ) === true;
-        publishState();
-      };
-
-      orchestrationUnsubscribe = host.orchestration.subscribeState(
-        ownerSessionId,
-        updateOrchestrationState,
-      );
-      updateOrchestrationState(await host.orchestration.snapshot(ownerSessionId));
-    } catch {
-      // pi-orchestrate is optional and may not have created its process host yet.
-    }
-  }
-
   pi.on("session_start", async (event, ctx) => {
     // TUI only: RPC/JSON/print modes are headless (no PTY herdr can display),
     // and RPC still reports hasUI=true, so mode is the reliable gate.
@@ -289,10 +238,6 @@ export default function (pi) {
     // A reload can replace this extension mid-run without emitting another agent_start.
     agentActive = ctx?.isIdle?.() === false;
     publishState(true);
-    if (currentAgentSessionId) {
-      const ownerSessionId = currentAgentSessionId;
-      queueMicrotask(() => void attachOrchestration(ownerSessionId));
-    }
   });
 
   pi.on("agent_start", (_event, ctx) => {
@@ -312,12 +257,5 @@ export default function (pi) {
 
     agentActive = false;
     publishState();
-  });
-
-  pi.on("session_shutdown", () => {
-    rootSession = false;
-    orchestrationUnsubscribe?.();
-    orchestrationUnsubscribe = undefined;
-    orchestrationActive = false;
   });
 }

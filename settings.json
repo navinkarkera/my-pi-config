@@ -21,9 +21,9 @@
     "npm:@codexstar/pi-listen",
     "git:github.com/DietrichGebert/ponytail",
     "npm:pi-discord-remote",
-    "npm:pi-nvim-context",
     "npm:pi-advisor-flow",
-    "npm:pi-ast-grep"
+    "npm:pi-ast-grep",
+    "npm:pi-subagents"
   ],
   "hideThinkingBlock": true,
   "steeringMode": "one-at-a-time",
