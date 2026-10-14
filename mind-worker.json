@@ -7,10 +7,9 @@
   "ntfyTopic": "nrk_mangalpete_legion_ai_reminders",
   "mindModel": "openai/gpt-6.1-sol",
   "workerModels": [
-    { "model": "openai/gpt-6-luna", "count": 3, "tier": "flash" },
-    { "model": "openai/gpt-6-luna", "count": 0, "tier": "strong" }
+    { "model": "opencode-go/deepseek-v4.1-flash", "count": 2, "tier": "flash" }
   ],
-  "workerModel": "openai/gpt-6-luna",
+  "workerModel": "opencode-go/deepseek-v4.1-flash",
   "terminalBackend": "herdr",
   "resetTimeout": 5,
   "kittyEnabled": false,
@@ -23,7 +22,7 @@
   "dashboardStaleMs": 30000,
   "burstFlash": {
     "enabled": true,
-    "model": "openai/gpt-6-luna",
+    "model": "opencode-go/deepseek-v4.1-flash",
     "maxBurst": 5,
     "idleTtlMs": 180000,
     "maxTasksPerWorker": 3,
