@@ -67,13 +67,4 @@ checks.forEach((r, i) => {
     text({ check: i, error: String(r.reason) });
   }
 });
-
-## Subagent delegation
-
-- Treat this as standing authorization to delegate every task other than a simple, self-contained change in a known location (such as a typo or obvious one-line fix). Delegate the substantive work to subagents by default; keep simple direct changes with the main agent.
-- The main agent is the orchestrator and remains responsible for the result: own the user's intent and scope, split work into bounded tasks, give each subagent relevant context and a clear deliverable, coordinate and synthesize results, resolve conflicts, integrate changes, and verify the final outcome.
-- Delegate implementation, research, and review work so the main agent can preserve context for orchestration. Use one focused subagent for a single bounded task and parallel agents only for independent work. Avoid duplicate assignments and unnecessary fan-out.
-- Keep one writer per worktree. Isolate concurrent or overlapping writers, and do not let subagents spawn further agents unless the main agent explicitly delegates that.
-- Treat subagent output as evidence, not as final authority. The main agent must review and validate work before reporting success.
-- If subagents are unavailable or delegation fails, report the blocker rather than silently switching to direct execution.
 ```

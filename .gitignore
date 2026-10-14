@@ -19,7 +19,9 @@ tmp/
 /pi-discord-remote/config.json
 /.pi
 /.billion-context-pi-update-check-749f6fc76d80
-/bin
+/bin/*
+!/bin/mind-worker-launcher
+!/bin/mind-worker-dashboard
 /pi-web
 /pi-web-run
 /pi-web-session-index.json
