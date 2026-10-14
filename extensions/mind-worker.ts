@@ -2740,9 +2740,18 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 				detached: true,
 				env: { ...process.env },
 			});
+			let resultReported = false;
+			const reportResult = (message: string, level: "info" | "error") => {
+				if (resultReported) return;
+				resultReported = true;
+				ctx.ui.notify(message, level);
+			};
+			child.once("error", error => reportResult(`Reset request failed: ${error.message}`, "error"));
+			child.once("exit", (code, signal) => code === 0
+				? reportResult("Reset request accepted — restart requested, not yet confirmed.", "info")
+				: reportResult(`Reset request rejected (launcher exit ${code ?? signal}).`, "error"));
 			child.unref();
-
-			ctx.ui.notify("Reset initiated — mind and worker will restart.", "info");
+			ctx.ui.notify("Reset request sent; awaiting launcher acceptance.", "info");
 		},
 	});
 

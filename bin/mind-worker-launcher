@@ -7,20 +7,51 @@ AGENT_DIR="$SCRIPT_DIR/.."
 CONFIG_FILE="$AGENT_DIR/mind-worker.json"
 NODE_CMD=(mise x node@26 -- node)
 
-# Parse --background flag (consumed here, not passed to launcher)
 BACKGROUND_FLAG=0
+RESET_FLAG=0
 PASSTHROUGH_ARGS=()
 for arg in "$@"; do
-  if [ "$arg" = "--background" ]; then
-    BACKGROUND_FLAG=1
-  else
-    PASSTHROUGH_ARGS+=("$arg")
-  fi
+  case "$arg" in
+    --background) BACKGROUND_FLAG=1 ;;
+    --reset) RESET_FLAG=1; PASSTHROUGH_ARGS+=("$arg") ;;
+    *) PASSTHROUGH_ARGS+=("$arg") ;;
+  esac
 done
 set -- "${PASSTHROUGH_ARGS[@]}"
 
 if [ "${MIND_WORKER_LAUNCHER_BACKGROUND:-}" = "1" ]; then
   BACKGROUND_FLAG=1
+fi
+
+MANAGED_RESET=0
+if [ "$RESET_FLAG" = "1" ] && [ -n "${PI_MIND_WORKER_LAUNCHER_PID:-}" ] && [ -n "${PI_MIND_WORKER_LAUNCHER_TOKEN:-}" ]; then
+  MANAGED_RESET=1
+fi
+
+if [ "$BACKGROUND_FLAG" = "1" ] && [ "$MANAGED_RESET" = "0" ]; then
+  echo "ERROR: Mind now runs in the invoking pane and requires its foreground terminal; rerun bin/mind-worker-launcher without --background." >&2
+  exit 2
+fi
+
+if [ "${HERDR_ENV:-}" != "1" ]; then
+  echo "ERROR: Run bin/mind-worker-launcher from a Herdr pane (HERDR_ENV=1)." >&2
+  exit 2
+fi
+
+if [ "$MANAGED_RESET" = "0" ]; then
+  if [ ! -t 0 ] || [ ! -t 1 ] || [ ! -t 2 ]; then
+    echo "ERROR: Mind must be started interactively in a Herdr pane; detached startup cannot safely take over a terminal." >&2
+    exit 2
+  fi
+  # A background job can inherit all three TTY descriptors.
+  read -r CURRENT_PGID TTY_PGID < <(ps -o pgid= -o tpgid= -p "$$" 2>/dev/null) || {
+    echo "ERROR: Cannot verify foreground terminal ownership; refusing to start Mind." >&2
+    exit 2
+  }
+  if [ -z "$CURRENT_PGID" ] || [ "$CURRENT_PGID" != "$TTY_PGID" ]; then
+    echo "ERROR: Mind must run in the foreground process group of its Herdr pane." >&2
+    exit 2
+  fi
 fi
 
 BACKEND=""
@@ -36,16 +67,6 @@ HERDR_LAUNCHER="$AGENT_DIR/lib/mind-worker/herdr-launcher.mjs"
 if [ ! -f "$HERDR_LAUNCHER" ]; then
   echo "ERROR: herdr launcher not found at $HERDR_LAUNCHER" >&2
   exit 1
-fi
-
-if [ "$BACKGROUND_FLAG" = "1" ]; then
-  LOG_FILE="$AGENT_DIR/mindworker/herdr-launcher-background.log"
-  mkdir -p "$(dirname "$LOG_FILE")"
-  MIND_WORKER_HERDR_BACKGROUND=1 nohup "${NODE_CMD[@]}" "$HERDR_LAUNCHER" "$@" < /dev/null >> "$LOG_FILE" 2>&1 &
-  BG_PID=$!
-  disown "$BG_PID" || true
-  echo "Background Herdr mind-worker launcher started (PID: $BG_PID)" >&2
-  exit 0
 fi
 
 exec "${NODE_CMD[@]}" "$HERDR_LAUNCHER" "$@"
