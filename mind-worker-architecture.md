@@ -10,7 +10,7 @@
 
 | Concept | Definition |
 |---------|------------|
-| **Mind** | The planner instance. Uses a superior model. Has zero file tools. Only tool is `delegate`. |
+| **Mind** | The planner instance. Uses a superior model. Read-only tools: `delegate`, `delegate_async`, `read`, `git`, `ripgrep`, and `codemode` (reaches `code_explore` only). |
 | **Worker** | The executor instance. Uses a cheaper model. Has full Pi tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`). |
 | **User** | Human operator who types into the Mind TUI. All intent flows through Mind. |
 | **Unix Socket** | The sole wire between Mind and Worker. Deterministic path per working directory. |
@@ -58,7 +58,7 @@
 
 - Socket path: `~/.pi/agent/mindworker/{hash-of-cwd}.sock`
 - Hash = stable hash of absolute `cwd` string. **[LAUNCHER PATH]** CWD is canonicalized via `realpath` before hashing to eliminate symlink mismatches between panes. See `mind-worker-reset-design.md §3.1`.
-- Only **one** mind-worker pair allowed per directory at a time.
+- Only **one** mind-worker pair per directory **per instance label**. `bin/mind-worker-launcher --instance <label>` (default: no label) prefixes every cwd-derived id with the label, so `--instance beta` uses `beta-{hash}.sock`, `beta-{hash}-manifest.json`, `beta-{hash}-mind-control.json`, session dirs `worker-beta-{hash}-{i}`, and passes `PI_MIND_WORKER_INSTANCE=beta` to Mind and workers. Without a label nothing changes.
 - **Mind** creates socket and listens.
 - **Worker** polls socket path every `500ms`, timeout `30s`. If not found: error "Run `/be-mind` first." **[LEGACY]** — launcher path worker does **not** poll; launcher waits for socket live + manifest generation match before spawning worker.
 - Stale socket from crashed instance: worker probes; if dead, deletes and retries. If alive and role occupied: error. **[LEGACY]** — launcher path cleanup phase deletes all artifacts (including socket) before spawn, so stale socket is impossible.
@@ -81,7 +81,7 @@ Mind and Worker must not share a session file (Pi's `SessionManager` names from 
 
 ### 4.1. Mind Tool Set
 
-Exactly **one** custom tool:
+Active tool set (`MIND_ALLOWED_TOOLS` in `extensions/mind-worker.ts`): `delegate`, `delegate_async`, `read`, `git`, `ripgrep`, `codemode` (reaches `code_explore` and nothing else). Everything else is blocked mechanically by the `tool_call` guard. `delegate`/\`delegate_async\` remain the mutating path.
 
 ```typescript
 pi.registerTool({
@@ -99,7 +99,7 @@ pi.registerTool({
 })
 ```
 
-**No** `read`, `write`, `edit`, `bash` tools for Mind. Enforced mechanically.
+**No** `write`, `edit`, or `bash` tools for Mind, and `read`/`git`/`ripgrep`/`code_explore` stay read-only. Enforced mechanically.
 
 ### 4.2. Worker Tool Set
 
