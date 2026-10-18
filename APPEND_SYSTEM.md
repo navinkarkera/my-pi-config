@@ -1,74 +1,76 @@
-## ai-notes
+## Response style
 
-Requested Markdown documents go to `~/work/ai-notes/<current_dir_name>/` (`<current_dir_name>` = current working directory name); create the folder if missing, then commit and push the document. Notes already in that folder may be used as context.
+Answer simple points directly instead of writing paragraphs. Keep language simple and concise.
 
-Search before writing; update existing notes instead of duplicating.
-- qmd — conceptual/semantic discovery and full-source retrieval: `qmd query $'intent: ...\nlex: ...\nvec: ...' -c ai-notes`, then `qmd get <path|#docid>`. Keyword-only: `qmd search "<terms>" -c ai-notes`.
-- zk — exact term/title matches, metadata listing, and the link graph, always pinned: `zk --notebook-dir ~/work/ai-notes list --match '<terms>'` (`--match-strategy exact`, `--format`, `--orphan`, `--broken-links`, `--missing-backlink`, `--linked-by`). Never rely on `ZK_NOTEBOOK_DIR` — it selects personal notes.
-- After adding or editing notes: `qmd update` re-indexes incrementally; run `qmd embed` only when `qmd status` shows missing vectors.
+## AI notes
 
-Always respond on simple points instead of writing paragraphs. Keep the language simple and concise.
+Durable project notes live in `~/work/ai-notes/<current_dir_name>/` (`<current_dir_name>` = current working directory name). Notes already in that folder are valid context.
 
-## Codemode preference
+**Read before writing**
+- Search whenever prior project context may help, and always before writing a requested Markdown document. Update existing notes instead of duplicating them.
+- qmd — conceptual/semantic discovery and full-source retrieval:
+  `qmd query $'intent: ...\nlex: ...\nvec: ...' -c ai-notes`, then `qmd get <path|#docid>`.
+  Keyword-only: `qmd search "<terms>" -c ai-notes`.
+- zk — exact titles/terms, metadata and the link graph; always pin the notebook, never rely on `ZK_NOTEBOOK_DIR` (it selects personal notes):
+  `zk --notebook-dir ~/work/ai-notes list --match '<terms>'` (add `--match-strategy exact` for exact terms, `--linked-by <id>` for the link graph).
 
-Prefer **codemode** as the default interface for tools whenever possible. Use it to batch independent operations, chain dependent operations, and filter results *before* putting them in the model context. Call a tool directly only when codemode cannot perform the operation or would introduce needless overhead.
+**Write**
+- Requested Markdown documents go into the project folder, created if missing, then commit and push.
 
-- For coherent multi-step tasks, favor one self-contained codemode script that gathers evidence, performs necessary actions in order, verifies results, and returns a concise summary. Do not make a series of tool calls solely to pass intermediate output back through the model.
-- Use `Promise.allSettled()` when independent calls can fail separately. Sequence dependent calls and stop on error. Inspect error and exit information; never claim success without verification.
-- Keep `text()` output small and relevant. Filter structured tool results in the script rather than returning large raw results.
-- For Git changes, stage only explicitly relevant paths and inspect the resulting diff or commit. Do not stage unrelated work.
+**Re-index**
+- After adding or editing notes: `qmd update` (incremental). Run `qmd embed` only when `qmd status` reports missing vectors.
 
-## Code exploration policy
+## Codemode is the default
 
-Choose the least expensive tool that can answer the question. **Keep searches scoped, bounded, and read-only.** Do not index a large repository just to answer a narrow question.
+Prefer codemode as the interface for tools. Call a tool directly only when codemode cannot perform the operation or would add needless overhead.
 
-### Tool selection
+- One coherent script per task: gather evidence, act, verify, return a short summary. Don't chain separate calls just to pass intermediate output through the model.
+- Use `Promise.allSettled()` for independent calls; sequence dependent calls and stop on error.
+- Check results, errors and exit codes; never claim success without verification.
+- Keep `text()` output small and relevant — select fields in the script instead of returning raw tool results.
+- Git: stage only explicitly relevant paths and inspect the resulting diff or commit.
 
-- **Known file or line range:** Use `tools.read` through codemode. Read only the relevant portion; no map is necessary.
-- **Unfamiliar module or directory:** Use `tools.code_explore({ action: "map", scope: "specific/subtree", maxFiles: 60, maxTokens: 1024 })`. This produces a syntax-level outline of symbols, signatures, and source locations without a persistent index. For a large repository, find a likely subtree first; do not map its root.
-- **Find filenames or literal text:** Use `tools.code_explore({ action: "files" | "text", query: "...", scope: "..." })` or scoped `rg` through `tools.bash`. Prefer `rg -F` for literal searches and `rg -l` when only matching filenames are needed.
-- **AST patterns:** Prefer the installed Pi-native `ast_grep_search` tool via codemode, checking its schema with `describeTool("ast_grep_search")` when needed. Use `code_explore({ action: "ast", ... })` as a fallback. AST matching is syntactic, not type-resolved.
-- **Symbol references or change impact:** Use `tools.code_explore({ action: "symbol" | "references" | "impact", query: "...", scope: "..." })`. It may choose Cymbal only in small, healthy repositories. **Never run Cymbal directly to bypass size and timeout safeguards**, particularly in `edx-platform`.
-- **Existing changes or tests:** Start with the affected files and a bounded Git diff. Run the smallest appropriate lint or test command before expanding scope.
+## Code Explorer
 
-### RTK and command output
+Prefer the least expensive tool that answers the question. Keep searches scoped, bounded and read-only; never index a large repository to answer a narrow question.
 
-- Call shell commands through `tools.bash` inside codemode. When RTK's Pi integration is installed, let it compress supported Git, build, lint, and test output. Do not build a second output-rewriting layer inside Code Explorer.
-- Request uncompressed output when exact stack traces, full diffs, complete logs, or security-relevant evidence are needed.
-- RTK does not replace validation: inspect exit codes and preserve enough detail to explain failures.
+1. **Known file or line range** → `tools.read`, only the relevant span. No map needed.
+2. **Unfamiliar module or directory** → `code_explore` with `action:"map"` first, on a narrow `scope`: a syntax-level overview of symbols, signatures and locations with no persistent index. Find a likely subtree; never map a large repo root.
+3. **Then pick the action that matches the question**, passing `query` (and `scope` to narrow):
+   - `files` — filenames; `text` — literal strings.
+   - `ast` — structural/syntactic patterns; `language` is required.
+   - `symbol` — symbol lookup; `references` — usages; `impact` — change surface.
+4. **Relationships:** `symbol`, `references` and `impact` may use Cymbal only when the repository is eligible (small and healthy), and fall back to a bounded text search otherwise. Never call or bypass Cymbal directly.
 
-### Search and mapping discipline
+`map` and `ast` are ast-grep (syntax-level); `files` and `text` are ripgrep.
 
-- Start in the narrowest plausible subtree, then expand only when evidence requires it. Respect `.gitignore` and avoid generated files, virtual environments, dependencies, caches, and build outputs.
-- Do not dump whole files, giant diffs, or hundreds of search hits into context. Find candidate paths first, then read bounded spans or inspect a few relevant symbols.
-- Map limits are safety controls: by default a directory with more than 60 eligible files is refused. `maxTokens` limits approximate *output*, not the number of bytes scanned. Narrow the scope instead of repeatedly increasing caps.
-- A syntax map, grep match, or AST match is not proof of a complete call graph. Dynamic dispatch, aliases, reflection, and imports may require additional verification.
-- If a tool is unavailable or fails, use a simpler scoped fallback. Do not repeatedly retry failed indexing or install new tools without approval.
+- Stay bounded: narrow the scope instead of raising safety limits (`maxFiles` caps file count at 60 by default; `maxTokens` limits output, not bytes scanned).
+- A map, grep or AST match is not a complete call graph. Dynamic dispatch, aliases, reflection and imports may need verification.
+- If a tool fails or is unavailable, fall back to a simpler scoped search instead of retrying indexing or installing tools.
 
-### Codemode examples
+### Map first
 
 ```js
-// Inspect a bounded directory structure; does not invoke Cymbal.
 const map = await tools.code_explore({
   action: "map",
   scope: "openedx/core/djangoapps/content_libraries",
-  maxFiles: 60,
-  maxTokens: 1024,
 });
 text({ backend: map.backend, truncated: map.truncated, warning: map.warning, map: map.output });
 ```
 
+### Fan out independent Code Explorer queries
+
 ```js
-// Run independent targeted checks and return only useful summaries.
-const checks = await Promise.allSettled([
-  tools.bash({ command: "git diff --check" }),
-  tools.bash({ command: "git status --short" }),
-]);
-checks.forEach((r, i) => {
-  if (r.status === "fulfilled") {
-    text({ check: i, exitCode: r.value.exit_code, output: r.value.output.slice(0, 2000) });
-  } else {
-    text({ check: i, error: String(r.reason) });
-  }
+const calls = [
+  ["symbol", { action: "symbol", query: "ContentLibrary", scope: "openedx/core/djangoapps/content_libraries" }],
+  ["references", { action: "references", query: "ContentLibrary", scope: "openedx" }],
+  ["text", { action: "text", query: "content_libraries", scope: "openedx/core/djangoapps" }],
+];
+const results = await Promise.allSettled(calls.map(([, args]) => tools.code_explore(args)));
+results.forEach((r, i) => {
+  const label = calls[i][0];
+  text(r.status === "fulfilled"
+    ? { label, backend: r.value.backend, truncated: r.value.truncated, warning: r.value.warning, output: r.value.output.slice(0, 400) }
+    : { label, error: String(r.reason) });
 });
 ```
