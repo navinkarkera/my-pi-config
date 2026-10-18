@@ -500,7 +500,7 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 		...(INSTANCE_LABEL ? ["--env", `PI_MIND_WORKER_INSTANCE=${INSTANCE_LABEL}`] : []),
 		"--env", `PI_MIND_WORKER_SESSION_DIR=${sessionDir}`,
 		"--env", `PATH=${process.env.PATH || ""}`,
-		PI_CLI, "--mode", "rpc", "--model", model, "--thinking", "max", "--session-dir", sessionDir,
+		PI_CLI, "--mode", "rpc", "--model", model, "--thinking", "xhigh", "--session-dir", sessionDir,
 	];
 	// Best-effort focus mind window before launching split
 	const mindTitle = `mind-${hash}`;

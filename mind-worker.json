@@ -5,7 +5,7 @@
   "workerTaskStrictness": "strict",
   "notifyOnMindIdle": true,
   "ntfyTopic": "nrk_mangalpete_legion_ai_reminders",
-  "mindModel": "openai/gpt-6.1-sol",
+  "mindModel": "openai/gpt-5.6-sol",
   "workerModels": [
     { "model": "opencode-go/deepseek-v4.1-flash", "count": 2, "tier": "flash" }
   ],

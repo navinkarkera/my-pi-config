@@ -1,79 +1,57 @@
 ---
 name: to-issues
-description: Break a plan, spec, or PRD into independently-grabbable issues on the project issue tracker using tracer-bullet vertical slices. Use when user wants to convert a plan into issues, create implementation tickets, or break down work into issues.
+description: Break a plan, spec, or PRD into independently grabbable implementation tasks, written as local notes under ~/work/ai-notes, each declaring its hard blockers. Use when the user wants to convert a plan into tasks, issues, or tickets, create implementation tickets, or break down work into issues.
 ---
 
 # To Issues
 
-Break a plan into independently-grabbable issues using vertical slices (tracer bullets). Create separate markdown files for each step in .tasks/ folder.
+Turn a settled plan, spec, or PRD into **implementation tasks**: tracer-bullet vertical slices, each delivering demonstrable end-to-end behaviour and declaring only its hard blockers. Tasks are always local Markdown notes — this skill never creates or modifies anything on an issue tracker.
 
-## Process
+## 1. Gather context
 
-### 1. Gather context
+Work from the conversation and from any spec, PRD, or issue the user references. A tracker issue (number or URL) may be read as source context: **fetch its full body and comments read-only**, and record that provenance in the tasks. Never publish, edit, label, close, attach, or create anything on GitHub, GitLab, or any other tracker.
 
-Work from whatever is already in the conversation context. If the user passes an issue reference (issue number, URL, or path) as an argument, fetch it from the issue tracker and read its full body and comments.
+Search the target folder first and update an existing task rather than creating a near-duplicate. Facts are the agent's job, never the user's: research the codebase and notes instead of asking. Explore enough to understand the current state, prefactoring opportunities, and the project's domain vocabulary.
 
-### 2. Explore the codebase (optional)
+## 2. Where tasks go
 
-If you have not already explored the codebase, do so to understand the current state of the code. Issue titles and descriptions should use the project's domain glossary vocabulary, and respect ADRs in the area you're touching.
+Every task goes to `~/work/ai-notes/<current_dir_name>/tasks/<feature-slug>/<NN>-<slug>.md`, where `<current_dir_name>` is the basename of the session's current working directory. Generated Markdown never goes into the source repo — not `.tasks/`, not `.scratch/`, nowhere in it.
 
-### 3. Draft vertical slices
+## 3. Draft the slices
 
-Break the plan into **tracer bullet** issues. Each issue is a thin vertical slice that cuts through ALL integration layers end-to-end, NOT a horizontal slice of one layer.
+Each task is a **tracer bullet**. Produce the fewest complete vertical slices, each cutting through every layer it needs and demoable on its own. Avoid layer-shaped or file-shaped tasks and over-decomposition; a small change may be a single task.
 
-Slices may be 'HITL' or 'AFK'. HITL slices require human interaction, such as an architectural decision or a design review. AFK slices can be implemented and merged without human interaction. Prefer AFK over HITL where possible.
+**Guard the lower bound.** If the whole change fits one fresh implementation context and tasks would add no coordination or tracking value, recommend going straight to implementation; write one task only if the user still wants the tracking.
 
-<vertical-slice-rules>
-- Each slice delivers a narrow but COMPLETE path through every layer (schema, API, UI, tests)
-- A completed slice is demoable or verifiable on its own
-- Prefer many thin slices over few thick ones
-</vertical-slice-rules>
+<slice-rules>
+- End-to-end behaviour, not a horizontal slice of one layer
+- Sized to fit one fresh implementation context window
+- Acceptance criteria owned by this task, observable and falsifiable, and false at the commit the implementer starts from
+- Any required prefactoring comes first, preserves behaviour, and makes the later slices easier
+</slice-rules>
 
-### 4. Quiz the user
+**Wide refactors are the exception.** One mechanical change whose blast radius breaks many call sites at once becomes expand → migrate → contract: add the new form beside the old; migrate in batches sized by blast radius, each batch independently green and blocked by the expand; contract once no caller remains, blocked by every batch. If the batches cannot stay green alone, give them an integration branch and a final integrate-and-verify task that every batch blocks.
 
-Present the proposed breakdown as a numbered list. For each slice, show:
+**The testing seam belongs in the task.** Carry confirmed seams and spec user stories/outcomes across from the source. If a seam or a necessary design decision is missing, ask before writing. Facts get researched; unresolved design decisions are not implementation tasks — settle them or mark a clearly human-only step instead of pretending it is agent-ready.
 
-- **Title**: short descriptive name
-- **Type**: HITL / AFK
-- **Blocked by**: which other slices (if any) must complete first
-- **User stories covered**: which user stories this addresses (if the source material has them)
+## 4. Wire the dependencies
 
-Ask the user:
+Every dependency must be a **hard blocker**, with no dangling or self edges, forming a DAG. Order the tasks blockers first and link each one to its blockers with relative Markdown links between the task files. Represent the executable frontier — which tasks can start immediately and which can run in parallel.
 
-- Does the granularity feel right? (too coarse / too fine)
-- Are the dependency relationships correct?
-- Should any slices be merged or split further?
-- Are the correct slices marked as HITL and AFK?
+## 5. Quiz the user
 
-Iterate until the user approves the breakdown.
+Before anything is written, show the whole breakdown as a numbered list: **title**, **delivered behaviour**, **verification/demo**, **test seam**, **blockers**, and the spec **user story/outcome** each task covers.
 
-### 5. Publish the issues to the issue tracker
+Ask the user to approve the granularity, the blocking edges, and any merge or split choices. Do not write any task until they approve.
 
-For each approved slice, publish a new issue to the issue tracker. Use the issue body template below. Apply the `needs-triage` triage label so each issue enters the normal triage flow.
+## 6. Write the tasks
 
-Publish issues in dependency order (blockers first) so you can reference real issue identifiers in the "Blocked by" field.
+One file per task named `<NN>-<slug>.md`, numbered from `01` in dependency order, blockers first. Each file records: title, delivered behaviour, acceptance criteria, blockers, status, test seam, how the work is verified or demoed, provenance (source spec or issue), and what is out of scope.
 
-<issue-template>
-## Parent
+Before writing, read `~/work/ai-notes/AGENTS.md` and the target `CONTEXT.md` and `TODO.md`, and search first with `rg` plus zk run from `~/work/ai-notes` (`zk --notebook-dir ~/work/ai-notes list --match '<terms>'`). Every zk command uses `~/work/ai-notes` as its working directory and notebook root, so it can never resolve to the source repo. Task notes carry the AGENTS.md metadata with `type: plan`; if the target `TODO.md` is absent, create it with valid AGENTS.md metadata and link the new task files from it.
 
-A reference to the parent issue on the issue tracker (if the source was an existing issue, otherwise omit this section).
+Mark genuine human-only or external steps clearly rather than presenting them as agent-ready, and keep task bodies free of file paths, line numbers, and code snippets — except a prototype snippet that encodes a decision, clearly attributed as one.
 
-## What to build
+## 7. Commit local tasks
 
-A concise description of this vertical slice. Describe the end-to-end behavior, not layer-by-layer implementation.
-
-## Acceptance criteria
-
-- [ ] Criterion 1
-- [ ] Criterion 2
-- [ ] Criterion 3
-
-## Blocked by
-
-- A reference to the blocking ticket (if any)
-
-Or "None - can start immediately" if no blockers.
-
-</issue-template>
-
-Do NOT close or modify any parent issue.
+From `~/work/ai-notes` (the working directory for every zk command): run the AGENTS.md graph checks (`zk --notebook-dir ~/work/ai-notes list --orphan` and `zk --notebook-dir ~/work/ai-notes list --broken-links`), note the pre-existing baseline, and confirm the new files add no new orphan or broken internal link. Then inspect the target-path diff, ask before including pre-existing edits you did not make, stage only the exact files you touched, commit as `docs(<current_dir_name>): add <feature> implementation tasks`, and push normally. If the commit or push fails, report it plainly. No force, no rebase.
