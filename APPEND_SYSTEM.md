@@ -1,7 +1,11 @@
-Whenever user asks to create a markdown document, add the document to ~/work/ai-notes/<current_dir_name>/ where `current_dir_name` will be the current directory name. Create the folder if missing.
-Commit the document and push it.
+## ai-notes
 
-You can also refer to documents contained in ai-notes/<current_dir_name> folder
+Requested Markdown documents go to `~/work/ai-notes/<current_dir_name>/` (`<current_dir_name>` = current working directory name); create the folder if missing, then commit and push the document. Notes already in that folder may be used as context.
+
+Search before writing; update existing notes instead of duplicating.
+- qmd — conceptual/semantic discovery and full-source retrieval: `qmd query $'intent: ...\nlex: ...\nvec: ...' -c ai-notes`, then `qmd get <path|#docid>`. Keyword-only: `qmd search "<terms>" -c ai-notes`.
+- zk — exact term/title matches, metadata listing, and the link graph, always pinned: `zk --notebook-dir ~/work/ai-notes list --match '<terms>'` (`--match-strategy exact`, `--format`, `--orphan`, `--broken-links`, `--missing-backlink`, `--linked-by`). Never rely on `ZK_NOTEBOOK_DIR` — it selects personal notes.
+- After adding or editing notes: `qmd update` re-indexes incrementally; run `qmd embed` only when `qmd status` shows missing vectors.
 
 Always respond on simple points instead of writing paragraphs. Keep the language simple and concise.
 
