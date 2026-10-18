@@ -484,7 +484,7 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 	const fallbackToHeadless = (reason: string) => {
 		if (fellBack) return;
 		fellBack = true;
-		console.error(`[burst-flash] ${workerId}: ${reason}, falling back to headless`);
+		logDiag("error", `[burst-flash] ${workerId}: ${reason}, falling back to headless`);
 		burstWorkers.delete(workerId);
 		spawnBurstHeadless({ n, workerId, cwd, sessionDir, logPath, model, generation, env });
 	};
@@ -534,7 +534,7 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 	};
 	burstWorkers.set(workerId, state);
 	logBurstEvent(cwd, workerId, "spawned", `mode=kitty title=${paneTitle} model=${model}`);
-	console.error(`[burst-flash] spawned ${workerId} in kitty pane ${paneTitle}`);
+	logDiag("error", `[burst-flash] spawned ${workerId} in kitty pane ${paneTitle}`);
 	child.on("error", (err) => fallbackToHeadless(`kitty spawn error: ${err.message}`));
 	child.on("close", (code) => {
 		if (code !== 0) fallbackToHeadless(`kitty @ launch exit code ${code}`);
@@ -551,15 +551,15 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 			s.lastEvent = `pid discovered: ${result.pid}`;
 			s.lastEventAt = Date.now();
 			logBurstEvent(cwd, workerId, "pid-discovered", `pid=${result.pid} windowId=${result.windowId}`);
-			console.error(`[burst-flash] ${workerId} pid=${result.pid} windowId=${result.windowId}`);
+			logDiag("error", `[burst-flash] ${workerId} pid=${result.pid} windowId=${result.windowId}`);
 		} else {
 			s.lastEvent = "pid discovery failed";
 			s.lastEventAt = Date.now();
 			logBurstEvent(cwd, workerId, "pid-discovery-failed", "tracking by title only");
-			console.warn(`[burst-flash] ${workerId} PID discovery failed, tracking by title only`);
+			logDiag("warn", `[burst-flash] ${workerId} PID discovery failed, tracking by title only`);
 		}
 	}).catch((err) => {
-		console.warn(`[burst-flash] ${workerId} PID discovery error: ${err?.message ?? err}`);
+		logDiag("warn", `[burst-flash] ${workerId} PID discovery error: ${err?.message ?? err}`);
 	});
 	if (!burstIdleCheckTimer) {
 		burstIdleCheckTimer = setInterval(() => checkBurstIdleTtl(cwd), 5000);
@@ -604,7 +604,7 @@ function retireBurstFlash(workerId: string, reason: string): void {
 	if (!state) return;
 	state.lastEvent = `retire: ${reason}`;
 	state.lastEventAt = Date.now();
-	console.error(`[burst-flash] retiring ${workerId} reason=${reason} tasks=${state.taskCount}`);
+	logDiag("error", `[burst-flash] retiring ${workerId} reason=${reason} tasks=${state.taskCount}`);
 	logBurstEvent("", workerId, "retire", reason);
 	// Stop sequence: socket shutdown -> (kitty close if kitty mode) -> SIGTERM -> SIGKILL
 	const conn = workerPool.get(workerId);
@@ -670,20 +670,20 @@ function spawnBurstHeadless(p: SpawnHeadlessParams): void {
 		});
 	} catch (err: any) {
 		const syncErrMsg = `[burst-flash] ${workerId}: headless spawn threw synchronously: ${err.message}`;
-		console.error(syncErrMsg);
+		logDiag("error", syncErrMsg);
 		appendFileSync(logPath, syncErrMsg + "\n");
 		burstWorkers.delete(workerId);
 		return;
 	}
 	child.on("error", (err) => {
 		const errMsg = `[burst-flash] ${workerId}: headless spawn error: ${err.message}`;
-		console.error(errMsg);
+		logDiag("error", errMsg);
 		appendFileSync(logPath, errMsg + "\n");
 		burstWorkers.delete(workerId);
 		try { require("node:fs").rmSync(sessionDir, { recursive: true, force: true }); } catch { /* ignore */ }
 	});
 	if (!child.pid) {
-		console.error(`[burst-flash] spawn failed: no pid for ${workerId}`);
+		logDiag("error", `[burst-flash] spawn failed: no pid for ${workerId}`);
 		return;
 	}
 	const state: BurstWorkerState = {
@@ -704,20 +704,20 @@ function spawnBurstHeadless(p: SpawnHeadlessParams): void {
 	};
 	burstWorkers.set(workerId, state);
 	const logStream = createWriteStream(logPath, { flags: "a" });
-	logStream.on("error", (err) => console.warn(`[burst-flash] ${workerId}: log stream error: ${err.message}`));
+	logStream.on("error", (err) => logDiag("warn", `[burst-flash] ${workerId}: log stream error: ${err.message}`));
 	if (child.stdout) child.stdout.pipe(logStream, { end: false });
 	if (child.stderr) child.stderr.pipe(logStream, { end: false });
 	child.on("exit", (code, signal) => {
 		const reason = signal ? `signal=${signal}` : `code=${code}`;
 		state.lastEvent = `exited ${reason}`;
 		state.lastEventAt = Date.now();
-		console.error(`[burst-flash] ${workerId} exited code=${code} signal=${signal}`);
+		logDiag("error", `[burst-flash] ${workerId} exited code=${code} signal=${signal}`);
 		logStream.end();
 		burstWorkers.delete(workerId);
 		try { require("node:fs").rmSync(sessionDir, { recursive: true, force: true }); } catch { /* ignore */ }
 	});
 	logBurstEvent(cwd, workerId, "spawned", `pid=${child.pid} model=${model}`);
-	console.error(`[burst-flash] spawned ${workerId} pid=${child.pid}`);
+	logDiag("error", `[burst-flash] spawned ${workerId} pid=${child.pid}`);
 	if (!burstIdleCheckTimer) {
 		burstIdleCheckTimer = setInterval(() => checkBurstIdleTtl(cwd), 5000);
 	}
@@ -909,6 +909,14 @@ function ensureDir(path: string): void {
 
 function getStateDir(): string {
 	return join(getAgentDir(), "mindworker");
+}
+
+/** Append extension diagnostics to one shared log file; stdout/stderr stay clean for the TUI. */
+function logDiag(level: "warn" | "error", message: string): void {
+	try {
+		ensureDir(getStateDir());
+		appendFileSync(join(getStateDir(), "mind-worker-ext.log"), `[${new Date().toISOString()}] ${level}: ${message}\n`);
+	} catch { /* logging must never break the session */ }
 }
 
 function getSocketPath(cwd: string): string {
@@ -1106,7 +1114,7 @@ function writeManifestRunning(cwd: string): void {
 		if (!manifest) return; // no manifest → legacy path, skip
 		if (manifest.state === "running") return;
 		if (!validateStateTransition(manifest.state as string, "running")) {
-			console.error(`[mind-worker] Invalid manifest transition: ${manifest.state} → running`);
+			logDiag("error", `[mind-worker] Invalid manifest transition: ${manifest.state} → running`);
 			return;
 		}
 		manifest.state = "running";
@@ -1166,7 +1174,7 @@ function resolveWorkerModels(config: MindWorkerConfig): WorkerModelEntry[] {
 			}
 		}
 		if (resolved.length === 0) {
-			console.warn("[mind-worker] workerModels validation failed — falling back to legacy config");
+			logDiag("warn", "[mind-worker] workerModels validation failed — falling back to legacy config");
 		}
 	}
 	if (resolved.length === 0) {
@@ -1190,22 +1198,22 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 
 		// Type validation warnings for new fields
 		if (parsed.resetTimeout !== undefined && (typeof parsed.resetTimeout !== "number" || parsed.resetTimeout <= 0)) {
-			console.warn("[mind-worker] resetTimeout must be a positive number — using default 5");
+			logDiag("warn", "[mind-worker] resetTimeout must be a positive number — using default 5");
 		}
 		if (parsed.kittyEnabled !== undefined && typeof parsed.kittyEnabled !== "boolean") {
-			console.warn("[mind-worker] kittyEnabled must be a boolean — using default false");
+			logDiag("warn", "[mind-worker] kittyEnabled must be a boolean — using default false");
 		}
 		if (parsed.workerCount !== undefined && (typeof parsed.workerCount !== "number" || parsed.workerCount < 1 || parsed.workerCount > 10)) {
-			console.warn("[mind-worker] workerCount must be 1-10 — using default 3");
+			logDiag("warn", "[mind-worker] workerCount must be 1-10 — using default 3");
 		}
 		if (parsed.dashboardRetention !== undefined && (typeof parsed.dashboardRetention !== "number" || parsed.dashboardRetention < 1)) {
-			console.warn("[mind-worker] dashboardRetention must be a positive number — using default 200");
+			logDiag("warn", "[mind-worker] dashboardRetention must be a positive number — using default 200");
 		}
 		if (parsed.dashboardHeartbeatMs !== undefined && (typeof parsed.dashboardHeartbeatMs !== "number" || parsed.dashboardHeartbeatMs < 1000)) {
-			console.warn("[mind-worker] dashboardHeartbeatMs must be >= 1000 — using default 10000");
+			logDiag("warn", "[mind-worker] dashboardHeartbeatMs must be >= 1000 — using default 10000");
 		}
 		if (parsed.dashboardStaleMs !== undefined && (typeof parsed.dashboardStaleMs !== "number" || parsed.dashboardStaleMs < 3000)) {
-			console.warn("[mind-worker] dashboardStaleMs must be >= 3000 — using default 30000");
+			logDiag("warn", "[mind-worker] dashboardStaleMs must be >= 3000 — using default 30000");
 		}
 
 		// Parse burstFlash config block
@@ -1229,7 +1237,7 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 			logDetail: (rawBurst.logDetail === "full" ? "full" : "compact") as "compact" | "full",
 		};
 		if (burstFlash.enabled && burstFlash.maxBurst === 0) {
-			console.warn("[mind-worker] burstFlash.maxBurst=0 effectively disables burst spawning");
+			logDiag("warn", "[mind-worker] burstFlash.maxBurst=0 effectively disables burst spawning");
 		}
 
 		const wc = typeof parsed.workerCount === "number" && parsed.workerCount >= 1 && parsed.workerCount <= 10
@@ -1251,7 +1259,7 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 			kittyLayout: (() => {
 				const v = parsed.kittyLayout;
 				if (typeof v === "string" && v !== "default" && v !== "mind-split-workers-tab") {
-					console.warn(`[mind-worker] kittyLayout "${v}" invalid — must be "default" or "mind-split-workers-tab"`);
+					logDiag("warn", `[mind-worker] kittyLayout "${v}" invalid — must be "default" or "mind-split-workers-tab"`);
 					return undefined;
 				}
 				return typeof v === "string" ? v : undefined;
@@ -1272,7 +1280,7 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 		return { config, created: false, resolvedWorkers: resolved };
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
-		console.warn(`[mind-worker] Failed to parse ${path}: ${msg}. Falling back to DEFAULT_CONFIG.`);
+		logDiag("warn", `[mind-worker] Failed to parse ${path}: ${msg}. Falling back to DEFAULT_CONFIG.`);
 		const resolved = resolveWorkerModels(DEFAULT_CONFIG);
 		return { config: DEFAULT_CONFIG, created: false, resolvedWorkers: resolved };
 	}
@@ -1720,7 +1728,7 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 						const manifestGen = (manifest?.generation as number) ?? 0;
 						if (!msg.generation || !manifestGen || msg.generation !== manifestGen) {
 							const errMsg = `Generation mismatch: worker=${msg.generation || "none"}, mind=${manifestGen}. Reconnecting.`;
-							console.error(`[mind-worker] HANDSHAKE REJECT: ${errMsg}`);
+							logDiag("error", `[mind-worker] HANDSHAKE REJECT: ${errMsg}`);
 							sendJson(socket, { type: "error", code: "GENERATION_MISMATCH", message: errMsg });
 							if (LAUNCHER_ROLE_FLAG === "mind") {
 								writeControlFileStatus(cwd, "error", errMsg);
@@ -1749,7 +1757,7 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 						// Mark burst worker as connected
 						if (isBurst) {
 							onBurstWorkerConnected(assignedWorkerId);
-							console.error(`[burst-flash] ${assignedWorkerId} connected to socket`);
+							logDiag("error", `[burst-flash] ${assignedWorkerId} connected to socket`);
 							// Restart idle check timer if it was paused during suspend
 							if (!burstIdleCheckTimer && burstWorkers.size > 0) {
 								burstIdleCheckTimer = setInterval(() => checkBurstIdleTtl(cwd), 5000);
@@ -1759,7 +1767,7 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 						if (pendingQueue.length > 0) {
 							dispatchNextQueued(assignedWorkerId, workerPool.get(assignedWorkerId)!, ctx);
 						}
-						console.error(`[mind-worker] Handshake OK, worker=${assignedWorkerId}, tier=${workerTier}, gen=${msg.generation}`);
+						logDiag("error", `[mind-worker] Handshake OK, worker=${assignedWorkerId}, tier=${workerTier}, gen=${msg.generation}`);
 						ctx.ui.notify(`Worker ${assignedWorkerId} [${workerTier}] connected (${workerPool.size}/${maxWorkers})`, "success");
 						ctx.ui.setStatus("mind-worker", `🔵 mind (${workerPool.size}/${maxWorkers})`);
 						if (LAUNCHER_ROLE_FLAG === "mind") {
@@ -2222,7 +2230,7 @@ async function spawnWorkerInKitty(cwd: string): Promise<void> {
 		}
 	}
 	if (errors.length > 0) {
-		console.error(`[spawnWorkerInKitty] ${errors.length}/${resolvedWorkers.length} workers failed: ${errors.join("; ")}`);
+		logDiag("error", `[spawnWorkerInKitty] ${errors.length}/${resolvedWorkers.length} workers failed: ${errors.join("; ")}`);
 	}
 }
 
@@ -2274,7 +2282,7 @@ async function connectWorker(
 
 				// Send generation handshake with workerId and tier
 				const workerTier = LAUNCHER_WORKER_TIER || "flash";
-				console.error(`[worker] Connected, sending handshake gen=${generation} workerId=${LAUNCHER_WORKER_ID} tier=${workerTier}`);
+				logDiag("error", `[worker] Connected, sending handshake gen=${generation} workerId=${LAUNCHER_WORKER_ID} tier=${workerTier}`);
 				sendJson(socket, {
 					type: "handshake",
 					role: "worker",
