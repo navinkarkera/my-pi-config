@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CustomEditor, getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { parseSafeGitArgs } from "../lib/mind-worker/git-command.mjs";
+import { parseGitArgs } from "../lib/mind-worker/git-command.mjs";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -127,7 +127,11 @@ const DEFAULT_CONFIG: MindWorkerConfig = {
 };
 
 const MIND_ALLOWED_TOOLS = ["delegate", "delegate_async", "read", "git", "ripgrep", "codemode"];
+// code_explore is codemode-exposed; allow it only as a nested codemode call, never as a direct tool.
+const MIND_ALLOWED_CODEMODE_TOOLS = ["code_explore"];
 const WORKER_THINKING_LEVEL = "max";
+/** Hard stop for Git so an interactive or credential-prompting command cannot wedge the session. */
+const GIT_TIMEOUT_MS = 120_000;
 
 /** Parsed from env var PI_MIND_WORKER_ROLE (launcher path) or --mind-worker-role CLI flag (legacy). null = legacy path. */
 const LAUNCHER_ROLE_FLAG: Role | null = parseEnvRole() ?? parseRoleFlag(process.argv);
@@ -3661,36 +3665,45 @@ async function executeFanout(
 	pi.registerTool({
 		name: "git",
 		label: "Git",
-		description: "Run safe git read-only commands for review",
+		description: "Run any Git subcommand, including mutating and remote operations. Noninteractive: no editor, pager, or prompts. The subcommand must come first; global options before the subcommand (e.g. -C, -c, --version) are unsupported.",
 		parameters: Type.Object({
-			command: Type.String({ description: "Git subcommand, e.g. 'status -sb' or 'diff -- src/file.ts'" }),
+			command: Type.String({ description: "Git subcommand and arguments, e.g. status -sb or commit -m 'message with spaces'" }),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (currentRole !== "mind" && !(currentRole === "worker" && LAUNCHER_WORKER_TIER === "strong")) {
 				return { content: [{ type: "text", text: "git tool only in mind mode or strong-worker mode" }], isError: true };
 			}
-			const command = params.command?.trim() || "";
-			const gitArgs = parseSafeGitArgs(command);
+			const command = params.command ?? "";
+			const gitArgs = parseGitArgs(command);
 			if (!gitArgs) {
 				return {
-					content: [{ type: "text", text: "Blocked. Use a read-only Git command; branch, remote, and tag accept list-only forms." }],
+					content: [{ type: "text", text: "Blocked. Put a Git subcommand first; any subcommand is allowed, including mutating and remote ones. Caller-supplied global options (e.g. -C, -c, --version) are not supported." }],
 					isError: true,
 				};
 			}
 			try {
 				const [subcommand, ...args] = gitArgs;
-				const readOnlyOptions = ["diff", "log", "show"].includes(subcommand)
-					? ["--no-ext-diff", "--no-textconv"]
-					: [];
 				const { stdout, stderr } = await execFileAsync(
 					"git",
-					["--no-pager", "-c", "core.fsmonitor=false", "-c", "diff.external=", subcommand, ...readOnlyOptions, ...args],
-					{ cwd: ctx.cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" } },
+					["--no-pager", "-c", "core.fsmonitor=false", "-c", "diff.external=", subcommand, ...args],
+					{
+						cwd: ctx.cwd,
+						signal,
+						timeout: GIT_TIMEOUT_MS,
+						env: {
+							...process.env,
+							GIT_OPTIONAL_LOCKS: "0",
+							GIT_TERMINAL_PROMPT: "0",
+							GIT_EDITOR: ":",
+							GIT_SEQUENCE_EDITOR: ":",
+						},
+					},
 				);
 				return { content: [{ type: "text", text: `${stdout}${stderr ? `\n${stderr}` : ""}`.trim() || "(no output)" }] };
 			} catch (err: any) {
 				const out = `${err?.stdout || ""}${err?.stderr || ""}`.trim() || err?.message || "git failed";
-				return { content: [{ type: "text", text: out }], isError: true };
+				const killed = err?.killed ? `\n[git stopped: timed out after ${GIT_TIMEOUT_MS / 1000}s or was cancelled]` : "";
+				return { content: [{ type: "text", text: `${out}${killed}` }], isError: true };
 			}
 		},
 	});
@@ -3790,15 +3803,15 @@ async function executeFanout(
 				"Use tier='flash' for ALL scoped/simple tasks — anything that does not require multi-file architecture, deep debugging, or correctness-sensitive reasoning. Prefer delegate_async, but use blocking delegate when the immediate-result exception above applies.\n" +
 				"Do not hold back flash delegates because static flash workers are busy — queued flash-tier tasks auto-spawn burst workers up to configured max.\n" +
 				"Parallelize/queue independent flash work liberally; burst workers activate from queue pressure.\n" +
-				"Mind: planning, final review/verdict, lightweight read/git/ripgrep checks only.\n" +
+				"Mind: planning, final review/verdict, and direct read/git/ripgrep checks. Git accepts any subcommand and may change the worktree/history or contact remotes; it is noninteractive (no editor or prompts), and do not run mutating Git while a worker is editing the same worktree.\n" +
 				"Never use write/edit/bash/grep/find directly in mind mode.\n" +
-				"Codemode in mind exposes only the tools above: use tools.code_explore({action:'map'|'files'|'text'}) with a narrow scope for bounded, read-only structure/search; keep output small.\n" +
+				"Codemode in mind exposes the tools above plus code_explore: use tools.code_explore with action 'files'|'text'|'ast'|'symbol'|'references'|'impact'|'map' and optional query/scope/language/maxResults/maxTokens/maxFiles; 'ast' requires language. Keep scopes narrow and output small.\n" +
 				"Parallel-by-default: independent tasks (separate files, separate searches, separate assertions) fan out across all idle workers in the same turn. This is the expected default — not a special pattern.\n" +
 				"Sequential exception: dependent tasks and overlapping file edits stay sequential; never overlap edits to the same files, and wait for the prior result before continuing.\n" +
 				"Blocking delegate batches return together; async results arrive separately in follow-up messages. Merge all required results before dependent work or final conclusions.\n" +
 				"If no workerId or tier is given, either delegation tool auto-routes to an idle worker.\n" +
 				`If all workers of the requested tier are busy, delegated tasks queue (up to ${maxQueueSize} queued) and dispatch when a matching-tier worker becomes idle. If the queue is full, wait for results before retrying or split into fewer chunks.\n` +
-				"Use read/git/ripgrep only for one-off, lightweight checks.\n" +
+				"Use read/git/ripgrep for one-off checks.\n" +
 				"Avoid reading large files directly in mind; this pollutes context window.\n" +
 				"Prefer delegating file reading/search to worker whenever possible, then consume concise summaries.\n" +
 				"If investigation is extensive (many files, repeated searches, or large outputs), delegate to worker and request concise summary with evidence.\n" +
@@ -3815,6 +3828,7 @@ async function executeFanout(
 	pi.on("tool_call", async (event) => {
 		if (currentRole === "mind") {
 			if (MIND_ALLOWED_TOOLS.includes(event.toolName)) return;
+			if (event.parentToolCallId && MIND_ALLOWED_CODEMODE_TOOLS.includes(event.toolName)) return;
 			return {
 				block: true,
 				reason: `Mind mode blocks ${event.toolName}. Use delegate/delegate_async/read/git/ripgrep/codemode(code_explore).`,

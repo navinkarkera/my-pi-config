@@ -10,7 +10,7 @@
 
 | Concept | Definition |
 |---------|------------|
-| **Mind** | The planner instance. Uses a superior model. Read-only tools: `delegate`, `delegate_async`, `read`, `git`, `ripgrep`, and `codemode` (reaches `code_explore` only). |
+| **Mind** | The planner instance. Uses a superior model. Tools: `delegate`, `delegate_async`, `read`, `git` (any subcommand; can change worktree/history and run configured aliases, hooks, helpers), `ripgrep`, and `codemode` (nested calls to the tools above also pass; among codemode-exposed tools only nested `code_explore` is admitted). |
 | **Worker** | The executor instance. Uses a cheaper model. Has full Pi tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`). |
 | **User** | Human operator who types into the Mind TUI. All intent flows through Mind. |
 | **Unix Socket** | The sole wire between Mind and Worker. Deterministic path per working directory. |
@@ -39,13 +39,13 @@
 ### 3.1. Instance Layout
 
 ```
-┌─────────────────────┐     ┌─────────────────────┐
-│   Kitty Split 1     │     │   Kitty Split 2     │
-│   Mind Instance     │◄───►│   Worker Instance   │
-│   (superior model)  │unix │   (cheaper model)   │
-│   read-only         │sock │   full tools        │
-│   plans & reviews   │     │   executes tasks    │
-└─────────────────────┘     └─────────────────────┘
+┌──────────────────────┐     ┌─────────────────────┐
+│   Kitty Split 1      │     │   Kitty Split 2     │
+│   Mind Instance      │◄───►│   Worker Instance   │
+│   (superior model)   │unix │   (cheaper model)   │
+│   no edit/write/bash │sock │   full tools        │
+│   plans & reviews    │     │   executes tasks    │
+└──────────────────────┘     └─────────────────────┘
          ▲                            ▲
          │                            │
       User types                   User watches
@@ -81,7 +81,7 @@ Mind and Worker must not share a session file (Pi's `SessionManager` names from 
 
 ### 4.1. Mind Tool Set
 
-Active tool set (`MIND_ALLOWED_TOOLS` in `extensions/mind-worker.ts`): `delegate`, `delegate_async`, `read`, `git`, `ripgrep`, `codemode` (reaches `code_explore` and nothing else). Everything else is blocked mechanically by the `tool_call` guard. `delegate`/\`delegate_async\` remain the mutating path.
+Active tool set (`MIND_ALLOWED_TOOLS` in `extensions/mind-worker.ts`): `delegate`, `delegate_async`, `read`, `git`, `ripgrep`, `codemode`. Every other direct tool is blocked mechanically by the `tool_call` guard. Codemode can call any codemode-exposed tool: nested calls to the allowed tools above pass, and among codemode-exposed tools only `code_explore` is admitted (`MIND_ALLOWED_CODEMODE_TOOLS`, matched only when the call carries `parentToolCallId`); every other nested call is blocked. `git` accepts any subcommand and may change the worktree or history, or contact remotes; `delegate`/\`delegate_async\` remain the usual file-editing path.
 
 ```typescript
 pi.registerTool({
@@ -99,7 +99,7 @@ pi.registerTool({
 })
 ```
 
-**No** `write`, `edit`, or `bash` tools for Mind, and `read`/`git`/`ripgrep`/`code_explore` stay read-only. Enforced mechanically.
+**No** `write`, `edit`, or `bash` tools for Mind. `git` runs any subcommand: it can alter the worktree or history and can execute configured aliases, hooks, and helpers, so the old shell/read-only boundary is weaker than the tool list suggests. `read`, `ripgrep`, and `code_explore` stay read-only.
 
 ### 4.2. Worker Tool Set
 
@@ -302,9 +302,9 @@ If config missing on first `/be-mind`, extension creates it with defaults and no
 
 ## 10. Safety & Isolation Rules
 
-1. **Mind is read-only during worker execution.** It has no file tools; the only way to touch disk is via `delegate`.
+1. **Mind has no direct edit tools during worker execution.** It can read, search, and run arbitrary Git subcommands, which may alter the worktree or history; routine file edits go through `delegate`.
 2. **Worker is input-locked.** Keyboard input in worker TUI is ignored. All tasks come from socket. On the launcher path, the worker pane is **monitor-only** with explicit kitty title `worker-{hash}`, hard input block, and visually distinct display.
-3. **Worker owns the working directory during a task.** No file locks; coordination is by design (Mind doesn't run competing edits).
+3. **Worker owns the working directory during a task.** There is no mechanical lock; coordination is by convention — Mind should not run worktree-mutating Git while a worker is editing the same worktree.
 4. **No daemon.** Worker is a normal Pi process. Clean termination on `/stop-worker` (legacy) or via launcher kill (reset).
 5. **One pair per cwd.** Prevents socket collisions and race conditions.
 6. **Ctrl+C is cooperative abort.** Never orphans a running subprocess.
