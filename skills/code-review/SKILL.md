@@ -23,7 +23,7 @@ If target is ambiguous and multiple plausible scopes exist, ask one short clarif
    - `git status --short`
    - relevant `git diff` / `git diff --staged` / `git diff <base>...HEAD`
 2. Read changed files and nearby context when needed. Do not rely on diff alone for behavior claims.
-3. Identify project conventions from nearby code, tests, package files, linters, and docs.
+3. Identify project conventions. Search the repository for every file that documents how code should be written; when `CODING_STANDARDS.md` or `CONTRIBUTING.md` exists, it must be on the list. Also read nearby code, tests, package files, linters, and docs as evidence.
 4. Check for:
    - correctness bugs and edge cases
    - API/contract breaks
