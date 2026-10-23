@@ -2,8 +2,8 @@
   "opencode-go": {
     "models": [
       {
-        "id": "cat-jam-free",
-        "name": "Cat Jam Free",
+        "id": "beam-free",
+        "name": "Beam Free",
         "api": "openai-completions",
         "provider": "opencode-go",
         "baseUrl": "https://opencode.ai/inference/go/v1",
@@ -665,43 +665,6 @@
         "type": "chat"
       },
       {
-        "id": "longcat-2.5-preview-free",
-        "name": "LongCat 2.5 Preview Free",
-        "api": "openai-completions",
-        "provider": "opencode-go",
-        "baseUrl": "https://opencode.ai/inference/go/v1",
-        "reasoning": true,
-        "input": [
-          "text",
-          "image"
-        ],
-        "cost": {
-          "input": 0,
-          "output": 0,
-          "cacheRead": 0,
-          "cacheWrite": 0
-        },
-        "compat": {
-          "supportsStore": false,
-          "supportsDeveloperRole": false,
-          "supportsStrictMode": true,
-          "maxTokensField": "max_tokens"
-        },
-        "contextWindow": 1000000,
-        "maxTokens": 131072,
-        "inputLimits": {
-          "images": {
-            "resize": {
-              "maxWidth": 2000,
-              "maxHeight": 2000,
-              "maxBytes": 4718592,
-              "jpegQuality": 80
-            }
-          }
-        },
-        "type": "chat"
-      },
-      {
         "id": "mimo-v2.5",
         "name": "MiMo V2.5",
         "api": "openai-completions",
@@ -866,6 +829,52 @@
         },
         "contextWindow": 1000000,
         "maxTokens": 131072,
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
+        "type": "chat"
+      },
+      {
+        "id": "minimax-m3.1-flash",
+        "name": "MiniMax M3.1 Flash",
+        "api": "openai-completions",
+        "provider": "opencode-go",
+        "baseUrl": "https://opencode.ai/inference/go/v1",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0.15,
+          "output": 0.6,
+          "cacheRead": 0.015,
+          "cacheWrite": 0
+        },
+        "compat": {
+          "supportsStore": false,
+          "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
+          "maxTokensField": "max_tokens"
+        },
+        "contextWindow": 1000000,
+        "maxTokens": 512000,
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "xhigh": "xhigh",
+          "max": "max"
+        },
         "inputLimits": {
           "images": {
             "resize": {
@@ -1070,52 +1079,6 @@
         "type": "chat"
       },
       {
-        "id": "space-bunny",
-        "name": "Space Bunny",
-        "api": "openai-completions",
-        "provider": "opencode-go",
-        "baseUrl": "https://opencode.ai/inference/go/v1",
-        "reasoning": true,
-        "input": [
-          "text",
-          "image"
-        ],
-        "cost": {
-          "input": 0.15,
-          "output": 0.6,
-          "cacheRead": 0.03,
-          "cacheWrite": 0
-        },
-        "compat": {
-          "supportsStore": false,
-          "supportsDeveloperRole": false,
-          "supportsStrictMode": true,
-          "maxTokensField": "max_tokens"
-        },
-        "contextWindow": 1048576,
-        "maxTokens": 524288,
-        "thinkingLevelMap": {
-          "off": null,
-          "minimal": null,
-          "low": "low",
-          "medium": "medium",
-          "high": "high",
-          "xhigh": "xhigh",
-          "max": "max"
-        },
-        "inputLimits": {
-          "images": {
-            "resize": {
-              "maxWidth": 2000,
-              "maxHeight": 2000,
-              "maxBytes": 4718592,
-              "jpegQuality": 80
-            }
-          }
-        },
-        "type": "chat"
-      },
-      {
         "id": "step-5-preview",
         "name": "Step 5 Preview",
         "api": "openai-completions",
@@ -1162,9 +1125,9 @@
         "type": "chat"
       }
     ],
-    "lastModified": 1792139818000,
-    "etag": "W/\"5504011e8b5a0715381dc92a4e6f0fb2\"",
-    "checkedAt": 1792329927481
+    "lastModified": 1792751385000,
+    "etag": "W/\"739d5ac829d590425bd9d13b53b7d899\"",
+    "checkedAt": 1792767427064
   },
   "openai-codex": {
     "models": [
@@ -3685,52 +3648,6 @@
         "type": "chat"
       },
       {
-        "id": "gpt-5.2-chat-latest",
-        "name": "GPT-5.2 Chat",
-        "api": "openai-responses",
-        "provider": "openai",
-        "baseUrl": "https://api.openai.com/v1",
-        "reasoning": true,
-        "input": [
-          "text",
-          "image"
-        ],
-        "cost": {
-          "input": 1.75,
-          "output": 14,
-          "cacheRead": 0.175,
-          "cacheWrite": 0
-        },
-        "contextWindow": 128000,
-        "maxTokens": 16384,
-        "thinkingLevelMap": {
-          "off": null,
-          "minimal": null,
-          "low": null,
-          "medium": "medium",
-          "high": null,
-          "xhigh": "xhigh",
-          "max": null
-        },
-        "compat": {
-          "supportsStrictMode": true,
-          "supportsOpenAIGrammarTools": true
-        },
-        "inputLimits": {
-          "maxRequestBytes": 536870912,
-          "images": {
-            "maxPerRequest": 1500,
-            "resize": {
-              "maxWidth": 2000,
-              "maxHeight": 2000,
-              "maxBytes": 4718592,
-              "jpegQuality": 80
-            }
-          }
-        },
-        "type": "chat"
-      },
-      {
         "id": "gpt-5.2-pro",
         "name": "GPT-5.2 Pro",
         "api": "openai-responses",
@@ -3757,47 +3674,6 @@
           "high": "high",
           "xhigh": "xhigh",
           "max": null
-        },
-        "compat": {
-          "supportsStrictMode": true,
-          "supportsOpenAIGrammarTools": true
-        },
-        "inputLimits": {
-          "maxRequestBytes": 536870912,
-          "images": {
-            "maxPerRequest": 1500,
-            "resize": {
-              "maxWidth": 2000,
-              "maxHeight": 2000,
-              "maxBytes": 4718592,
-              "jpegQuality": 80
-            }
-          }
-        },
-        "type": "chat"
-      },
-      {
-        "id": "gpt-5.3-chat-latest",
-        "name": "GPT-5.3 Chat (latest)",
-        "api": "openai-responses",
-        "provider": "openai",
-        "baseUrl": "https://api.openai.com/v1",
-        "reasoning": false,
-        "input": [
-          "text",
-          "image"
-        ],
-        "cost": {
-          "input": 1.75,
-          "output": 14,
-          "cacheRead": 0.175,
-          "cacheWrite": 0
-        },
-        "contextWindow": 128000,
-        "maxTokens": 16384,
-        "thinkingLevelMap": {
-          "off": null,
-          "xhigh": "xhigh"
         },
         "compat": {
           "supportsStrictMode": true,
@@ -5082,8 +4958,8 @@
         "contextWindow": 922000
       }
     ],
-    "lastModified": 1791971778000,
-    "etag": "W/\"66ade7f4bebf0ce0a7650e47031e58dd\"",
-    "checkedAt": 1792329929944
+    "lastModified": 1792500101000,
+    "etag": "W/\"29918974afd6f0245e01383446ccae49\"",
+    "checkedAt": 1792767427491
   }
 }
