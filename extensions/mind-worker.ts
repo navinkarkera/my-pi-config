@@ -24,6 +24,10 @@ interface WorkerConnection {
 	workerId: string;
 	connectedAt: number;
 	tier: string;
+	/** Manifest generation this connection handshook with - matched again by the replacement handshake. */
+	generation: number;
+	/** Reserved by an in-flight reset: not idle, not a reset target, not dispatchable until replaced. */
+	resetting: boolean;
 }
 
 interface WorkerModelEntry {
@@ -67,7 +71,7 @@ interface BurstFlashConfig {
 }
 
 interface SocketMsg {
-	type: "task" | "result" | "error" | "status" | "abort" | "ping" | "pong" | "handshake" | "subdelegate-request" | "subdelegate-response" | "shutdown";
+	type: "task" | "result" | "error" | "status" | "abort" | "ping" | "pong" | "handshake" | "subdelegate-request" | "subdelegate-response" | "shutdown" | "reset";
 	id?: string;
 	task?: string;
 	step?: number;
@@ -78,6 +82,7 @@ interface SocketMsg {
 	generation?: number;
 	workerId?: string;
 	tier?: string;
+	resetId?: string;
 	explanation?: string;
 	diff?: string;
 	filesChanged?: string[];
@@ -201,6 +206,14 @@ const taskWorkerMap = new Map<string, string>();
 let workerBusy = false;
 let workerTaskId: string | null = null;
 
+/**
+ * Mind-issued reset id. Set by the reset control, cleared only after the replacement handshake is
+ * written (or on cancellation/initiation failure) and deliberately not by session_shutdown (9).
+ */
+let activeResetId: string | null = null;
+/** True between dispatching the reset command and writing the replacement handshake. */
+let resetCommandInFlight = false;
+
 /** Launcher-path worker keepalive — prevents Node event-loop exit in headless/noninteractive mode. */
 let workerKeepaliveTimer: ReturnType<typeof setInterval> | null = null;
 const WORKER_KEEPALIVE_MS = 60_000;
@@ -284,6 +297,25 @@ interface QueuedTask {
 }
 const pendingQueue: QueuedTask[] = [];
 let maxQueueSize = 6; // 2x default maxWorkers; updated on config load
+
+// ── Worker session reset (Mind side) ───────────────────────────────────────-------------------------------------
+
+type ResetState = "active" | "abandoned";
+
+/** One in-flight reset per worker. While it exists it is the sole owner of its retained task. */
+interface ResetReservation {
+	resetId: string;
+	workerId: string;
+	generation: number;
+	tier: string;
+	oldSocket: Socket;
+	state: ResetState;
+	task: QueuedTask | null;
+	timer: ReturnType<typeof setTimeout> | null;
+	disposeAbort: (() => void) | null;
+	ctx: ExtensionContext;
+}
+const pendingResets = new Map<string, ResetReservation>();
 
 let lastNotificationFingerprint = "";
 let lastNotificationTime = 0;
@@ -418,7 +450,7 @@ function countBurstWorkers(): number {
 function countIdleFlashWorkers(): number {
 	let count = 0;
 	for (const [wid, conn] of workerPool) {
-		if (conn.tier === "flash" && !conn.busy && !conn.socket.destroyed) {
+		if (conn.tier === "flash" && !conn.busy && !conn.resetting && !conn.socket.destroyed) {
 			// Skip stale burst workers whose state has been cleaned up
 			if (isBurstWorker(wid) && !burstWorkers.has(wid)) continue;
 			count++;
@@ -430,7 +462,7 @@ function countIdleFlashWorkers(): number {
 function getOldestFlashQueueWait(cwd: string): number {
 	// Returns ms since oldest flash-eligible queued task was enqueued, or 0 if none
 	for (const entry of pendingQueue) {
-		if (entry.cwd === cwd && (!entry.tier || entry.tier === "flash" || entry.tier === "default")) {
+		if (!entry.reset && entry.cwd === cwd && (!entry.tier || entry.tier === "flash" || entry.tier === "default")) {
 			return Date.now() - (entry as any).queuedAt || 0;
 		}
 	}
@@ -438,7 +470,7 @@ function getOldestFlashQueueWait(cwd: string): number {
 }
 
 function countFlashEligibleQueued(cwd: string): number {
-	return pendingQueue.filter(e => e.cwd === cwd && (!e.tier || e.tier === "flash" || e.tier === "default")).length;
+	return pendingQueue.filter(e => !e.reset && e.cwd === cwd && (!e.tier || e.tier === "flash" || e.tier === "default")).length;
 }
 
 function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
@@ -1416,6 +1448,8 @@ async function sendMindIdleNotification(config: MindWorkerConfig, ctx: Extension
 }
 
 function failPendingTasks(message: string, code = "DISCONNECT"): void {
+	// Every resetting worker holds a retained task: settle it before the maps are cleared (I9).
+	failAllResets(code, message);
 	// Fail queued tasks
 	for (const entry of pendingQueue) {
 		entry.resolve({
@@ -1460,13 +1494,25 @@ function failPendingTasksForWorker(workerId: string, message: string, code = "DI
 	}
 }
 
-/** Find first idle (non-busy, connected) worker from the pool. Optionally filter by tier. */
+/** Find first idle (non-busy, non-resetting, connected) worker from the pool. Optionally filter by tier. */
 function findIdleWorker(tier?: string): { workerId: string; connection: WorkerConnection } | null {
 	for (const [wid, conn] of workerPool) {
-		if (!conn.busy && !conn.socket.destroyed) {
+		if (!conn.busy && !conn.resetting && !conn.socket.destroyed) {
 			if (tier && conn.tier !== tier) continue;
 			// Skip stale burst workers whose state has been cleaned up
 			if (isBurstWorker(wid) && !burstWorkers.has(wid)) continue;
+			return { workerId: wid, connection: conn };
+		}
+	}
+	return null;
+}
+
+/** Find first idle worker that is not a burst worker - the only valid target for a reset. */
+function findIdleStaticWorker(tier?: string): { workerId: string; connection: WorkerConnection } | null {
+	for (const [wid, conn] of workerPool) {
+		if (isBurstWorker(wid)) continue;
+		if (!conn.busy && !conn.resetting && !conn.socket.destroyed) {
+			if (tier && conn.tier !== tier) continue;
 			return { workerId: wid, connection: conn };
 		}
 	}
@@ -1477,7 +1523,7 @@ function findIdleWorker(tier?: string): { workerId: string; connection: WorkerCo
 function findAllIdleWorkers(tier?: string): Array<{ workerId: string; connection: WorkerConnection }> {
 	const idle: Array<{ workerId: string; connection: WorkerConnection }> = [];
 	for (const [wid, conn] of workerPool) {
-		if (!conn.busy && !conn.socket.destroyed) {
+		if (!conn.busy && !conn.resetting && !conn.socket.destroyed) {
 			if (tier && conn.tier !== tier) continue;
 			// Skip stale burst workers whose state has been cleaned up
 			if (isBurstWorker(wid) && !burstWorkers.has(wid)) continue;
@@ -1487,35 +1533,59 @@ function findAllIdleWorkers(tier?: string): Array<{ workerId: string; connection
 	return idle;
 }
 
-/** Count busy workers in the pool. */
+/** Count busy or reserving workers in the pool. */
 function countBusyWorkers(): number {
 	let busy = 0;
 	for (const [, conn] of workerPool) {
-		if (conn.busy && !conn.socket.destroyed) busy++;
+		if ((conn.busy || conn.resetting) && !conn.socket.destroyed) busy++;
 	}
 	return busy;
 }
 
 /** Pop next queued task (matching worker tier) and dispatch to given idle worker. Returns true if dispatched. */
 function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx: ExtensionContext): boolean {
-	if (connection.busy) return false;
+	if (connection.busy || connection.resetting) return false;
 	if (pendingQueue.length === 0) return false;
 	if (connection.socket.destroyed) return false;
 	// Skip retired/stale burst workers whose state has been cleaned up
 	if (isBurstWorker(workerId) && !burstWorkers.has(workerId)) return false;
 
-	// Scan queue for first entry matching this worker's tier (or any if entry has no tier preference)
+	const burst = isBurstWorker(workerId);
+	// Scan queue for first entry matching this worker's tier (or any if entry has no tier preference).
+	// A reset is never consumed by a burst worker: the scan skips it and keeps looking.
 	let matchIdx = -1;
 	for (let i = 0; i < pendingQueue.length; i++) {
 		const e = pendingQueue[i];
+		if (e.reset && burst) continue;
 		if (!e.tier || e.tier === connection.tier) {
 			matchIdx = i;
 			break;
 		}
 	}
 	if (matchIdx === -1) return false;
-	const entry = pendingQueue.splice(matchIdx, 1)[0];
+	const entry = pendingQueue[matchIdx];
 
+	// Removal and reservation happen in one synchronous step, so a reset request can never route twice (I1).
+	if (entry.reset) {
+		if (isBurstWorker(workerId)) return false;
+		pendingQueue.splice(matchIdx, 1);
+		return beginReset(workerId, connection, entry, ctx);
+	}
+	pendingQueue.splice(matchIdx, 1);
+	return dispatchEntryToWorker(workerId, connection, entry, ctx);
+}
+
+/**
+ * The single dispatch path for queued, blocking-direct, async-direct and post-reset sends.
+ * Owns busy/taskId, the maps, plan and control writes, the task timeout, the abort listener and
+ * the task frame, so the timeout always starts at dispatch and never at reset start (I10).
+ */
+function dispatchEntryToWorker(
+	workerId: string,
+	connection: WorkerConnection,
+	entry: QueuedTask,
+	ctx: ExtensionContext,
+): boolean {
 	const { config } = loadConfig();
 	const id = entry.id;
 
@@ -1541,22 +1611,43 @@ function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx:
 
 	writeControlFileBusy(entry.cwd);
 
-	const timeoutId = setTimeout(() => {
+	let timeoutId: ReturnType<typeof setTimeout> | null = null;
+	let settled = false;
+	let disposeAbort: (() => void) | null = null;
+	/** Idempotent settlement: releases the timeout and the abort listener, clears the task maps. */
+	const settle = (): boolean => {
+		if (settled) return false;
+		settled = true;
+		if (timeoutId) {
+			clearTimeout(timeoutId);
+			timeoutId = null;
+		}
+		if (disposeAbort) {
+			disposeAbort();
+			disposeAbort = null;
+		}
 		pendingResolvers.delete(id);
 		pendingUpdates.delete(id);
 		taskWorkerMap.delete(id);
-		if (workerPool.has(workerId)) {
-			const conn = workerPool.get(workerId)!;
-			conn.busy = false;
-			conn.taskId = null;
-		}
-		if (!connection.socket.destroyed) {
-			sendJson(connection.socket, { type: "abort", id });
-		}
-		// Dispatch next queued task now that worker is idle
-		if (workerPool.has(workerId)) {
-			const conn = workerPool.get(workerId)!;
-			dispatchNextQueued(workerId, conn, ctx);
+		return true;
+	};
+	/** Release the worker only while this dispatch still owns it; never touch a replacement. */
+	const releaseWorker = (): WorkerConnection | null => {
+		const conn = workerPool.get(workerId);
+		if (!conn || conn.socket !== connection.socket || conn.taskId !== id) return null;
+		conn.busy = false;
+		conn.taskId = null;
+		return conn;
+	};
+
+	timeoutId = setTimeout(() => {
+		if (!settle()) return;
+		const released = releaseWorker();
+		if (released) {
+			if (!released.socket.destroyed) {
+				sendJson(released.socket, { type: "abort", id });
+			}
+			dispatchNextQueued(workerId, released, ctx);
 		}
 		writeControlFileIdle(entry.cwd);
 		logDelegateResult(id, "timeout", `Worker "${workerId}" timeout after ${config.timeout}s`);
@@ -1569,10 +1660,7 @@ function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx:
 	}, Math.max(1, config.timeout) * 1000);
 
 	pendingResolvers.set(id, (msg) => {
-		clearTimeout(timeoutId);
-		pendingResolvers.delete(id);
-		pendingUpdates.delete(id);
-		taskWorkerMap.delete(id);
+		settle();
 		writeControlFileIdle(entry.cwd);
 		const status = msg.type === "result" ? "completed" : "error";
 		const summary = msg.explanation || msg.message || "(no result)";
@@ -1609,47 +1697,201 @@ function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx:
 		step: entry.step,
 		plan: entry.plan,
 		context: entry.context,
-		reset: entry.reset,
 	});
 
 	if (entry.signal) {
+		const signal = entry.signal;
 		const onAbort = () => {
-			clearTimeout(timeoutId);
-			pendingResolvers.delete(id);
-			pendingUpdates.delete(id);
-			taskWorkerMap.delete(id);
-			if (workerPool.has(workerId)) {
-				const conn = workerPool.get(workerId)!;
-				conn.busy = false;
-				conn.taskId = null;
-			}
-			if (!connection.socket.destroyed) {
-				sendJson(connection.socket, { type: "abort", id });
-			}
-			// Dispatch next queued task now that worker is idle
-			if (workerPool.has(workerId)) {
-				const conn = workerPool.get(workerId)!;
-				dispatchNextQueued(workerId, conn, ctx);
+			if (!settle()) return;
+			const released = releaseWorker();
+			if (released) {
+				if (!released.socket.destroyed) {
+					sendJson(released.socket, { type: "abort", id });
+				}
+				dispatchNextQueued(workerId, released, ctx);
 			}
 			writeControlFileIdle(entry.cwd);
 			logDelegateResult(id, "aborted", "Task aborted");
 			entry.resolve({ content: [{ type: "text", text: "Task aborted" }], isError: true });
 			asyncTaskWorkerMap.delete(id);
 		};
-		if (entry.signal.aborted) onAbort();
-		else entry.signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) onAbort();
+		else {
+			signal.addEventListener("abort", onAbort, { once: true });
+			disposeAbort = () => signal.removeEventListener("abort", onAbort);
+		}
 	}
 
 	return true;
 }
 
-/** Returns true if any work is pending (busy workers or queued tasks). */
+/** Returns true if any work is pending (busy/resetting workers, queued tasks, or in-flight resets). */
 function hasPendingWork(): boolean {
 	if (pendingQueue.length > 0) return true;
+	if (pendingResets.size > 0) return true;
 	for (const [, conn] of workerPool) {
-		if (conn.busy && !conn.socket.destroyed) return true;
+		if ((conn.busy || conn.resetting) && !conn.socket.destroyed) return true;
 	}
 	return false;
+}
+
+/** True while this worker's expected disconnect belongs to an in-flight reset (I6). */
+function isResetExpected(workerId: string | null): boolean {
+	return !!workerId && pendingResets.has(workerId);
+}
+
+/** True if Mind already tracks an in-flight task for this worker (RESET_BUSY reconciliation). */
+function hasTrackedTaskForWorker(workerId: string): boolean {
+	for (const wid of taskWorkerMap.values()) {
+		if (wid === workerId) return true;
+	}
+	return false;
+}
+
+/** Settle a retained task through the ordinary queue-entry resolver (I2/I8). */
+function settleRetainedTask(reservation: ResetReservation, code: string, message: string): void {
+	const entry = reservation.task;
+	reservation.task = null;
+	if (!entry) return;
+	entry.resolve({
+		content: [{ type: "text", text: message }],
+		isError: true,
+		details: { code },
+	});
+}
+
+/** Release the timer and abort listener exactly once (I2). */
+function releaseReservation(reservation: ResetReservation): void {
+	if (reservation.timer) {
+		clearTimeout(reservation.timer);
+		reservation.timer = null;
+	}
+	if (reservation.disposeAbort) {
+		reservation.disposeAbort();
+		reservation.disposeAbort = null;
+	}
+}
+
+/**
+ * Reserve an idle worker for a context reset and send the reset control.
+ * Synchronous by design: no await between choosing the worker and marking it reserved (I3).
+ */
+function beginReset(workerId: string, connection: WorkerConnection, entry: QueuedTask, ctx: ExtensionContext): boolean {
+	if (pendingResets.has(workerId)) {
+		// I11 - never overwrite an existing record, never leak the retained task.
+		entry.resolve({
+			content: [{ type: "text", text: `A reset is already in progress for worker "${workerId}".` }],
+			isError: true,
+			details: { code: "RESET_IN_PROGRESS" },
+		});
+		return false;
+	}
+	if (connection.busy || connection.resetting || connection.socket.destroyed) {
+		entry.resolve({
+			content: [{ type: "text", text: `Worker "${workerId}" is not available for reset. reset requires an idle worker.` }],
+			isError: true,
+			details: { code: "RESET_BUSY" },
+		});
+		return false;
+	}
+
+	const { config } = loadConfig();
+	const reservation: ResetReservation = {
+		resetId: `reset-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+		workerId,
+		generation: connection.generation,
+		tier: connection.tier,
+		oldSocket: connection.socket,
+		state: "active",
+		task: entry,
+		timer: null,
+		disposeAbort: null,
+		ctx,
+	};
+	connection.resetting = true;
+	pendingResets.set(workerId, reservation);
+	// A reset in flight keeps the pair busy, direct resets included.
+	writeControlFileBusy(entry.cwd);
+	// The reset window is a hard deadline for active and abandoned records alike.
+	reservation.timer = setTimeout(() => {
+		const { config: cfg } = loadConfig();
+		failReset(reservation, "RESET_TIMEOUT", `Worker "${workerId}" reset timed out after ${cfg.resetTimeout}s`, { resumeOldWorker: false });
+	}, Math.max(1, config.resetTimeout) * 1000);
+	if (entry.signal) {
+		const signal = entry.signal;
+		const onAbort = () => abandonReset(reservation, "ABORTED", "Task aborted during worker reset");
+		if (signal.aborted) onAbort();
+		else {
+			signal.addEventListener("abort", onAbort, { once: true });
+			reservation.disposeAbort = () => signal.removeEventListener("abort", onAbort);
+		}
+	}
+	logDelegateResult(entry.id, "reset", `Worker "${workerId}" reset started`);
+	if (entry.onUpdate) {
+		// Same shape as the worker status forwarding in the mind data handler.
+		entry.onUpdate({
+			content: [{ type: "text", text: `[Worker ${workerId}] reset: start` }],
+			details: {},
+		});
+	}
+	sendJson(connection.socket, { type: "reset", resetId: reservation.resetId });
+	return true;
+}
+
+/** Acceptance: the fresh connection is installed, so the reservation ends here (6.7 step 3). */
+function completeReset(reservation: ResetReservation): void {
+	if (pendingResets.get(reservation.workerId) !== reservation) return;
+	releaseReservation(reservation);
+	pendingResets.delete(reservation.workerId);
+}
+
+/**
+ * Terminal failure for a reservation. resumeOldWorker is true only where the old worker and its
+ * session stay usable; every other code destroys the socket it can still identify (I5).
+ */
+function failReset(
+	reservation: ResetReservation,
+	code: string,
+	message: string,
+	opts: { resumeOldWorker: boolean; keepSocket?: boolean },
+): void {
+	if (pendingResets.get(reservation.workerId) !== reservation) return;
+	releaseReservation(reservation);
+	pendingResets.delete(reservation.workerId);
+	if (reservation.state === "active") settleRetainedTask(reservation, code, message);
+	reservation.task = null;
+
+	const current = workerPool.get(reservation.workerId);
+	if (current && current.socket === reservation.oldSocket) {
+		current.resetting = false;
+		if (!opts.resumeOldWorker) {
+			// Teardown callers keep the socket so stop/suspend can still send shutdown.
+			if (!opts.keepSocket) {
+				try { current.socket.destroy(); } catch { /* ignore */ }
+				// Remove synchronously so a later ordinary reconnect is not refused DUPLICATE_ID.
+				workerPool.delete(reservation.workerId);
+			}
+		} else if (!current.busy) {
+			dispatchNextQueued(reservation.workerId, current, reservation.ctx);
+		}
+	}
+	writeControlFileIdle(reservation.ctx.cwd);
+}
+
+/** Caller aborted: settle now, keep the tombstone (and its suppression) until handshake or timeout. */
+function abandonReset(reservation: ResetReservation, code: string, message: string): void {
+	if (pendingResets.get(reservation.workerId) !== reservation) return;
+	if (reservation.state !== "active") return;
+	settleRetainedTask(reservation, code, message);
+	reservation.state = "abandoned";
+}
+
+/** Teardown funnel: every reservation settles, so no blocking delegate can hang (I9). */
+function failAllResets(code: string, message: string): void {
+	for (const reservation of [...pendingResets.values()]) {
+		// Teardown owns the sockets: failReset settles the task, stop/suspend still shut them down.
+		failReset(reservation, code, message, { resumeOldWorker: false, keepSocket: true });
+	}
 }
 
 function startMindServer(cwd: string, ctx: ExtensionContext): void {
@@ -1685,6 +1927,49 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 				if (!handshakeDone) {
 					if (msg.type === "handshake") {
 						const workerTier = (msg.tier || "flash") as string;
+
+						// Reset classification runs before every other guard (I7).
+						const resetReservation = msg.workerId ? pendingResets.get(msg.workerId) : undefined;
+						if (resetReservation) {
+							const resetMatches = msg.resetId === resetReservation.resetId
+								&& msg.generation === resetReservation.generation
+								&& msg.tier === resetReservation.tier;
+							if (!resetMatches) {
+								const errMsg = `Reset protocol violation: worker=${msg.workerId} resetId=${msg.resetId || "none"} gen=${msg.generation ?? "none"} tier=${msg.tier || "none"}`;
+								logDiag("error", `[mind-worker] RESET_PROTOCOL: ${errMsg}`);
+								sendJson(socket, { type: "error", code: "RESET_PROTOCOL", resetId: msg.resetId || resetReservation.resetId, message: errMsg });
+								socket.end();
+								failReset(resetReservation, "RESET_PROTOCOL", errMsg, { resumeOldWorker: false });
+								return;
+							}
+							// Expected replacement: skip burst eligibility, tier eligibility, capacity,
+							// generation validation and DUPLICATE_ID.
+							const replacementId = msg.workerId!;
+							handshakeDone = true;
+							assignedWorkerId = replacementId;
+							const replacement: WorkerConnection = {
+								socket, busy: false, taskId: null,
+								workerId: replacementId, connectedAt: Date.now(),
+								tier: resetReservation.tier, generation: resetReservation.generation,
+								resetting: false,
+							};
+							workerPool.set(replacementId, replacement);
+							const retained = resetReservation.state === "active" ? resetReservation.task : null;
+							completeReset(resetReservation);
+							logDiag("error", `[mind-worker] Reset accepted, worker=${replacementId}, tier=${replacement.tier}, resetId=${resetReservation.resetId}`);
+							ctx.ui.notify(`Worker ${replacementId} [${replacement.tier}] reset accepted`, "success");
+							ctx.ui.setStatus("mind-worker", `🔵 mind (${workerPool.size}/${maxWorkers})`);
+							if (LAUNCHER_ROLE_FLAG === "mind") {
+								writeControlFileWorkerConnected(cwd);
+							}
+							if (retained) {
+								logDelegateResult(retained.id, "reset", `Worker "${replacementId}" reset accepted`);
+								dispatchEntryToWorker(replacementId, replacement, retained, ctx);
+							}
+							// Generic dispatch runs last so it can never steal the fresh connection (6.7 step 6).
+							dispatchNextQueued(replacementId, replacement, ctx);
+							return;
+						}
 
 						// Tier-aware pool capacity guard (fallback to total maxWorkers if tier unknown)
 						const { config: cfg, resolvedWorkers } = loadConfig();
@@ -1756,7 +2041,7 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 						workerPool.set(assignedWorkerId, {
 							socket, busy: false, taskId: null,
 							workerId: assignedWorkerId, connectedAt: Date.now(),
-							tier: workerTier,
+							tier: workerTier, generation: msg.generation ?? 0, resetting: false,
 						});
 						// Mark burst worker as connected
 						if (isBurst) {
@@ -1798,7 +2083,7 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 					workerPool.set(assignedWorkerId, {
 						socket, busy: false, taskId: null,
 						workerId: assignedWorkerId, connectedAt: Date.now(),
-						tier: "flash",
+						tier: "flash", generation: 0, resetting: false,
 					});
 					// Dispatch any queued tasks to this new worker
 					if (pendingQueue.length > 0) {
@@ -2022,6 +2307,33 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 					}
 					return;
 				}
+				// Reset control replies
+				if (msg.type === "error" && msg.resetId && assignedWorkerId) {
+					const reservation = pendingResets.get(assignedWorkerId);
+					if (!reservation || reservation.resetId !== msg.resetId) {
+						logDiag("warn", `[mind-worker] Unmatched reset error ${msg.code} resetId=${msg.resetId}`);
+						return;
+					}
+					const resetMessage = msg.message || `Worker reset failed (${msg.code || "RESET_FAILED"})`;
+					if (msg.code === "RESET_BUSY" && hasTrackedTaskForWorker(reservation.workerId)) {
+						// Mind tracks work on this worker: keep it busy until that task settles or the
+						// socket closes, rather than pinning a desynchronized socket for ever.
+						releaseReservation(reservation);
+						pendingResets.delete(reservation.workerId);
+						settleRetainedTask(reservation, "RESET_BUSY", resetMessage);
+						const conn = workerPool.get(reservation.workerId);
+						if (conn && conn.socket === reservation.oldSocket) {
+							conn.resetting = false;
+							conn.busy = true;
+						}
+						writeControlFileIdle(cwd);
+						return;
+					}
+					const resumeOldWorker = msg.code === "RESET_CANCELLED" || msg.code === "RESET_FAILED";
+					failReset(reservation, msg.code || "RESET_FAILED", resetMessage, { resumeOldWorker });
+					return;
+				}
+
 				// ── Result / Error messages ─────────────────────────
 				if ((msg.type === "result" || msg.type === "error") && msg.id) {
 					const resolve = pendingResolvers.get(msg.id);
@@ -2078,6 +2390,10 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 		);
 
 		socket.on("close", () => {
+			// Stale socket: a replacement for this worker is already installed (I5).
+			if (assignedWorkerId && workerPool.get(assignedWorkerId)?.socket !== socket) return;
+			// Expected disconnect for a reset: quiet, but the pool entry is still released.
+			const expectedReset = isResetExpected(assignedWorkerId);
 			if (assignedWorkerId && workerPool.has(assignedWorkerId)) {
 				const tier = workerPool.get(assignedWorkerId)!.tier;
 				// Remove any queued subdelegates initiated by this worker (if strong)
@@ -2103,50 +2419,57 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 					}
 				}
 				workerPool.delete(assignedWorkerId);
-				ctx.ui.notify(`Worker ${assignedWorkerId} [${tier}] disconnected (${workerPool.size}/${maxWorkers})`, "warning");
-				ctx.ui.setStatus(
-					"mind-worker",
-					workerPool.size > 0 ? `🔵 mind (${workerPool.size}/${maxWorkers})` : "🔵 mind (no workers)",
-				);
-				failPendingTasksForWorker(assignedWorkerId, "Worker disconnected", "DISCONNECT");
-				// If no workers remain but tasks are queued, fail them
-				if (workerPool.size === 0 && pendingQueue.length > 0) {
-					for (const entry of pendingQueue) {
-						entry.resolve({
-							content: [{ type: "text", text: "All workers disconnected. Queued task failed." }],
-							isError: true,
-							details: { code: "NO_WORKERS" },
-						});
+				if (!expectedReset) {
+					ctx.ui.notify(`Worker ${assignedWorkerId} [${tier}] disconnected (${workerPool.size}/${maxWorkers})`, "warning");
+					ctx.ui.setStatus(
+						"mind-worker",
+						workerPool.size > 0 ? `🔵 mind (${workerPool.size}/${maxWorkers})` : `🔵 mind (no workers)`,
+					);
+					failPendingTasksForWorker(assignedWorkerId, "Worker disconnected", "DISCONNECT");
+					// If no workers remain but tasks are queued, fail them
+					if (workerPool.size === 0 && pendingQueue.length > 0) {
+						for (const entry of pendingQueue) {
+							entry.resolve({
+								content: [{ type: "text", text: "All workers disconnected. Queued task failed." }],
+								isError: true,
+								details: { code: "NO_WORKERS" },
+							});
+						}
+						pendingQueue.length = 0;
 					}
-					pendingQueue.length = 0;
 				}
 			}
-			if (LAUNCHER_ROLE_FLAG === "mind" && assignedWorkerId) {
+			if (LAUNCHER_ROLE_FLAG === "mind" && assignedWorkerId && !expectedReset) {
 				writeControlFileWorkerConnected(cwd);
 			}
 		});
 
 		socket.on("error", () => {
+			// Stale socket: a replacement for this worker is already installed (I5).
+			if (assignedWorkerId && workerPool.get(assignedWorkerId)?.socket !== socket) return;
+			const expectedReset = isResetExpected(assignedWorkerId);
 			if (assignedWorkerId && workerPool.has(assignedWorkerId)) {
 				workerPool.delete(assignedWorkerId);
-				failPendingTasksForWorker(assignedWorkerId, "Socket error", "SOCKET_ERROR");
-				ctx.ui.setStatus(
-					"mind-worker",
-					workerPool.size > 0 ? `🔵 mind (${workerPool.size}/${maxWorkers})` : "🔵 mind (no workers)",
-				);
-				// If no workers remain but tasks are queued, fail them
-				if (workerPool.size === 0 && pendingQueue.length > 0) {
-					for (const entry of pendingQueue) {
-						entry.resolve({
-							content: [{ type: "text", text: "All workers disconnected. Queued task failed." }],
-							isError: true,
-							details: { code: "NO_WORKERS" },
-						});
+				if (!expectedReset) {
+					failPendingTasksForWorker(assignedWorkerId, "Socket error", "SOCKET_ERROR");
+					ctx.ui.setStatus(
+						"mind-worker",
+						workerPool.size > 0 ? `🔵 mind (${workerPool.size}/${maxWorkers})` : `🔵 mind (no workers)`,
+					);
+					// If no workers remain but tasks are queued, fail them
+					if (workerPool.size === 0 && pendingQueue.length > 0) {
+						for (const entry of pendingQueue) {
+							entry.resolve({
+								content: [{ type: "text", text: "All workers disconnected. Queued task failed." }],
+								isError: true,
+								details: { code: "NO_WORKERS" },
+							});
+						}
+						pendingQueue.length = 0;
 					}
-					pendingQueue.length = 0;
 				}
 			}
-			if (LAUNCHER_ROLE_FLAG === "mind" && assignedWorkerId) {
+			if (LAUNCHER_ROLE_FLAG === "mind" && assignedWorkerId && !expectedReset) {
 				writeControlFileWorkerConnected(cwd);
 			}
 		});
@@ -2286,14 +2609,21 @@ async function connectWorker(
 
 				// Send generation handshake with workerId and tier
 				const workerTier = LAUNCHER_WORKER_TIER || "flash";
-				logDiag("error", `[worker] Connected, sending handshake gen=${generation} workerId=${LAUNCHER_WORKER_ID} tier=${workerTier}`);
-				sendJson(socket, {
+				logDiag("error", `[worker] Connected, sending handshake gen=${generation} workerId=${LAUNCHER_WORKER_ID} tier=${workerTier} resetId=${activeResetId || "none"}`);
+				const handshakeSent = sendJson(socket, {
 					type: "handshake",
 					role: "worker",
 					generation,
 					workerId: LAUNCHER_WORKER_ID || undefined,
 					tier: workerTier,
+					resetId: activeResetId ?? undefined,
 				});
+				// The id rode this handshake. Keep it when the write failed so the next attempt
+				// still carries it; a lost id surfaces as RESET_PROTOCOL, never silent success.
+				if (handshakeSent) {
+					activeResetId = null;
+					resetCommandInFlight = false;
+				}
 
 				resolve(true);
 			});
@@ -2492,6 +2822,30 @@ function createWorkerHandler(pi: ExtensionAPI) {
 			return;
 		}
 
+		// Worker-side: reset control from mind
+		if (msg.type === "reset" && msg.resetId) {
+			if (workerBusy) {
+				sendJson(socket, { type: "error", id: msg.resetId, resetId: msg.resetId, code: "RESET_BUSY", message: "Worker busy" });
+				return;
+			}
+			if (resetCommandInFlight) {
+				sendJson(socket, { type: "error", id: msg.resetId, resetId: msg.resetId, code: "RESET_IN_PROGRESS", message: "Reset already in progress" });
+				return;
+			}
+			activeResetId = msg.resetId;
+			resetCommandInFlight = true;
+			try {
+				// A registered extension command, so template expansion dispatches it instead of
+				// sending literal text to the model.
+				pi.sendUserMessage(`/mind-worker-internal-reset ${msg.resetId}`, { expandPromptTemplates: true });
+			} catch (err: any) {
+				activeResetId = null;
+				resetCommandInFlight = false;
+				sendJson(socket, { type: "error", id: msg.resetId, resetId: msg.resetId, code: "RESET_FAILED", message: err?.message || "Reset dispatch failed" });
+			}
+			return;
+		}
+
 		if (msg.type !== "task" || !msg.id || !msg.task) return;
 
 		if (workerBusy) {
@@ -2686,6 +3040,35 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 		description: "Activate worker role",
 		handler: async (_args, ctx) => {
 			await activateWorkerRole(ctx, pi);
+		},
+	});
+
+	// Internal: the reset primitive. A registered command is the only path to newSession, and the
+	// nonce keeps a manually typed invocation inert.
+	pi.registerCommand("mind-worker-internal-reset", {
+		description: "Internal: clear this worker's conversation context for its next Mind task",
+		handler: async (args, ctx) => {
+			const nonce = (args || "").trim();
+			if (!activeResetId || nonce !== activeResetId) return;
+			if (!ctx.isIdle()) {
+				// Report instead of leaving Mind to wait out its reset timeout.
+				activeResetId = null;
+				resetCommandInFlight = false;
+				if (workerSocket && !workerSocket.destroyed) {
+					sendJson(workerSocket, { type: "error", id: nonce, resetId: nonce, code: "RESET_BUSY", message: "Worker is not idle" });
+				}
+				return;
+			}
+			const result = await ctx.newSession();
+			if (result.cancelled) {
+				activeResetId = null;
+				resetCommandInFlight = false;
+				if (workerSocket && !workerSocket.destroyed) {
+					sendJson(workerSocket, { type: "error", id: nonce, resetId: nonce, code: "RESET_CANCELLED", message: "Reset cancelled" });
+				}
+			}
+			// Not cancelled: session_shutdown destroyed the old socket and session_start reconnects;
+			// the flags ride the replacement handshake. No withSession reconfiguration.
 		},
 	});
 
@@ -3061,7 +3444,7 @@ async function executeFanout(
 			step: Type.Optional(Type.Number({ description: "Step number" })),
 			plan: Type.Optional(Type.String({ description: "Full plan markdown" })),
 			context: Type.Optional(Type.String({ description: "Running summary" })),
-			reset: Type.Optional(Type.Boolean({ description: "Reserved" })),
+			reset: Type.Optional(Type.Boolean({ description: "Clear the worker's conversation context before dispatching this task. Requires an idle, non-burst worker; a reset never spawns one and never runs with strategy 'auto'/'fanout'." })),
 			workerId: Type.Optional(Type.String({ description: "Target specific worker by ID. Omit for auto-routing to first idle worker." })),
 			tier: Type.Optional(Type.String({ description: "Worker tier: 'flash' for simple/scoped tasks, 'strong' for complex/deep reasoning. Omit or 'auto' for any idle worker." })),
 			strategy: Type.Optional(Type.String({ description: "Routing strategy: 'single' (default, one task to one worker), 'auto' or 'fanout' (auto-decompose and fan out to all idle workers). Intent alone does NOT trigger fanout." })),
@@ -3081,6 +3464,12 @@ async function executeFanout(
 			}
 
 			const shouldFanout = strategy === "auto" || strategy === "fanout";
+			const resetRequested = params.reset === true;
+
+			// Reset is a single-worker primitive: the fanout guard runs first.
+			if (shouldFanout && resetRequested) {
+				return { content: [{ type: "text", text: "reset is not supported with strategy 'auto' or 'fanout'. reset targets one idle worker." }], isError: true, details: { code: "RESET_UNSUPPORTED" } };
+			}
 
 			if (shouldFanout && currentRole === "mind") {
 				if (!params.task?.trim()) {
@@ -3106,6 +3495,9 @@ async function executeFanout(
 
 			// ── Worker-side subdelegation (strong worker → mind → flash worker) ──
 			if (currentRole === "worker") {
+				if (resetRequested) {
+					return { content: [{ type: "text", text: "reset is not supported in a subdelegate request." }], isError: true, details: { code: "SUBDELEGATE_NO_RESET" } };
+				}
 				// Only strong-tier workers may subdelegate
 				if (LAUNCHER_WORKER_TIER !== "strong") {
 					return { content: [{ type: "text", text: "delegate blocked: only strong-tier workers may delegate. Flash workers cannot delegate." }], isError: true };
@@ -3164,6 +3556,11 @@ async function executeFanout(
 			if (currentRole !== "mind") {
 				return { content: [{ type: "text", text: "delegate only in mind mode. Run /be-mind first." }], isError: true };
 			}
+			// Legacy (non-launcher) workers never handshake with a stable identity, so a reset
+			// control could never be matched to its replacement.
+			if (resetRequested && LAUNCHER_ROLE_FLAG !== "mind") {
+				return { content: [{ type: "text", text: "reset requires the launcher worker path (stable worker identity)." }], isError: true, details: { code: "RESET_UNSUPPORTED" } };
+			}
 			if (!params.task?.trim()) {
 				return { content: [{ type: "text", text: "task is required" }], isError: true };
 			}
@@ -3191,50 +3588,60 @@ async function executeFanout(
 						isError: true,
 					};
 				}
-				if (conn.busy) {
-					const idleCount = [...workerPool.values()].filter(w => !w.busy && !w.socket.destroyed).length;
+				if (resetRequested && isBurstWorker(targetWorkerId)) {
 					return {
-						content: [{ type: "text", text: `Worker "${targetWorkerId}" is busy. ${idleCount} idle worker(s) available. Omit workerId for auto-routing.` }],
+						content: [{ type: "text", text: `Worker "${targetWorkerId}" is a burst worker. reset requires an idle static worker.` }],
+						isError: true,
+						details: { code: "RESET_UNSUPPORTED" },
+					};
+				}
+				if (conn.busy || conn.resetting) {
+					const idleCount = [...workerPool.values()].filter(w => !w.busy && !w.resetting && !w.socket.destroyed).length;
+					return {
+						content: [{ type: "text", text: `Worker "${targetWorkerId}" is busy. ${idleCount} idle worker(s) available. Omit workerId for auto-routing.${resetRequested ? " reset requires an idle worker." : ""}` }],
 						isError: true,
 					};
 				}
 				connection = conn;
 			} else {
-				// Auto-select first idle worker of requested tier (or any if no tier)
-				const idle = findIdleWorker(effectiveTier);
+				// Auto-select first idle worker of requested tier (or any if no tier).
+				// A reset never spawns a worker and never targets a burst worker.
+				const idle = resetRequested ? findIdleStaticWorker(effectiveTier) : findIdleWorker(effectiveTier);
+				const connected = [...workerPool.values()].filter(w => !w.socket.destroyed).length;
 				if (!idle) {
-					const connected = [...workerPool.values()].filter(w => !w.socket.destroyed).length;
-					const isFlashTier = !effectiveTier || effectiveTier === "flash" || effectiveTier === "default";
-					const { config: bCfg } = loadConfig();
-					const canBurst = isFlashTier && bCfg.burstFlash.enabled && bCfg.burstFlash.maxBurst > 0;
-					if (connected === 0) {
-						if (canBurst) {
-							// No workers connected but burst flash available — queue for burst spawn
-						} else {
-							return {
-								content: [{ type: "text", text: "No workers connected. Workers start automatically." }],
-								isError: true,
-							};
-						}
-					} else {
-						// If tier specified, check if any worker of that tier exists
-						if (effectiveTier) {
-							const tierCount = [...workerPool.values()].filter(w => w.tier === effectiveTier && !w.socket.destroyed).length;
-							const tierBusy = [...workerPool.values()].filter(w => w.tier === effectiveTier && w.busy && !w.socket.destroyed).length;
-							if (tierCount === 0) {
+					if (!resetRequested) {
+						const isFlashTier = !effectiveTier || effectiveTier === "flash" || effectiveTier === "default";
+						const { config: bCfg } = loadConfig();
+						const canBurst = isFlashTier && bCfg.burstFlash.enabled && bCfg.burstFlash.maxBurst > 0;
+						if (connected === 0) {
+							if (canBurst) {
+								// No workers connected but burst flash available - queue for burst spawn
+							} else {
 								return {
-									content: [{ type: "text", text: `No ${effectiveTier} workers connected. Available tiers: ${[...new Set([...workerPool.values()].filter(w => !w.socket.destroyed).map(w => w.tier))].join(", ") || "(none)"}` }],
+									content: [{ type: "text", text: "No workers connected. Workers start automatically." }],
 									isError: true,
 								};
 							}
-							// Tier workers exist but all busy — queue for that tier
-							if (tierCount > 0 && tierCount === tierBusy) {
-								// Fall through to queue below
-							} else {
-								return {
-									content: [{ type: "text", text: `All ${effectiveTier} worker(s) busy (${tierBusy}/${tierCount}). Use "auto" or omit tier to queue for any available worker.` }],
-									isError: true,
-								};
+						} else {
+							// If tier specified, check if any worker of that tier exists
+							if (effectiveTier) {
+								const tierCount = [...workerPool.values()].filter(w => w.tier === effectiveTier && !w.socket.destroyed).length;
+								const tierBusy = [...workerPool.values()].filter(w => w.tier === effectiveTier && (w.busy || w.resetting) && !w.socket.destroyed).length;
+								if (tierCount === 0) {
+									return {
+										content: [{ type: "text", text: `No ${effectiveTier} workers connected. Available tiers: ${[...new Set([...workerPool.values()].filter(w => !w.socket.destroyed).map(w => w.tier))].join(", ") || "(none)"}` }],
+										isError: true,
+									};
+								}
+								// Tier workers exist but all busy - queue for that tier
+								if (tierCount > 0 && tierCount === tierBusy) {
+									// Fall through to queue below
+								} else {
+									return {
+										content: [{ type: "text", text: `All ${effectiveTier} worker(s) busy (${tierBusy}/${tierCount}). Use "auto" or omit tier to queue for any available worker.` }],
+										isError: true,
+									};
+								}
 							}
 						}
 					}
@@ -3246,7 +3653,7 @@ async function executeFanout(
 							isError: true,
 						};
 					}
-					// ── Enqueue task ───────────────────────────────────
+					// ── Enqueue task ───────────────────────────────
 					const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 					// Plan file written at dispatch time, not here
 					writeControlFileBusy(ctx.cwd);
@@ -3257,7 +3664,7 @@ async function executeFanout(
 							step: params.step,
 							plan: params.plan,
 							context: params.context,
-							reset: params.reset,
+							reset: resetRequested || undefined,
 							tier: effectiveTier,
 							ctx,
 							resolve,
@@ -3266,8 +3673,8 @@ async function executeFanout(
 							cwd: ctx.cwd,
 							queuedAt: Date.now(),
 						});
-						// Trigger burst flash spawn if conditions met (immediate + delayed retry)
-						if (!effectiveTier || effectiveTier === "flash" || effectiveTier === "default") {
+						// A reset never spawns a worker: burst spawn is skipped for reset entries.
+						if (!resetRequested && (!effectiveTier || effectiveTier === "flash" || effectiveTier === "default")) {
 							trySpawnBurstFlashWithRetry(ctx.cwd, ctx);
 						}
 						// If signal fires while queued, remove from queue and reject
@@ -3289,128 +3696,26 @@ async function executeFanout(
 				connection = idle.connection;
 			}
 
-			// ── Send task ───────────────────────────────────────────
-			const { config } = loadConfig();
+			// ── Send task ──────────────────────────────────────────
 			const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-			if (onUpdate) pendingUpdates.set(id, onUpdate);
-
-			if (params.plan) {
-				const planPath = getPlanPath(ctx.cwd);
-				ensureDir(dirname(planPath));
-				writeFileSync(planPath, params.plan, "utf-8");
-			}
-
-			// Mark worker busy and record task-worker mapping
-			connection.busy = true;
-			connection.taskId = id;
-			taskWorkerMap.set(id, targetWorkerId);
-			trackTaskStart(id, targetWorkerId, connection.tier, params.task.slice(0, 100), ctx.cwd);
-			// Track burst worker task start (direct dispatch path)
-			if (isBurstWorker(targetWorkerId)) {
-				onBurstWorkerTaskStart(targetWorkerId);
-				logBurstEvent(ctx.cwd, targetWorkerId, "task-start", id);
-			}
-			writeControlFileBusy(ctx.cwd);
-
 			return new Promise((resolve) => {
-				const timeoutId = setTimeout(() => {
-					pendingResolvers.delete(id);
-					pendingUpdates.delete(id);
-					taskWorkerMap.delete(id);
-					// Mark worker idle on timeout
-					if (targetWorkerId && workerPool.has(targetWorkerId)) {
-						const conn = workerPool.get(targetWorkerId)!;
-						conn.busy = false;
-						conn.taskId = null;
-					}
-					// Abort the worker
-					if (connection && !connection.socket.destroyed) {
-						sendJson(connection.socket, { type: "abort", id });
-					}
-					// Dispatch next queued task now that worker is idle
-					if (targetWorkerId && workerPool.has(targetWorkerId)) {
-						const conn = workerPool.get(targetWorkerId)!;
-						dispatchNextQueued(targetWorkerId, conn, ctx);
-					}
-					writeControlFileIdle(ctx.cwd);
-					logDelegateResult(id, "timeout", `Worker "${targetWorkerId}" timeout after ${config.timeout}s`);
-					resolve({
-						content: [{ type: "text", text: `Worker "${targetWorkerId}" timeout after ${config.timeout}s` }],
-						isError: true,
-						details: { code: "TIMEOUT" },
-					});
-				}, Math.max(1, config.timeout) * 1000);
-
-				pendingResolvers.set(id, (msg) => {
-					clearTimeout(timeoutId);
-					pendingResolvers.delete(id);
-					pendingUpdates.delete(id);
-					taskWorkerMap.delete(id);
-					// Worker already marked idle in socket data handler
-					writeControlFileIdle(ctx.cwd);
-					const status = msg.type === "result" ? "completed" : "error";
-					const summary = msg.explanation || msg.message || "(no result)";
-					const details = {
-						filesChanged: msg.filesChanged,
-						diffLength: msg.diff?.length,
-						bashExitCodes: msg.bashResults?.map(r => r.exitCode),
-						bashCount: msg.bashResults?.length,
-					};
-					logDelegateResult(id, status, summary, details);
-					if (msg.type === "result") {
-						resolve({
-							content: [{ type: "text", text: msg.explanation || "(no explanation)" }],
-							details: {
-								diff: msg.diff || "",
-								filesChanged: msg.filesChanged || [],
-								bashResults: msg.bashResults || [],
-							},
-						});
-					} else {
-						resolve({
-							content: [{ type: "text", text: msg.message || "Worker error" }],
-							isError: true,
-							details: { code: msg.code || "ERROR" },
-						});
-					}
-				});
-
-				sendJson(connection.socket, {
-					type: "task",
+				const entry: QueuedTask = {
 					id,
 					task: params.task,
 					step: params.step,
 					plan: params.plan,
 					context: params.context,
-					reset: params.reset,
-				});
-
-				if (signal) {
-					const onAbort = () => {
-						clearTimeout(timeoutId);
-						pendingResolvers.delete(id);
-						pendingUpdates.delete(id);
-						taskWorkerMap.delete(id);
-						if (targetWorkerId && workerPool.has(targetWorkerId)) {
-							const conn = workerPool.get(targetWorkerId)!;
-							conn.busy = false;
-							conn.taskId = null;
-						}
-						if (connection && !connection.socket.destroyed) {
-							sendJson(connection.socket, { type: "abort", id });
-						}
-						// Dispatch next queued task now that worker is idle
-						if (targetWorkerId && workerPool.has(targetWorkerId)) {
-							const conn = workerPool.get(targetWorkerId)!;
-							dispatchNextQueued(targetWorkerId, conn, ctx);
-						}
-						writeControlFileIdle(ctx.cwd);
-						logDelegateResult(id, "aborted", "Task aborted");
-						resolve({ content: [{ type: "text", text: "Task aborted" }], isError: true });
-					};
-					if (signal.aborted) onAbort();
-					else signal.addEventListener("abort", onAbort, { once: true });
-				}
+					reset: resetRequested || undefined,
+					tier: connection!.tier,
+					ctx,
+					cwd: ctx.cwd,
+					queuedAt: Date.now(),
+					resolve,
+					signal,
+					onUpdate,
+				};
+				if (resetRequested) beginReset(targetWorkerId!, connection!, entry, ctx);
+				else dispatchEntryToWorker(targetWorkerId!, connection!, entry, ctx);
 			});
 		},
 	});
@@ -3427,6 +3732,7 @@ async function executeFanout(
 			step: Type.Optional(Type.Number({ description: "Step number" })),
 			plan: Type.Optional(Type.String({ description: "Full plan markdown" })),
 			context: Type.Optional(Type.String({ description: "Running summary" })),
+			reset: Type.Optional(Type.Boolean({ description: "Clear the worker's conversation context before dispatching this task. Requires an idle, non-burst worker; a reset never spawns one." })),
 			workerId: Type.Optional(Type.String({ description: "Target specific worker by ID. Omit for auto-routing to first idle worker." })),
 			tier: Type.Optional(Type.String({ description: "Worker tier: 'flash' for simple/scoped tasks, 'strong' for complex/deep reasoning. Omit or 'auto' for any idle worker." })),
 		}),
@@ -3484,7 +3790,27 @@ async function executeFanout(
 				});
 			};
 
+			// Terminal-state delivery for queued, direct, and post-reset async dispatches
+			const asyncResultFor = (taskId: string, fallbackTier: string | undefined) => (result: any) => {
+				const info = asyncTaskWorkerMap.get(taskId);
+				const wid = info?.workerId || "?";
+				const t = info?.tier || fallbackTier || "?";
+				if (result.isError && result.details?.code === "TIMEOUT") {
+					sendAsyncTimeout(taskId);
+					return;
+				}
+				if (result.isError) {
+					sendAsyncResult(taskId, wid, t, "error", { message: result.content?.[0]?.text || "Worker error", isError: true });
+				} else {
+					sendAsyncResult(taskId, wid, t, "completed", { explanation: result.content?.[0]?.text || "(no explanation)" });
+				}
+			};
+
 			// ── Find target worker ──
+			const resetRequested = params.reset === true;
+			if (resetRequested && LAUNCHER_ROLE_FLAG !== "mind") {
+				return { content: [{ type: "text", text: "reset requires the launcher worker path (stable worker identity)." }], isError: true, details: { code: "RESET_UNSUPPORTED" } };
+			}
 			let targetWorkerId = params.workerId?.trim() || null;
 			let connection: WorkerConnection | undefined;
 
@@ -3493,171 +3819,90 @@ async function executeFanout(
 				if (!conn || conn.socket.destroyed) {
 					return { content: [{ type: "text", text: `Worker "${targetWorkerId}" not connected. Connected: ${[...workerPool.keys()].filter(w => !workerPool.get(w)!.socket.destroyed).join(", ") || "(none)"}` }], isError: true };
 				}
-				if (conn.busy) {
-					return { content: [{ type: "text", text: `Worker "${targetWorkerId}" is busy. Omit workerId for auto-routing (queues if all busy).` }], isError: true };
+				if (resetRequested && isBurstWorker(targetWorkerId)) {
+					return { content: [{ type: "text", text: `Worker "${targetWorkerId}" is a burst worker. reset requires an idle static worker.` }], isError: true, details: { code: "RESET_UNSUPPORTED" } };
+				}
+				if (conn.busy || conn.resetting) {
+					return { content: [{ type: "text", text: `Worker "${targetWorkerId}" is busy. Omit workerId for auto-routing (queues if all busy).${resetRequested ? " reset requires an idle worker." : ""}` }], isError: true };
 				}
 				connection = conn;
 			} else {
-				const idle = findIdleWorker(effectiveTier);
+				const idle = resetRequested ? findIdleStaticWorker(effectiveTier) : findIdleWorker(effectiveTier);
+				const connected = [...workerPool.values()].filter(w => !w.socket.destroyed).length;
 				if (!idle) {
-					const connected = [...workerPool.values()].filter(w => !w.socket.destroyed).length;
-					if (connected === 0) {
-						return { content: [{ type: "text", text: "No workers connected. Workers start automatically." }], isError: true };
-					}
-					if (effectiveTier) {
-						const tierCount = [...workerPool.values()].filter(w => w.tier === effectiveTier && !w.socket.destroyed).length;
-						if (tierCount === 0) {
-							return { content: [{ type: "text", text: `No ${effectiveTier} workers connected. Available tiers: ${[...new Set([...workerPool.values()].filter(w => !w.socket.destroyed).map(w => w.tier))].join(", ") || "(none)"}` }], isError: true };
-					}
-				}
-				// ── Enqueue task ──
-				if (pendingQueue.length >= maxQueueSize) {
-					return { content: [{ type: "text", text: `All ${connected} worker(s) busy and queue full (${pendingQueue.length}/${maxQueueSize}). Wait for results, then retry.` }], isError: true };
-				}
-				const qId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-				writeControlFileBusy(ctx.cwd);
-				pendingQueue.push({
-					id: qId,
-					task: params.task,
-					step: params.step,
-					plan: params.plan,
-					context: params.context,
-					tier: effectiveTier,
-					ctx,
-					cwd: ctx.cwd,
-					queuedAt: Date.now(),
-					signal,
-					onUpdate,
-					resolve: (result) => {
-						const info = asyncTaskWorkerMap.get(qId);
-						asyncTaskWorkerMap.delete(qId);
-						const wid = info?.workerId || "?";
-						const t = info?.tier || effectiveTier || "?";
-						if (result.isError) {
-							sendAsyncResult(qId, wid, t, "error", { message: result.content?.[0]?.text || "Worker error", isError: true });
-						} else {
-							const text = result.content?.[0]?.text || "(no explanation)";
-							sendAsyncResult(qId, wid, t, "completed", { explanation: text });
+					if (!resetRequested) {
+						if (connected === 0) {
+							return { content: [{ type: "text", text: "No workers connected. Workers start automatically." }], isError: true };
 						}
-					},
-				});
-				if (!effectiveTier || effectiveTier === "flash" || effectiveTier === "default") {
-					trySpawnBurstFlashWithRetry(ctx.cwd, ctx);
-				}
-				if (signal) {
-					const onAbort = () => {
-						const idx = pendingQueue.findIndex(e => e.id === qId);
-						if (idx !== -1) {
-							pendingQueue.splice(idx, 1);
-							asyncTaskWorkerMap.delete(qId);
-							if (!hasPendingWork()) writeControlFileIdle(ctx.cwd);
+						if (effectiveTier) {
+							const tierCount = [...workerPool.values()].filter(w => w.tier === effectiveTier && !w.socket.destroyed).length;
+							if (tierCount === 0) {
+								return { content: [{ type: "text", text: `No ${effectiveTier} workers connected. Available tiers: ${[...new Set([...workerPool.values()].filter(w => !w.socket.destroyed).map(w => w.tier))].join(", ") || "(none)"}` }], isError: true };
+							}
 						}
-					};
-					if (signal.aborted) onAbort();
-					else signal.addEventListener("abort", onAbort, { once: true });
-				}
-				return { content: [{ type: "text", text: `Task ${qId} queued (position ${pendingQueue.length}). Result will follow asynchronously.` }] };
+					}
+					// ── Enqueue task ───────────────────────────────
+					if (pendingQueue.length >= maxQueueSize) {
+						return { content: [{ type: "text", text: `All ${connected} worker(s) busy and queue full (${pendingQueue.length}/${maxQueueSize}). Wait for results, then retry.` }], isError: true };
+					}
+					const qId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+					writeControlFileBusy(ctx.cwd);
+					pendingQueue.push({
+						id: qId,
+						task: params.task,
+						step: params.step,
+						plan: params.plan,
+						context: params.context,
+						reset: resetRequested || undefined,
+						tier: effectiveTier,
+						ctx,
+						cwd: ctx.cwd,
+						queuedAt: Date.now(),
+						signal,
+						onUpdate,
+						resolve: asyncResultFor(qId, effectiveTier),
+					});
+					// A reset never spawns a worker: burst spawn is skipped for reset entries.
+					if (!resetRequested && (!effectiveTier || effectiveTier === "flash" || effectiveTier === "default")) {
+						trySpawnBurstFlashWithRetry(ctx.cwd, ctx);
+					}
+					if (signal) {
+						const onAbort = () => {
+							const idx = pendingQueue.findIndex(e => e.id === qId);
+							if (idx !== -1) {
+								pendingQueue.splice(idx, 1);
+								asyncTaskWorkerMap.delete(qId);
+								if (!hasPendingWork()) writeControlFileIdle(ctx.cwd);
+							}
+						};
+						if (signal.aborted) onAbort();
+						else signal.addEventListener("abort", onAbort, { once: true });
+					}
+					return { content: [{ type: "text", text: `Task ${qId} queued (position ${pendingQueue.length}). Result will follow asynchronously.` }] };
 				}
 				targetWorkerId = idle.workerId;
 				connection = idle.connection;
 			}
 
 			// ── Direct dispatch ──
-			const { config } = loadConfig();
 			const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-			if (onUpdate) pendingUpdates.set(id, onUpdate);
-
-			if (params.plan) {
-				const planPath = getPlanPath(ctx.cwd);
-				ensureDir(dirname(planPath));
-				writeFileSync(planPath, params.plan, "utf-8");
-			}
-
-			connection.busy = true;
-			connection.taskId = id;
-			taskWorkerMap.set(id, targetWorkerId);
-			asyncTaskWorkerMap.set(id, { workerId: targetWorkerId, tier: connection.tier });
-			trackTaskStart(id, targetWorkerId, connection.tier, params.task.slice(0, 100), ctx.cwd);
-			if (isBurstWorker(targetWorkerId)) {
-				onBurstWorkerTaskStart(targetWorkerId);
-				logBurstEvent(ctx.cwd, targetWorkerId, "task-start", id);
-			}
-			writeControlFileBusy(ctx.cwd);
-
-			const timeoutId = setTimeout(() => {
-				pendingResolvers.delete(id);
-				pendingUpdates.delete(id);
-				taskWorkerMap.delete(id);
-				if (targetWorkerId && workerPool.has(targetWorkerId)) {
-					const conn = workerPool.get(targetWorkerId)!;
-					conn.busy = false;
-					conn.taskId = null;
-				}
-				if (connection && !connection.socket.destroyed) {
-					sendJson(connection.socket, { type: "abort", id });
-				}
-				if (targetWorkerId && workerPool.has(targetWorkerId)) {
-					const conn = workerPool.get(targetWorkerId)!;
-					dispatchNextQueued(targetWorkerId, conn, ctx);
-				}
-				writeControlFileIdle(ctx.cwd);
-				logDelegateResult(id, "timeout", `Worker "${targetWorkerId}" timeout after ${config.timeout}s`);
-				sendAsyncTimeout(id);
-				asyncTaskWorkerMap.delete(id);
-			}, Math.max(1, config.timeout) * 1000);
-
-			pendingResolvers.set(id, (msg) => {
-				clearTimeout(timeoutId);
-				pendingResolvers.delete(id);
-				pendingUpdates.delete(id);
-				taskWorkerMap.delete(id);
-				asyncTaskWorkerMap.delete(id);
-				writeControlFileIdle(ctx.cwd);
-				const status = msg.type === "result" ? "completed" : "error";
-				const summary = msg.explanation || msg.message || "(no result)";
-				logDelegateResult(id, status, summary, { filesChanged: msg.filesChanged, diffLength: msg.diff?.length, bashExitCodes: msg.bashResults?.map(r => r.exitCode), bashCount: msg.bashResults?.length });
-				if (msg.type === "result") {
-					sendAsyncCompleted(id, targetWorkerId, connection!.tier, msg);
-				} else {
-					sendAsyncError(id, targetWorkerId, connection!.tier, msg.message || "Worker error");
-				}
-			});
-
-			sendJson(connection.socket, {
-				type: "task",
+			const entry: QueuedTask = {
 				id,
 				task: params.task,
 				step: params.step,
 				plan: params.plan,
 				context: params.context,
-			});
-
-			if (signal) {
-				const onAbort = () => {
-					clearTimeout(timeoutId);
-					pendingResolvers.delete(id);
-					pendingUpdates.delete(id);
-					taskWorkerMap.delete(id);
-					asyncTaskWorkerMap.delete(id);
-					if (targetWorkerId && workerPool.has(targetWorkerId)) {
-						const conn = workerPool.get(targetWorkerId)!;
-						conn.busy = false;
-						conn.taskId = null;
-					}
-					if (connection && !connection.socket.destroyed) {
-						sendJson(connection.socket, { type: "abort", id });
-					}
-					if (targetWorkerId && workerPool.has(targetWorkerId)) {
-						const conn = workerPool.get(targetWorkerId)!;
-						dispatchNextQueued(targetWorkerId, conn, ctx);
-					}
-					writeControlFileIdle(ctx.cwd);
-					logDelegateResult(id, "aborted", "Task aborted");
-				};
-				if (signal.aborted) onAbort();
-				else signal.addEventListener("abort", onAbort, { once: true });
-			}
-
+				reset: resetRequested || undefined,
+				tier: connection!.tier,
+				ctx,
+				cwd: ctx.cwd,
+				queuedAt: Date.now(),
+				signal,
+				onUpdate,
+				resolve: asyncResultFor(id, connection!.tier),
+			};
+			if (resetRequested) beginReset(targetWorkerId!, connection!, entry, ctx);
+			else dispatchEntryToWorker(targetWorkerId!, connection!, entry, ctx);
 			return { content: [{ type: "text", text: `Task ${id} dispatched async to ${targetWorkerId}` }] };
 		},
 	});
