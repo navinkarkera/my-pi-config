@@ -1,0 +1,32 @@
+{
+  "rules": [
+    {
+      "pattern": "^\\s*(?:sudo\\s+)?rm\\s+(?=[^;|&\\n]*(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)(?:\\s|$))(?:(?:-[A-Za-z]+|--[a-z-]+)\\s+)*(?:--\\s+)?/(?:\\s|$|[;|&)])",
+      "feedback": "Refusing to recursively delete /. If this is truly intended, ask the operator to run it."
+    },
+    {
+      "pattern": "^\\s*(?:sudo\\s+)?git\\s+push\\b[\\s\\S]*?(?:--force(?![\\w-])|\\s-f(?:\\s|$))",
+      "feedback": "Force-pushing rewrites shared history. Ask the operator before forcing a push."
+    },
+    {
+      "pattern": "^\\s*(?:sudo\\s+)?git\\s+reset\\s+--hard\\b",
+      "feedback": "git reset --hard discards uncommitted work. Confirm with the operator first."
+    },
+    {
+      "pattern": "^\\s*(?:sudo\\s+)?(?:systemctl\\s+(?:reboot|poweroff|halt)|mkfs(?:\\.\\w+)?|shutdown|reboot|poweroff)\\b",
+      "feedback": "Host-destructive command. Ask the operator to run it."
+    },
+    {
+      "pattern": "^\\s*(?:cd\\s+[^\\s;&|]+\\s*&&\\s*)?(?:npm|pnpm|yarn)\\s+(?:run\\s+)?test(?:\\s+-[^\\s]+)*\\s*$",
+      "feedback": "Running the full test suite is blocked. Run a focused test file or a single test instead (e.g. npm test -- path/to/test.js)."
+    },
+    {
+      "pattern": "^\\s*(?:cd\\s+[^\\s;&|]+\\s*&&\\s*)?make(?:\\s+-[^\\s]+)*\\s+(?:test|validate)(?:\\s+-[^\\s]+)*\\s*$",
+      "feedback": "Running the full test suite is blocked. Run a focused test file or a single test instead (e.g. make test TESTS=tests/unit)."
+    },
+    {
+      "pattern": "^\\s*(?:cd\\s+[^\\s;&|]+\\s*&&\\s*)?(?:pytest|python[\\d.]*\\s+-m\\s+pytest)(?:\\s+-[^\\s]+)*\\s*$",
+      "feedback": "Running the full test suite is blocked. Run a focused test file or a single test instead (e.g. pytest tests/test_one.py or pytest -k auth)."
+    }
+  ]
+}
