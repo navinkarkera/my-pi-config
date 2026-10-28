@@ -2,7 +2,7 @@
 
 **Status:** Ratified — resolved in mind-worker grilling session 2.
 
-> **Current runtime:** `bin/mind-worker-launcher` is Herdr-only. Mind stays in the invoking Herdr session; workers use the separate shared `pi-workers` session with per-project workspaces. Kitty-specific references below describe the legacy design path.
+> **Current runtime:** `bin/mind-worker-launcher` is Herdr-only. Mind stays in the invoking Herdr session; workers use the separate shared `pi-workers` session with per-project workspaces. Kitty-specific references below describe the retired Kitty pair launcher and are historical only. Manual `/be-mind` / `/be-worker` role restore and the optional burst-worker Kitty path remain supported and are not that retired pair launcher.
 
 **Supersedes:** Legacy command-based role switching (`/be-mind`, `/be-worker`, etc.) for startup/reset lifecycle. Core protocol (socket, delegate tool, workflow steps) remains unchanged.
 

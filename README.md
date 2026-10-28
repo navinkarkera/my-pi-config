@@ -9,6 +9,10 @@ git clone <this-repo> ~/.pi/agent
 pi
 ```
 
+## Mind-worker launcher
+
+`bin/mind-worker-launcher` is the supported pair launcher and requires a running Herdr session (`terminalBackend: "herdr"` in `mind-worker.json`). The legacy Kitty pair launcher has been retired. Manual `/be-mind` / `/be-worker` role restore remains available, and the optional burst-worker Kitty path is unchanged.
+
 ## Authentication
 
 Pi supports OAuth (`/login`) or API keys. Credentials are stored in `auth.json` — never commit this file.
