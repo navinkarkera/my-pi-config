@@ -436,6 +436,8 @@ const pendingResets = new Map<string, ResetReservation>();
 let lastNotificationFingerprint = "";
 let lastNotificationTime = 0;
 const NOTIFICATION_COOLDOWN_MS = 10_000;
+/** 005: latest Mind run summary + boundary outcome, consumed once at settlement. */
+let mindSettleCapture: { summary: string; outcome: "completed" | "aborted" | "error" | null } | null = null;
 
 // ── Dashboard support ────────────────────────────────────────────────────────
 
@@ -4423,23 +4425,26 @@ async function executeFanout(
 
 	pi.on("agent_end", async (event, ctx) => {
 		if (currentRole === "mind") {
-			const { config } = loadConfig();
 			const summary = extractLastAssistantText(event.messages);
 
-			// Log mind response to JSONL for dashboard (respects dashboardEnabled + dashboardLogResponses)
+			// Dashboard contract: one response-log entry per low-level run, aborted runs included.
 			if (summary) {
 				logMindResponse(ctx.cwd, summary);
 			}
-
-			// Restore idle control-file status after processing completes
-			writeControlFileIdle(ctx.cwd);
-			await sendMindIdleNotification(config, ctx, summary);
+			// A run end is not settlement; retries and follow-ups can run again.
+			mindSettleCapture = { summary, outcome: null };
 			return;
 		}
 
 		// Worker: capture only. Retries, recovery, compaction and queued work can still start another run.
 		if (currentRole !== "worker") return;
 		if (workerTask) workerTask.latestMessages = event.messages;
+	});
+
+	pi.on("agent_before_settle", async (event) => {
+		// Mind: the boundary outcome for the run whose summary agent_end captured.
+		if (currentRole !== "mind" || !mindSettleCapture) return;
+		mindSettleCapture.outcome = event.outcome;
 	});
 
 	pi.on("agent_before_settle", async (event) => {
@@ -4452,6 +4457,20 @@ async function executeFanout(
 	});
 
 	pi.on("agent_settled", async (event, ctx) => {
+		// 005: control status is state, not an alert — restore it on any settled idle Mind parent.
+		if (currentRole === "mind" && ctx.isIdle() && !hasPendingWork()) writeControlFileIdle(ctx.cwd);
+		// Consume the capture once for every settled run, whatever the role: a run that still
+		// owns a retired worker record belongs to 001 and must never alert Mind.
+		const capture = mindSettleCapture;
+		mindSettleCapture = null;
+		if (currentRole === "mind" && !workerTask) {
+			if (!capture || event.aborted || capture.outcome !== "completed" || !ctx.isIdle()) return;
+			if (ctx.hasPendingMessages() || hasPendingWork()) return;
+			const { config } = loadConfig();
+			await sendMindIdleNotification(config, ctx, capture.summary || undefined);
+			return;
+		}
+		// 001's unchanged body follows; it still finalizes a retired record in Mind role.
 		const task = workerTask;
 		if (!task || !retireTask(task)) return;
 		const maySend = isActiveActor(task);
@@ -4478,6 +4497,7 @@ async function executeFanout(
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		mindSettleCapture = null;
 		// Launcher path: skip legacy role-restore, auto-activate fresh role
 		if (LAUNCHER_ROLE_FLAG === "mind") {
 			await activateMindRole(ctx, pi);
@@ -4526,6 +4546,7 @@ async function executeFanout(
 		if (currentRole === "worker") disconnectWorker(ctx);
 		failPendingTasks("Session ended", "SESSION_END");
 		currentRole = "none";
+		mindSettleCapture = null;
 		if (!workerTask) {
 			workerBusy = false;
 			workerTaskId = null;
