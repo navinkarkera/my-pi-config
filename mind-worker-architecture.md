@@ -2,7 +2,7 @@
 
 > Consolidated design from 38-question grilling session.
 >
-> **Launcher path:** The Herdr-only `bin/mind-worker-launcher` keeps Mind in the invoking Herdr session and launches workers in the separate shared `pi-workers` Herdr session, with per-project workspaces and per-worker Pi session directories. Sections marked **[LEGACY]** describe the old manual/Kitty path; the Herdr launcher takes precedence.
+> **Launcher path:** The Herdr-only `bin/mind-worker-launcher` keeps Mind in the invoking Herdr session and launches workers in the separate shared `pi-workers` Herdr session, with per-project workspaces and per-worker Pi session directories. The legacy Kitty pair launcher is retired and its code is removed; sections marked **[LEGACY]** describe that historical design, not a supported pair-launcher path. Manual `/be-mind` / `/be-worker` role restore remains supported, and the optional burst-worker Kitty path is unchanged.
 
 ---
 
