@@ -8,6 +8,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { CustomEditor, getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { parseGitArgs } from "../lib/mind-worker/git-command.mjs";
+// Pi's package entry does not export the ThinkingLevel union; the helper owns it.
+import { resolveThinkingLevel, type ThinkingLevel } from "../lib/mind-worker/thinking-level.mjs";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -33,11 +35,15 @@ interface WorkerConnection {
 interface WorkerModelEntry {
 	model: string;
 	tier: string;
+	thinkingLevel: ThinkingLevel;
 }
 
 interface MindWorkerConfig {
 	mindModel: string;
+	/** Absent keeps Pi's saved thinking level. */
+	mindThinkingLevel?: ThinkingLevel;
 	workerModel: string;
+	workerThinkingLevel: ThinkingLevel;
 	timeout: number;
 	statusStream: boolean;
 	autoSpawnWorker: boolean;
@@ -48,7 +54,7 @@ interface MindWorkerConfig {
 	kittyEnabled: boolean;
 	kittyLayout?: string;
 	workerCount: number;
-	workerModels?: Array<{ model: string; count: number; tier?: string }>;
+	workerModels?: Array<{ model: string; count: number; tier?: string; thinkingLevel?: ThinkingLevel }>;
 	dashboardEnabled: boolean;
 	dashboardRetention: number;
 	dashboardHeartbeatMs: number;
@@ -60,6 +66,8 @@ interface MindWorkerConfig {
 interface BurstFlashConfig {
 	enabled: boolean;
 	model: string;
+	/** Resolved against the global workerThinkingLevel when the config omits it. */
+	thinkingLevel: ThinkingLevel;
 	maxBurst: number;
 	idleTtlMs: number;
 	maxTasksPerWorker: number;
@@ -99,6 +107,7 @@ interface SocketMsg {
 const DEFAULT_BURST_FLASH_CONFIG: BurstFlashConfig = {
 	enabled: true,
 	model: "openai/gpt-6-luna",
+	thinkingLevel: "max",
 	maxBurst: 2,
 	idleTtlMs: 180000,
 	maxTasksPerWorker: 3,
@@ -111,7 +120,9 @@ const DEFAULT_BURST_FLASH_CONFIG: BurstFlashConfig = {
 
 const DEFAULT_CONFIG: MindWorkerConfig = {
 	mindModel: "anthropic/claude-opus-4-5",
+	mindThinkingLevel: undefined,
 	workerModel: "openai/gpt-6-luna",
+	workerThinkingLevel: "max",
 	timeout: 120,
 	statusStream: true,
 	autoSpawnWorker: true,
@@ -134,7 +145,6 @@ const DEFAULT_CONFIG: MindWorkerConfig = {
 const MIND_ALLOWED_TOOLS = ["delegate", "delegate_async", "read", "git", "ripgrep", "codemode"];
 // code_explore is codemode-exposed; allow it only as a nested codemode call, never as a direct tool.
 const MIND_ALLOWED_CODEMODE_TOOLS = ["code_explore"];
-const WORKER_THINKING_LEVEL = "max";
 /** Hard stop for Git so an interactive or credential-prompting command cannot wedge the session. */
 const GIT_TIMEOUT_MS = 120_000;
 
@@ -508,11 +518,12 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 	env.PI_MIND_WORKER_GENERATION = String(generation);
 	env.PI_MIND_WORKER_SESSION_DIR = sessionDir;
 	const model = config.burstFlash.model;
+	const thinking = config.burstFlash.thinkingLevel;
 	const hash = getCwdHash(cwd);
 	const paneTitle = `burst-flash-${hash}-${n}`;
 	// Decide: kitty or headless?
 	if (config.burstFlash.launchMode !== "kitty") {
-		spawnBurstHeadless({ n, workerId, cwd, sessionDir, logPath, model, generation, env });
+		spawnBurstHeadless({ n, workerId, cwd, sessionDir, logPath, model, thinking, generation, env });
 		return;
 	}
 	// ── Kitty launch path ──
@@ -522,7 +533,7 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 		fellBack = true;
 		logDiag("error", `[burst-flash] ${workerId}: ${reason}, falling back to headless`);
 		burstWorkers.delete(workerId);
-		spawnBurstHeadless({ n, workerId, cwd, sessionDir, logPath, model, generation, env });
+		spawnBurstHeadless({ n, workerId, cwd, sessionDir, logPath, model, thinking, generation, env });
 	};
 	const kittyArgs = [
 		"@", "launch",
@@ -536,7 +547,7 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 		...(INSTANCE_LABEL ? ["--env", `PI_MIND_WORKER_INSTANCE=${INSTANCE_LABEL}`] : []),
 		"--env", `PI_MIND_WORKER_SESSION_DIR=${sessionDir}`,
 		"--env", `PATH=${process.env.PATH || ""}`,
-		PI_CLI, "--mode", "rpc", "--model", model, "--thinking", "xhigh", "--session-dir", sessionDir,
+		PI_CLI, "--mode", "rpc", "--model", model, "--thinking", thinking, "--session-dir", sessionDir,
 	];
 	// Best-effort focus mind window before launching split
 	const mindTitle = `mind-${hash}`;
@@ -690,15 +701,16 @@ interface SpawnHeadlessParams {
 	sessionDir: string;
 	logPath: string;
 	model: string;
+	thinking: ThinkingLevel;
 	generation: number;
 	env: Record<string, string>;
 }
 
 function spawnBurstHeadless(p: SpawnHeadlessParams): void {
-	const { n, workerId, cwd, sessionDir, logPath, model, generation, env } = p;
+	const { n, workerId, cwd, sessionDir, logPath, model, thinking, generation, env } = p;
 	let child: import("node:child_process").ChildProcess;
 	try {
-		child = spawn(PI_CLI, ["--mode", "rpc", "--model", model, "--thinking", "max", "--session-dir", sessionDir], {
+		child = spawn(PI_CLI, ["--mode", "rpc", "--model", model, "--thinking", thinking, "--session-dir", sessionDir], {
 			env,
 			cwd,
 			stdio: ["pipe", "pipe", "pipe"],
@@ -1188,6 +1200,15 @@ function getConfigPath(): string {
 	return join(getAgentDir(), "mind-worker.json");
 }
 
+/** Configured thinking level, warning when a value is present but unusable. */
+function readThinkingLevel(value: unknown, fallback: ThinkingLevel | undefined, field: string): ThinkingLevel | undefined {
+	const level = resolveThinkingLevel(value, fallback);
+	if (value !== undefined && level !== value) {
+		logDiag("warn", `[mind-worker] ${field} "${String(value)}" invalid — using ${level ?? "the Pi default"}`);
+	}
+	return level;
+}
+
 function resolveWorkerModels(config: MindWorkerConfig): WorkerModelEntry[] {
 	const resolved: WorkerModelEntry[] = [];
 	if (Array.isArray(config.workerModels) && config.workerModels.length > 0) {
@@ -1203,8 +1224,9 @@ function resolveWorkerModels(config: MindWorkerConfig): WorkerModelEntry[] {
 			if (total >= 1 && total <= 10) {
 				for (const entry of config.workerModels) {
 					const tier = entry.tier || "flash";
+					const thinkingLevel = resolveThinkingLevel(entry.thinkingLevel, config.workerThinkingLevel);
 					for (let i = 0; i < entry.count; i++) {
-						resolved.push({ model: entry.model.trim(), tier });
+						resolved.push({ model: entry.model.trim(), tier, thinkingLevel });
 					}
 				}
 			}
@@ -1216,7 +1238,7 @@ function resolveWorkerModels(config: MindWorkerConfig): WorkerModelEntry[] {
 	if (resolved.length === 0) {
 		// Fallback: workerModel x workerCount, all flash
 		for (let i = 0; i < config.workerCount; i++) {
-			resolved.push({ model: config.workerModel, tier: "flash" });
+			resolved.push({ model: config.workerModel, tier: "flash", thinkingLevel: config.workerThinkingLevel });
 		}
 	}
 	return resolved;
@@ -1252,11 +1274,17 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 			logDiag("warn", "[mind-worker] dashboardStaleMs must be >= 3000 — using default 30000");
 		}
 
+		// Thinking levels: workers keep the pre-config default (max); Mind keeps Pi's saved level when unset.
+		const workerThinkingLevel = readThinkingLevel(parsed.workerThinkingLevel, DEFAULT_CONFIG.workerThinkingLevel, "workerThinkingLevel")
+			?? DEFAULT_CONFIG.workerThinkingLevel;
+		const mindThinkingLevel = readThinkingLevel(parsed.mindThinkingLevel, undefined, "mindThinkingLevel");
+
 		// Parse burstFlash config block
-		const rawBurst = parsed.burstFlash || {};
+		const rawBurst: Partial<BurstFlashConfig> = parsed.burstFlash || {};
 		const burstFlash: BurstFlashConfig = {
 			enabled: typeof rawBurst.enabled === "boolean" ? rawBurst.enabled : DEFAULT_BURST_FLASH_CONFIG.enabled,
 			model: typeof rawBurst.model === "string" && rawBurst.model.trim() ? rawBurst.model.trim() : DEFAULT_BURST_FLASH_CONFIG.model,
+			thinkingLevel: resolveThinkingLevel(rawBurst.thinkingLevel, workerThinkingLevel),
 			maxBurst: typeof rawBurst.maxBurst === "number" && rawBurst.maxBurst >= 0 && rawBurst.maxBurst <= 10
 				? rawBurst.maxBurst : DEFAULT_BURST_FLASH_CONFIG.maxBurst,
 			idleTtlMs: typeof rawBurst.idleTtlMs === "number" && rawBurst.idleTtlMs >= 10000
@@ -1281,7 +1309,9 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 
 		const config: MindWorkerConfig = {
 			mindModel: parsed.mindModel || DEFAULT_CONFIG.mindModel,
+			mindThinkingLevel,
 			workerModel: parsed.workerModel || DEFAULT_CONFIG.workerModel,
+			workerThinkingLevel,
 			timeout: typeof parsed.timeout === "number" ? parsed.timeout : DEFAULT_CONFIG.timeout,
 			statusStream: parsed.statusStream !== false,
 			autoSpawnWorker: parsed.autoSpawnWorker !== false,
@@ -1346,6 +1376,18 @@ async function setModelFromId(pi: ExtensionAPI, ctx: ExtensionContext, modelId: 
 	const model = ctx.modelRegistry?.find(provider, id);
 	if (!model) return;
 	await pi.setModel(model);
+}
+
+/** Model and thinking level this worker must run: burst id, then worker index, then tier, then the legacy default. */
+function resolveWorkerRoleTarget(config: MindWorkerConfig, resolvedWorkers: WorkerModelEntry[]): WorkerModelEntry {
+	const workerId = LAUNCHER_WORKER_ID || "";
+	// A burst worker is spawned with its own model, so the static flash tier entry must not override it.
+	if (isBurstWorker(workerId)) return { model: config.burstFlash.model, tier: "flash", thinkingLevel: config.burstFlash.thinkingLevel };
+	const idxMatch = workerId.match(/^worker-(\d+)$/);
+	const entry = idxMatch
+		? resolvedWorkers[parseInt(idxMatch[1], 10)]
+		: LAUNCHER_WORKER_TIER ? resolvedWorkers.find(w => w.tier === LAUNCHER_WORKER_TIER) : undefined;
+	return entry ?? { model: config.workerModel, tier: "flash", thinkingLevel: config.workerThinkingLevel };
 }
 
 async function getProjectSnapshot(cwd: string): Promise<string> {
@@ -2542,7 +2584,7 @@ async function spawnWorkerInKitty(cwd: string): Promise<void> {
 		try {
 			await new Promise<void>((resolve, reject) => {
 				const title = `Pi Worker ${i} [${entry.tier}]`;
-				const child = spawn("kitty", ["@", "launch", "--cwd", cwd, "--title", title, "--env", `PI_MIND_WORKER_ID=worker-${i}`, "--env", `PI_MIND_WORKER_TIER=${entry.tier}`, "pi", "--model", entry.model, "--thinking", "max", "/be-worker"], {
+				const child = spawn("kitty", ["@", "launch", "--cwd", cwd, "--title", title, "--env", `PI_MIND_WORKER_ID=worker-${i}`, "--env", `PI_MIND_WORKER_TIER=${entry.tier}`, "pi", "--model", entry.model, "--thinking", entry.thinkingLevel, "/be-worker"], {
 					stdio: "ignore",
 					timeout: 10000,
 				});
@@ -2937,6 +2979,7 @@ async function activateMindRole(ctx: ExtensionContext, pi: ExtensionAPI): Promis
 	startMindServer(ctx.cwd, ctx);
 	startDashboardHeartbeat(ctx.cwd);
 	await setModelFromId(pi, ctx, config.mindModel);
+	if (config.mindThinkingLevel) pi.setThinkingLevel(config.mindThinkingLevel);
 
 	try {
 		const snapshot = await getProjectSnapshot(ctx.cwd);
@@ -2977,23 +3020,10 @@ async function activateWorkerRole(ctx: ExtensionContext, pi: ExtensionAPI): Prom
 	if (defaultTools) pi.setActiveTools(defaultTools);
 
 	currentRole = "worker";
-	// Pick model by worker index (worker-N) from resolved list, fallback to tier match, then config.workerModel
-	let workerModel = config.workerModel;
-	const workerIdxMatch = LAUNCHER_WORKER_ID?.match(/^worker-(\d+)$/);
-	if (workerIdxMatch) {
-		const idx = parseInt(workerIdxMatch[1], 10);
-		if (idx >= 0 && idx < resolvedWorkers.length) {
-			workerModel = resolvedWorkers[idx].model;
-		}
-	} else {
-		const tier = LAUNCHER_WORKER_TIER;
-		if (tier) {
-			const tierEntry = resolvedWorkers.find(w => w.tier === tier);
-			if (tierEntry) workerModel = tierEntry.model;
-		}
-	}
-	await setModelFromId(pi, ctx, workerModel);
-	pi.setThinkingLevel(WORKER_THINKING_LEVEL);
+	// Model + level for this worker: burst id, worker index, tier, then the legacy default.
+	const target = resolveWorkerRoleTarget(config, resolvedWorkers);
+	await setModelFromId(pi, ctx, target.model);
+	pi.setThinkingLevel(target.thinkingLevel);
 	// Launcher-path workers in headless mode need a keepalive to prevent event-loop exit
 	if (LAUNCHER_ROLE_FLAG === "worker") startWorkerKeepalive();
 
@@ -4158,7 +4188,8 @@ async function executeFanout(
 		if (roleEntry.data.role === "mind" && currentRole !== "mind") {
 			currentRole = "mind";
 			pi.setActiveTools(MIND_ALLOWED_TOOLS);
-			const { resolvedWorkers } = loadConfig();
+			const { config, resolvedWorkers } = loadConfig();
+			if (config.mindThinkingLevel) pi.setThinkingLevel(config.mindThinkingLevel);
 			maxWorkers = resolvedWorkers.length;
 			maxQueueSize = resolvedWorkers.length * 2;
 			startMindServer(ctx.cwd, ctx);
@@ -4169,7 +4200,8 @@ async function executeFanout(
 		if (roleEntry.data.role === "worker" && currentRole !== "worker") {
 			currentRole = "worker";
 			if (defaultTools) pi.setActiveTools(defaultTools);
-			pi.setThinkingLevel(WORKER_THINKING_LEVEL);
+			const { config, resolvedWorkers } = loadConfig();
+			pi.setThinkingLevel(resolveWorkerRoleTarget(config, resolvedWorkers).thinkingLevel);
 			void connectWorker(ctx.cwd, ctx, createWorkerHandler(pi));
 			ctx.ui.notify("Worker role restored", "info");
 		}

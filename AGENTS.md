@@ -93,9 +93,8 @@ printf '%s' "$BODY" | /home/navin/.local/bin/collie walky send collie-04rj6a/w54
 
 `send` waits up to 15 seconds for the receipt. If the message is not typed by then, it prints
 `check later: collie walky status <id>`. If the receipt says `not sent` or `waiting in the inbox`,
-tell your operator the reason and stop. Do not send it again.
-
-A send to a pane that closed, whose id another pane took, is refused `pane replaced`. Run `who` again.
+tell your operator the reason and stop. Do not send it again. A send to a pane that closed, whose id
+another pane took, is refused `pane replaced`. Run `who` again.
 
 After `send`, end your turn. Do not poll and do not sleep. The answer is typed into your pane as
 your next prompt, with `reply to <your id>` in its header. If your pane is busy, Collie queues or holds it
@@ -108,24 +107,25 @@ Answer a message by its id. The reply goes back to the sender.
 /home/navin/.local/bin/collie walky reply wt_k3f9x2m8q1a0 "Merged. Thanks."
 ```
 
-Read one message by its id. This is how you read the body of a message from another agent.
+Read one message by its id. This is how you read the body of a message from another agent. With no id,
+`inbox` prints every unread message for your pane and marks them read, one your screen refused too.
 
 ```bash
 /home/navin/.local/bin/collie walky inbox wt_k3f9x2m8q1a0
 ```
 
-`/home/navin/.local/bin/collie walky inbox` with no id prints every unread message for your pane and marks them
-read. This is also how you read one your screen refused.
+`/home/navin/.local/bin/collie walky status wt_...` shows what became of a message you sent: "queued", "held", "typed into
+the pane", "waiting in the inbox, not typed", "not sent" or "may have arrived, will not be sent again".
+"held: draft present" or "held: turn running" means Collie types it when the box clears or the turn ends,
+up to 60 minutes. Wait. Do not send it again. If a send says "waiting in the inbox", do not send it again:
+it waits there. If it says "may have arrived", do not send it again either: it may already be there. For a
+pane on another machine, "queued (outcome known on the lead)" also means wait.
 
-`/home/navin/.local/bin/collie walky status wt_...` shows what became of a message you sent: "queued", "typed
-into the pane", "waiting in the inbox, not typed", "not sent" with the reason, or "may have
-arrived, will not be sent again". If a send says "waiting in the inbox", the other session stayed
-busy, or its box held a draft. Do not send it again. The message waits in its inbox. If it says "may have
-arrived", do not send it again either: it may already be there. For a pane on another machine, "queued
-(outcome known on the lead)" means the outcome has not come back yet. Check later.
-
-An id Collie does not know exits 3 (`status` prints `no record of <id> on this machine`). A refused
-send exits 4.
+`/home/navin/.local/bin/collie walky cancel wt_...` takes back a message you sent while it is still held. It stays in the
+receiver's inbox, not typed ("cancelled by sender"). Run it in the pane that sent it; you can cancel only
+your own. One already typed prints "already typed, nothing to take back". Do not send a cancelled message
+again unless your operator asks. An id Collie does not know exits 3 (`status` prints `no record of <id> on
+this machine`). A refused send exits 4.
 
 ## When to send
 
@@ -151,5 +151,5 @@ limit it hit. Do not work around it.
 If the command prints `walky talky is off` or cannot find a bridge, tell your operator. Do not work
 around it.
 
-<!-- collie-skill walky-talky v1 collie 1.23.1+8c4c0d4 -->
+<!-- collie-skill walky-talky v1 collie 1.24.0+4bab157 -->
 <!-- collie:walky-talky v1 end -->

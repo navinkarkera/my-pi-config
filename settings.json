@@ -23,7 +23,8 @@
     "npm:@codexstar/pi-listen",
     "git:github.com/DietrichGebert/ponytail",
     "npm:pi-discord-remote",
-    "npm:pi-ast-grep"
+    "npm:pi-ast-grep",
+    "npm:@ff-labs/pi-fff"
   ],
   "hideThinkingBlock": true,
   "steeringMode": "one-at-a-time",
