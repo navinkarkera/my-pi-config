@@ -46,7 +46,7 @@ export default function (pi: ExtensionAPI) {
   let socketPath: string | null = null;
 
   pi.on("session_start", async (_event, ctx) => {
-    if (ctx.mode === "print") return;
+    if (ctx.mode !== "tui") return;
 
     const cwd = ctx.cwd;
     // Ensure sockets directory exists
@@ -136,6 +136,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function cleanup() {
+    if (!server && !socketPath) return;
     if (server) {
       server.close();
       server = null;
@@ -163,7 +164,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("pi-nvim-restart", {
     description: "Restart the pi-nvim socket and manifest",
     handler: async (_args, ctx) => {
-      if (ctx.mode === "print") return;
+      if (ctx.mode !== "tui") return;
       await ctx.reload();
       return;
     },
