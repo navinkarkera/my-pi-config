@@ -17,14 +17,14 @@
           "cacheRead": 0,
           "cacheWrite": 0
         },
+        "contextWindow": 1048576,
+        "maxTokens": 131072,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 1048576,
-        "maxTokens": 131072,
         "thinkingLevelMap": {
           "off": null,
           "minimal": null,
@@ -100,6 +100,8 @@
           "cacheRead": 0.022,
           "cacheWrite": 0
         },
+        "contextWindow": 1000000,
+        "maxTokens": 384000,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
@@ -108,8 +110,6 @@
           "requiresReasoningContentOnAssistantMessages": true,
           "thinkingFormat": "deepseek"
         },
-        "contextWindow": 1000000,
-        "maxTokens": 384000,
         "thinkingLevelMap": {
           "minimal": null,
           "low": null,
@@ -126,15 +126,6 @@
         "provider": "opencode-go",
         "baseUrl": "https://opencode.ai/inference/go/openai/v1",
         "reasoning": true,
-        "thinkingLevelMap": {
-          "off": null,
-          "minimal": null,
-          "low": "low",
-          "medium": null,
-          "high": "high",
-          "xhigh": null,
-          "max": "max"
-        },
         "input": [
           "text",
           "image"
@@ -145,6 +136,17 @@
           "cacheRead": 0.003,
           "cacheWrite": 0
         },
+        "contextWindow": 1000000,
+        "maxTokens": 384000,
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": null,
+          "high": "high",
+          "xhigh": null,
+          "max": "max"
+        },
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
@@ -153,8 +155,6 @@
           "requiresReasoningContentOnAssistantMessages": true,
           "thinkingFormat": "deepseek"
         },
-        "contextWindow": 1000000,
-        "maxTokens": 384000,
         "inputLimits": {
           "images": {
             "resize": {
@@ -174,15 +174,6 @@
         "provider": "opencode-go",
         "baseUrl": "https://opencode.ai/inference/go/google/v1beta",
         "reasoning": true,
-        "thinkingLevelMap": {
-          "off": null,
-          "minimal": null,
-          "low": "low",
-          "medium": "medium",
-          "high": "high",
-          "xhigh": null,
-          "max": null
-        },
         "input": [
           "text",
           "image"
@@ -195,6 +186,15 @@
         },
         "contextWindow": 1048576,
         "maxTokens": 65536,
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "xhigh": null,
+          "max": null
+        },
         "inputLimits": {
           "images": {
             "resize": {
@@ -223,14 +223,14 @@
           "cacheRead": 0.26,
           "cacheWrite": 0
         },
+        "contextWindow": 1000000,
+        "maxTokens": 131072,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 1000000,
-        "maxTokens": 131072,
         "thinkingLevelMap": {
           "off": null,
           "minimal": null,
@@ -258,14 +258,14 @@
           "cacheRead": 0.26,
           "cacheWrite": 0
         },
+        "contextWindow": 1000000,
+        "maxTokens": 131072,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 1000000,
-        "maxTokens": 131072,
         "thinkingLevelMap": {
           "off": null,
           "minimal": null,
@@ -294,14 +294,14 @@
           "cacheRead": 0.03,
           "cacheWrite": 0
         },
+        "contextWindow": 1000000,
+        "maxTokens": 131072,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 1000000,
-        "maxTokens": 131072,
         "thinkingLevelMap": {
           "off": null,
           "minimal": null,
@@ -349,13 +349,13 @@
             }
           ]
         },
+        "contextWindow": 1050000,
+        "maxTokens": 128000,
         "compat": {
           "sessionAffinityFormat": "openai-nosession",
           "supportsMidConvoSystemMessages": true,
           "supportsAdditionalTools": true
         },
-        "contextWindow": 1050000,
-        "maxTokens": 128000,
         "thinkingLevelMap": {
           "off": null,
           "minimal": null,
@@ -403,13 +403,13 @@
             }
           ]
         },
+        "contextWindow": 1050000,
+        "maxTokens": 128000,
         "compat": {
           "sessionAffinityFormat": "openai-nosession",
           "supportsMidConvoSystemMessages": true,
           "supportsAdditionalTools": true
         },
-        "contextWindow": 1050000,
-        "maxTokens": 128000,
         "thinkingLevelMap": {
           "off": "none",
           "minimal": null,
@@ -457,11 +457,11 @@
             }
           ]
         },
+        "contextWindow": 500000,
+        "maxTokens": 500000,
         "compat": {
           "sessionAffinityFormat": "openai-nosession"
         },
-        "contextWindow": 500000,
-        "maxTokens": 500000,
         "thinkingLevelMap": {
           "off": null,
           "minimal": null,
@@ -499,14 +499,14 @@
           "cacheRead": 0.035,
           "cacheWrite": 0
         },
+        "contextWindow": 256000,
+        "maxTokens": 128000,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 256000,
-        "maxTokens": 128000,
         "thinkingLevelMap": {
           "off": "none",
           "minimal": null,
@@ -534,14 +534,14 @@
           "cacheRead": 0.042,
           "cacheWrite": 0
         },
+        "contextWindow": 1024000,
+        "maxTokens": 64000,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 1024000,
-        "maxTokens": 64000,
         "thinkingLevelMap": {
           "off": "none",
           "minimal": null,
@@ -569,14 +569,14 @@
           "cacheRead": 0,
           "cacheWrite": 0
         },
+        "contextWindow": 262144,
+        "maxTokens": 131072,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 262144,
-        "maxTokens": 131072,
         "type": "chat"
       },
       {
@@ -596,14 +596,14 @@
           "cacheRead": 0.19,
           "cacheWrite": 0
         },
+        "contextWindow": 262144,
+        "maxTokens": 262144,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 262144,
-        "maxTokens": 262144,
         "inputLimits": {
           "images": {
             "resize": {
@@ -633,6 +633,8 @@
           "cacheRead": 0.3,
           "cacheWrite": 3
         },
+        "contextWindow": 1048576,
+        "maxTokens": 131072,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
@@ -641,8 +643,6 @@
           "supportsMidConvoSystemMessages": true,
           "supportsMidConvoToolAdditions": true
         },
-        "contextWindow": 1048576,
-        "maxTokens": 131072,
         "thinkingLevelMap": {
           "off": null,
           "minimal": null,
@@ -681,6 +681,8 @@
           "cacheRead": 0.2,
           "cacheWrite": 2
         },
+        "contextWindow": 1048576,
+        "maxTokens": 131072,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
@@ -689,8 +691,6 @@
           "supportsMidConvoSystemMessages": true,
           "supportsMidConvoToolAdditions": true
         },
-        "contextWindow": 1048576,
-        "maxTokens": 131072,
         "thinkingLevelMap": {
           "off": null,
           "minimal": null,
@@ -728,14 +728,14 @@
           "cacheRead": 0.006,
           "cacheWrite": 0
         },
+        "contextWindow": 1000000,
+        "maxTokens": 131072,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 1000000,
-        "maxTokens": 131072,
         "type": "chat"
       },
       {
@@ -755,14 +755,14 @@
           "cacheRead": 0.0028,
           "cacheWrite": 0
         },
+        "contextWindow": 1000000,
+        "maxTokens": 128000,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 1000000,
-        "maxTokens": 128000,
         "inputLimits": {
           "images": {
             "resize": {
@@ -791,14 +791,14 @@
           "cacheRead": 0.003625,
           "cacheWrite": 0
         },
+        "contextWindow": 1048576,
+        "maxTokens": 128000,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 1048576,
-        "maxTokens": 128000,
         "type": "chat"
       },
       {
@@ -818,14 +818,14 @@
           "cacheRead": 0.0028,
           "cacheWrite": 0
         },
+        "contextWindow": 1048576,
+        "maxTokens": 131072,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 1048576,
-        "maxTokens": 131072,
         "inputLimits": {
           "images": {
             "resize": {
@@ -855,14 +855,14 @@
           "cacheRead": 0.003625,
           "cacheWrite": 0
         },
+        "contextWindow": 1048576,
+        "maxTokens": 131072,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 1048576,
-        "maxTokens": 131072,
         "inputLimits": {
           "images": {
             "resize": {
@@ -932,14 +932,14 @@
           "cacheRead": 0.015,
           "cacheWrite": 0
         },
+        "contextWindow": 1000000,
+        "maxTokens": 512000,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 1000000,
-        "maxTokens": 512000,
         "thinkingLevelMap": {
           "off": null,
           "minimal": null,
@@ -978,11 +978,11 @@
           "cacheRead": 0.002,
           "cacheWrite": 0
         },
+        "contextWindow": 1048576,
+        "maxTokens": 131072,
         "compat": {
           "sessionAffinityFormat": "openai-nosession"
         },
-        "contextWindow": 1048576,
-        "maxTokens": 131072,
         "thinkingLevelMap": {
           "off": null,
           "minimal": "minimal",
@@ -1021,11 +1021,11 @@
           "cacheRead": 0.002,
           "cacheWrite": 0
         },
+        "contextWindow": 1048576,
+        "maxTokens": 131072,
         "compat": {
           "sessionAffinityFormat": "openai-nosession"
         },
-        "contextWindow": 1048576,
-        "maxTokens": 131072,
         "thinkingLevelMap": {
           "off": null,
           "minimal": "minimal",
@@ -1169,14 +1169,14 @@
           "cacheRead": 0.1,
           "cacheWrite": 0
         },
+        "contextWindow": 1000000,
+        "maxTokens": 65536,
         "compat": {
           "supportsStore": false,
           "supportsDeveloperRole": false,
           "supportsStrictMode": true,
           "maxTokensField": "max_tokens"
         },
-        "contextWindow": 1000000,
-        "maxTokens": 65536,
         "thinkingLevelMap": {
           "off": null,
           "minimal": null,
@@ -1199,9 +1199,9 @@
         "type": "chat"
       }
     ],
-    "lastModified": 1793094350000,
-    "etag": "W/\"0c93e1d21f7135ef3a38c560dc557be9\"",
-    "checkedAt": 1793180139938
+    "lastModified": 1793193885000,
+    "etag": "W/\"2a97586719f0fc413c838181323179be\"",
+    "checkedAt": 1793284163172
   },
   "openai-codex": {
     "models": [
@@ -3059,6 +3059,42 @@
   "openai": {
     "models": [
       {
+        "id": "chat-latest",
+        "name": "Chat Latest",
+        "api": "openai-responses",
+        "provider": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 5,
+          "output": 30,
+          "cacheRead": 0.5,
+          "cacheWrite": 0
+        },
+        "contextWindow": 400000,
+        "maxTokens": 128000,
+        "compat": {
+          "supportsStrictMode": true
+        },
+        "inputLimits": {
+          "maxRequestBytes": 536870912,
+          "images": {
+            "maxPerRequest": 1500,
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
+        "type": "chat"
+      },
+      {
         "id": "gpt-4",
         "name": "GPT-4",
         "api": "openai-responses",
@@ -4176,6 +4212,53 @@
         "type": "chat"
       },
       {
+        "id": "gpt-5.6-cyber",
+        "name": "GPT-5.6 Cyber",
+        "api": "openai-responses",
+        "provider": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 12.5,
+          "output": 75,
+          "cacheRead": 1.25,
+          "cacheWrite": 15.625
+        },
+        "contextWindow": 400000,
+        "maxTokens": 128000,
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "xhigh": "xhigh",
+          "max": "max"
+        },
+        "compat": {
+          "supportsStrictMode": true,
+          "supportsOpenAIGrammarTools": true,
+          "supportsExplicitPromptCacheMode": true
+        },
+        "inputLimits": {
+          "maxRequestBytes": 536870912,
+          "images": {
+            "maxPerRequest": 1500,
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
+        },
+        "type": "chat"
+      },
+      {
         "id": "gpt-5.6-luna",
         "name": "GPT-5.6 Luna",
         "api": "openai-responses",
@@ -4754,51 +4837,6 @@
         "type": "chat"
       },
       {
-        "id": "gpt-realtime-2.1",
-        "name": "GPT-Realtime-2.1",
-        "api": "openai-responses",
-        "provider": "openai",
-        "baseUrl": "https://api.openai.com/v1",
-        "reasoning": true,
-        "input": [
-          "text",
-          "image"
-        ],
-        "cost": {
-          "input": 4,
-          "output": 24,
-          "cacheRead": 0.4,
-          "cacheWrite": 0
-        },
-        "contextWindow": 128000,
-        "maxTokens": 32000,
-        "thinkingLevelMap": {
-          "off": null,
-          "minimal": "minimal",
-          "low": "low",
-          "medium": "medium",
-          "high": "high",
-          "xhigh": "xhigh",
-          "max": null
-        },
-        "compat": {
-          "supportsStrictMode": true
-        },
-        "inputLimits": {
-          "maxRequestBytes": 536870912,
-          "images": {
-            "maxPerRequest": 1500,
-            "resize": {
-              "maxWidth": 2000,
-              "maxHeight": 2000,
-              "maxBytes": 4718592,
-              "jpegQuality": 80
-            }
-          }
-        },
-        "type": "chat"
-      },
-      {
         "id": "o1",
         "name": "o1",
         "api": "openai-responses",
@@ -5084,8 +5122,8 @@
         "contextWindow": 922000
       }
     ],
-    "lastModified": 1793109077000,
-    "etag": "W/\"fdd98e75148df38e327e888c53628074\"",
-    "checkedAt": 1793180142029
+    "lastModified": 1793193877000,
+    "etag": "W/\"9cb1a79c50b9cf662b2087060a30e5dc\"",
+    "checkedAt": 1793284163388
   }
 }

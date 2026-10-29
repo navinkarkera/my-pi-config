@@ -26,7 +26,7 @@
     "npm:pi-ast-grep",
     "npm:@ff-labs/pi-fff"
   ],
-  "hideThinkingBlock": true,
+  "hideThinkingBlock": false,
   "steeringMode": "one-at-a-time",
   "followUpMode": "one-at-a-time",
   "enableInstallTelemetry": false,
