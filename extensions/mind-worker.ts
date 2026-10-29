@@ -1580,6 +1580,13 @@ async function sendMindIdleNotification(config: MindWorkerConfig, ctx: Extension
 		// Swallow notify-send errors
 	}
 
+	// Desktop sound: mako ignores sound hints, so play the freedesktop completion sound ourselves
+	try {
+		await execFileAsync("canberra-gtk-play", ["--id=complete"], { timeout: 5000 });
+	} catch {
+		// Swallow playback errors (no audio server, canberra missing)
+	}
+
 	// ntfy push (only when topic configured)
 	if (!config.ntfyTopic) return;
 	try {
