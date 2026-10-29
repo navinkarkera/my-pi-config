@@ -27,13 +27,17 @@ compatibility: playwright-cli (>=0.1), Playwright Extension (mmlmfjhmonkocbjadbf
 
 Use when user already has a browser tab open with the target app.
 
-Export the required env vars (especially needed for Brave Nightly):
+**Alert first, every time.** Brave shows a connection approval prompt that the user must answer, so before **every** attach attempt — including retries and reconnects — send a critical desktop alert. Commands in an existing session need no alert.
+
+Export the required env vars (especially needed for Brave Nightly) and chain the alert to the attach, so a failed notification stops the attempt instead of silently waiting on approval:
 
 ```bash
 export PLAYWRIGHT_MCP_EXECUTABLE_PATH=/usr/bin/brave-browser-nightly
 export PLAYWRIGHT_MCP_BROWSER=brave
-playwright-cli attach --extension=brave
+notify-send --urgency=critical 'Brave approval needed' 'Please switch to Brave and approve the Playwright connection request.' && playwright-cli attach --extension=brave
 ```
+
+If `notify-send` is missing or fails, tell the user in chat that the approval prompt is coming before attempting the attach. Do not install anything automatically.
 
 Output shows session name (default: `brave`) and current tab info.
 
@@ -121,8 +125,8 @@ playwright-cli -s=brave run-code 'async (page) => {
 export PLAYWRIGHT_MCP_EXECUTABLE_PATH=/usr/bin/brave-browser-nightly
 export PLAYWRIGHT_MCP_BROWSER=brave
 
-# Attach to already-open Brave
-playwright-cli attach --extension=brave
+# Attach to already-open Brave (alert first; the && stops attach if the alert fails)
+notify-send --urgency=critical 'Brave approval needed' 'Please switch to Brave and approve the Playwright connection request.' && playwright-cli attach --extension=brave
 # Session: brave
 
 # Inspect current page
