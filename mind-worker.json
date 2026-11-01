@@ -12,10 +12,8 @@
   ],
   "workerModel": "opencode-go/deepseek-v4.1-flash",
   "workerThinkingLevel": "max",
-  "terminalBackend": "herdr",
+  "terminalBackend": "hc",
   "resetTimeout": 5,
-  "kittyEnabled": false,
-  "kittyLayout": "mind-split-workers-tab",
   "workerCount": 3,
   "dashboardEnabled": true,
   "dashboardLogResponses": true,
@@ -28,10 +26,8 @@
     "maxBurst": 5,
     "idleTtlMs": 180000,
     "maxTasksPerWorker": 3,
-    "launchMode": "headless",
     "queuePressureThreshold": 1,
     "spawnWaitMs": 1000,
-    "killTimeoutMs": 2000,
     "logDetail": "compact"
   }
 }

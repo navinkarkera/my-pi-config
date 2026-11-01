@@ -75,6 +75,10 @@ minibuch/w11:p4#8h9h        minibuch  claude   walky-live             idle
   not the machine. Pick the row by MACHINE and LABEL.
 - Labels can repeat: `walky-live` is on two machines above. MACHINE tells them apart. If two rows
   still match, ask your operator.
+- A word with no `/` reaches a whole folder. `<repo>` is every agent pane in a folder of that name
+  on every machine of the crew, on any branch. `<repo>#<branch>` is the same on one branch. `here`
+  is your own folder on every machine, without your own pane. `<repo>` is the first part of LABEL,
+  such as `collie-workspace` in `collie-workspace#main`.
 - `(you)` marks your own pane. A message to it is refused.
 - STATE is `idle`, `working`, `blocked`, `done` or `unknown`, or `unreachable` for a crew member out
   of reach. A message to a `working` or `blocked` pane is not lost: Collie queues or holds it.
@@ -100,6 +104,22 @@ After `send`, end your turn. Do not poll and do not sleep. The answer is typed i
 your next prompt, with `reply to <your id>` in its header. If your pane is busy, Collie queues or holds it
 until your turn ends. `/home/navin/.local/bin/collie walky inbox` shows it too. `status` says only that your message was
 typed. It does not say the other agent read or answered it.
+
+Pick the address by who should get the message. For one agent, use its pane address and copy it from `who`.
+
+Use `here` when every agent on your project should get it, on every machine of the crew: your
+siblings in your own folder. Collie never sends it to your own pane. Use `<repo>` when you mean
+another folder by name. Use `here` or `<repo>` only when the message is for all of them. If one
+agent has what you need, ask that agent. Each pane it reaches gets its own copy and can answer.
+
+```bash
+/home/navin/.local/bin/collie walky who --here
+/home/navin/.local/bin/collie walky send here "I changed the Send Protocol. Rebase before you push."
+```
+
+`who --here` lists the panes `here` would reach. Look before you send. `send` prints one line per
+pane, then `status` adds a totals line such as `2 deliveries: delivered 2`. A machine out of reach
+prints `unreachable` and Collie does not retry it. Do not send it again.
 
 Answer a message by its id. The reply goes back to the sender.
 
@@ -151,5 +171,5 @@ limit it hit. Do not work around it.
 If the command prints `walky talky is off` or cannot find a bridge, tell your operator. Do not work
 around it.
 
-<!-- collie-skill walky-talky v1 collie 1.24.0+4bab157 -->
+<!-- collie-skill walky-talky v1 collie 1.25.3+9eeedd89b3 -->
 <!-- collie:walky-talky v1 end -->

@@ -1,72 +1,68 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Herdr-only entrypoint for the mind + worker pair.
+# hc entrypoint for the mind + worker pair. Mind replaces this terminal's shell
+# (run it with the shell builtin `exec`), static workers become direct
+# herdr-core (hc) children. No panes, no named sessions, no whole-pool reset.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_DIR="$SCRIPT_DIR/.."
 CONFIG_FILE="$AGENT_DIR/mind-worker.json"
-NODE_CMD=(mise x node@26 -- node)
+# Explicit toolchain: the launcher's Node and Mind share this resolved PATH.
+NODE_CMD=("${MISE_BIN:-/usr/bin/mise}" x node@26 -- node)
 
-BACKGROUND_FLAG=0
-RESET_FLAG=0
 PASSTHROUGH_ARGS=()
 for arg in "$@"; do
   case "$arg" in
-    --background) BACKGROUND_FLAG=1 ;;
-    --reset) RESET_FLAG=1; PASSTHROUGH_ARGS+=("$arg") ;;
+    --background)
+      echo "ERROR: Mind runs in the invoking terminal; --background is gone." >&2
+      exit 2 ;;
+    --reset)
+      echo "ERROR: Whole-pool reset is gone. Stop this root terminal and start a fresh one." >&2
+      exit 2 ;;
     *) PASSTHROUGH_ARGS+=("$arg") ;;
   esac
 done
 set -- "${PASSTHROUGH_ARGS[@]}"
 
-if [ "${MIND_WORKER_LAUNCHER_BACKGROUND:-}" = "1" ]; then
-  BACKGROUND_FLAG=1
-fi
-
-MANAGED_RESET=0
-if [ "$RESET_FLAG" = "1" ] && [ -n "${PI_MIND_WORKER_LAUNCHER_PID:-}" ] && [ -n "${PI_MIND_WORKER_LAUNCHER_TOKEN:-}" ]; then
-  MANAGED_RESET=1
-fi
-
-if [ "$BACKGROUND_FLAG" = "1" ] && [ "$MANAGED_RESET" = "0" ]; then
-  echo "ERROR: Mind now runs in the invoking pane and requires its foreground terminal; rerun bin/mind-worker-launcher without --background." >&2
+if [ -n "${MIND_WORKER_LAUNCHER_BACKGROUND:-}" ]; then
+  echo "ERROR: Mind runs in the invoking terminal; MIND_WORKER_LAUNCHER_BACKGROUND is gone." >&2
   exit 2
 fi
 
-if [ "${HERDR_ENV:-}" != "1" ]; then
-  echo "ERROR: Run bin/mind-worker-launcher from a Herdr pane (HERDR_ENV=1)." >&2
+if [ -z "${HC_TERMINAL_ID:-}" ]; then
+  echo "ERROR: HC_TERMINAL_ID is not set. Start this from a herdr-app (hc) terminal, not a plain shell." >&2
   exit 2
 fi
 
-if [ "$MANAGED_RESET" = "0" ]; then
-  if [ ! -t 0 ] || [ ! -t 1 ] || [ ! -t 2 ]; then
-    echo "ERROR: Mind must be started interactively in a Herdr pane; detached startup cannot safely take over a terminal." >&2
-    exit 2
-  fi
-  # A background job can inherit all three TTY descriptors.
-  read -r CURRENT_PGID TTY_PGID < <(ps -o pgid= -o tpgid= -p "$$" 2>/dev/null) || {
-    echo "ERROR: Cannot verify foreground terminal ownership; refusing to start Mind." >&2
-    exit 2
-  }
-  if [ -z "$CURRENT_PGID" ] || [ "$CURRENT_PGID" != "$TTY_PGID" ]; then
-    echo "ERROR: Mind must run in the foreground process group of its Herdr pane." >&2
-    exit 2
-  fi
+if [ ! -t 0 ] || [ ! -t 1 ] || [ ! -t 2 ]; then
+  echo "ERROR: Mind must be started interactively in its terminal; detached startup cannot take it over." >&2
+  exit 2
+fi
+
+# A background job can inherit all three TTY descriptors.
+read -r CURRENT_PGID TTY_PGID < <(ps -o pgid= -o tpgid= -p "$$" 2>/dev/null) || {
+  echo "ERROR: Cannot verify foreground terminal ownership; refusing to start Mind." >&2
+  exit 2
+}
+if [ -z "$CURRENT_PGID" ] || [ "$CURRENT_PGID" != "$TTY_PGID" ]; then
+  echo "ERROR: Mind must run in the foreground process group of its terminal." >&2
+  exit 2
 fi
 
 BACKEND=""
 if [ -f "$CONFIG_FILE" ]; then
   BACKEND="$("${NODE_CMD[@]}" -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf-8")).terminalBackend||"")}catch{console.log("")}' "$CONFIG_FILE" 2>/dev/null)"
 fi
-if [ "$BACKEND" != "herdr" ]; then
-  echo "ERROR: mind-worker launcher requires terminalBackend=herdr; refusing Kitty fallback." >&2
+if [ "$BACKEND" != "hc" ]; then
+  echo "ERROR: mind-worker launcher requires terminalBackend=hc; refusing any other backend." >&2
   exit 1
 fi
 
-HERDR_LAUNCHER="$AGENT_DIR/lib/mind-worker/herdr-launcher.mjs"
-if [ ! -f "$HERDR_LAUNCHER" ]; then
-  echo "ERROR: herdr launcher not found at $HERDR_LAUNCHER" >&2
+HC_LAUNCHER="$AGENT_DIR/lib/mind-worker/hc-launcher.mjs"
+if [ ! -f "$HC_LAUNCHER" ]; then
+  echo "ERROR: hc launcher not found at $HC_LAUNCHER" >&2
   exit 1
 fi
 
-exec "${NODE_CMD[@]}" "$HERDR_LAUNCHER" "$@"
+# exec keeps this PID: the launcher must be the root terminal's recorded program.
+exec "${NODE_CMD[@]}" "$HC_LAUNCHER" "$@"

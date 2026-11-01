@@ -1,6 +1,6 @@
-import { exec, execFile, spawn } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, renameSync, createWriteStream } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, renameSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -8,6 +8,12 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { CustomEditor, getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { parseGitArgs } from "../lib/mind-worker/git-command.mjs";
+// The one place that starts and retires hc terminals (argv only, no HC_* passthrough).
+import {
+	probeCoreIdentity,
+	retireWorkerTerminal,
+	spawnWorkerTerminal,
+} from "../lib/mind-worker/hc-terminal.mjs";
 // Pi's package entry does not export the ThinkingLevel union; the helper owns it.
 import { resolveThinkingLevel, type ThinkingLevel } from "../lib/mind-worker/thinking-level.mjs";
 
@@ -51,8 +57,8 @@ interface MindWorkerConfig {
 	ntfyTopic: string;
 	ntfyServer: string;
 	resetTimeout: number;
-	kittyEnabled: boolean;
-	kittyLayout?: string;
+	/** Only the hc backend exists; a legacy value is reported and ignored. */
+	terminalBackend?: "hc";
 	workerCount: number;
 	workerModels?: Array<{ model: string; count: number; tier?: string; thinkingLevel?: ThinkingLevel }>;
 	dashboardEnabled: boolean;
@@ -71,10 +77,8 @@ interface BurstFlashConfig {
 	maxBurst: number;
 	idleTtlMs: number;
 	maxTasksPerWorker: number;
-	launchMode: "headless" | "kitty";
 	queuePressureThreshold: number;
 	spawnWaitMs: number;
-	killTimeoutMs: number;
 	logDetail: "compact" | "full";
 }
 
@@ -111,10 +115,8 @@ const DEFAULT_BURST_FLASH_CONFIG: BurstFlashConfig = {
 	maxBurst: 2,
 	idleTtlMs: 180000,
 	maxTasksPerWorker: 3,
-	launchMode: "headless",
 	queuePressureThreshold: 1,
 	spawnWaitMs: 1000,
-	killTimeoutMs: 2000,
 	logDetail: "compact",
 };
 
@@ -130,8 +132,7 @@ const DEFAULT_CONFIG: MindWorkerConfig = {
 	ntfyTopic: "",
 	ntfyServer: "https://ntfy.sh",
 	resetTimeout: 5,
-	kittyEnabled: false,
-	kittyLayout: undefined,
+	terminalBackend: "hc",
 	workerCount: 3,
 	workerModels: undefined,
 	dashboardEnabled: true,
@@ -454,23 +455,192 @@ let dashboardHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let lastDashboardStatus = "";
 let lastDashboardCwd = "";
 
+// // ── Burst identity ───────────────────────────────────────────────────────────
+
+/** A child that has not handshaked by now is retired, not merely labelled. */
+const BURST_CONNECT_TIMEOUT_MS = 60_000;
+/** Bounded retirement: after these attempts the record stays tracked for the next sweep. */
+const BURST_RETIRE_RETRY_MS = [500, 1500, 3000];
+const HC_PROBE_TIMEOUT_MS = 5_000;
+const HC_LS_TIMEOUT_MS = 5_000;
+
+const sleepMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function errorMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+/** The parentless app terminal this Mind runs in; the parent of every worker. */
+function rootTerminalAddress(env: NodeJS.ProcessEnv = process.env): string | null {
+	return env.HC_TERMINAL_ID || null;
+}
+
+/** Selectors and dirs the hc CLI needs to reach the same core. Memory only, never persisted. */
+const HC_CLIENT_ENV_KEYS = [
+	"HC_SOCKET", "HC_TERMINAL_SOCKET", "HC_SESSION", "HC_SCOPE",
+	"XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "PATH", "HOME",
+];
+
+function hcClientEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+	const snapshot: Record<string, string> = {};
+	for (const key of HC_CLIENT_ENV_KEYS) {
+		const value = env[key];
+		if (typeof value === "string" && value) snapshot[key] = value;
+	}
+	return snapshot;
+}
+
+/** Without HC_SESSION or HC_SOCKET, hc silently selects the user's default core. */
+function hasCoreSelector(env: NodeJS.ProcessEnv = process.env): boolean {
+	return Boolean(env.HC_SESSION?.trim() || env.HC_SOCKET?.trim());
+}
+
+/**
+ * The core this pool belongs to. The id is the real one probed from
+ * `hc server status`; HC_SCOPE is per-terminal and is never identity.
+ */
+interface BurstCorePin {
+	readonly coreId: string;
+	readonly rootAddress: string;
+	/** Selector snapshot every later hc call reuses. Never written to disk. */
+	readonly clientEnv: Record<string, string>;
+}
+
+interface BurstManifestV2 {
+	coreId: string;
+	rootAddress: string;
+	generation: number;
+}
+
+/** Manifest v2 identity: the pool's core id and root terminal address. */
+function readBurstManifest(manifest: Record<string, unknown> | null): BurstManifestV2 | null {
+	// Exact v2 markers only: a record without them is legacy/unproven, never a burst pool.
+	if (!manifest || manifest.schemaVersion !== 2 || manifest.terminalBackend !== "hc") return null;
+	const core = (manifest as any)?.coreIdentity;
+	const coreId = typeof core?.id === "string" && core.id ? core.id : null;
+	const rootAddress = typeof (manifest as any)?.rootTerminalAddress === "string"
+		? (manifest as any).rootTerminalAddress
+		: null;
+	const generation = typeof manifest.generation === "number"
+		&& Number.isSafeInteger(manifest.generation) && manifest.generation > 0
+		? manifest.generation
+		: null;
+	if (!coreId || !rootAddress || generation === null) return null;
+	return { coreId, rootAddress, generation };
+}
+
+/**
+ * Pin the run to one core before any worker exists: an explicit selector, a live
+ * root terminal, and a probe whose id matches the manifest's core. Anything else
+ * fails closed, because a wrong core would give us addresses we cannot own.
+ */
+async function pinBurstCore(manifest: Record<string, unknown> | null): Promise<BurstCorePin | null> {
+	const env = process.env;
+	const rootAddress = rootTerminalAddress(env);
+	if (!rootAddress) {
+		logDiag("error", "[burst-flash] HC_TERMINAL_ID is not set — not a root app terminal, spawn refused");
+		return null;
+	}
+	if (!hasCoreSelector(env)) {
+		logDiag("error", "[burst-flash] HC_SESSION/HC_SOCKET is not set — refusing to run against the default core");
+		return null;
+	}
+	const v2 = readBurstManifest(manifest);
+	if (!v2) {
+		logDiag("error", "[burst-flash] manifest is not v2 (no coreIdentity.id/rootTerminalAddress) — burst spawn refused");
+		return null;
+	}
+	if (rootAddress !== v2.rootAddress) {
+		logDiag("error", `[burst-flash] HC_TERMINAL_ID ${rootAddress} is not the pool root ${v2.rootAddress} — burst spawn refused`);
+		return null;
+	}
+	const clientEnv = hcClientEnv(env);
+	let actual: Awaited<ReturnType<typeof probeCoreIdentity>>;
+	try {
+		actual = await probeCoreIdentity({ env: clientEnv, timeoutMs: HC_PROBE_TIMEOUT_MS });
+	} catch (err) {
+		logDiag("error", `[burst-flash] core probe failed: ${errorMessage(err)} — burst spawn refused`);
+		return null;
+	}
+	if (!actual?.id) {
+		logDiag("error", "[burst-flash] core probe returned no core id — burst spawn refused");
+		return null;
+	}
+	if (actual.id !== v2.coreId) {
+		logDiag("error", `[burst-flash] reached core ${actual.id}, not the pool core ${v2.coreId} — burst spawn refused`);
+		return null;
+	}
+	return { coreId: actual.id, rootAddress, clientEnv };
+}
+
+/** true = the pinned core is gone or replaced; null = cannot tell right now. */
+async function burstCoreReplaced(pin: BurstCorePin): Promise<boolean | null> {
+	try {
+		const actual = await probeCoreIdentity({ env: pin.clientEnv, timeoutMs: HC_PROBE_TIMEOUT_MS });
+		return actual.id !== pin.coreId;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Reconcile a name whose spawn reply was uncertain. The helper already retires a
+ * terminal it could prove; this covers the rest.
+ * shortcut: reads `hc ls` here instead of through the helper, which does not
+ * export its list helper yet; drop this once it does.
+ */
+async function findBurstTerminalByName(pin: BurstCorePin, name: string): Promise<string | null | undefined> {
+	// Prove the same pinned core before and after the list. Unavailable, replaced or
+	// ambiguous cores can never prove absence; only a valid list on the same core can.
+	if (await burstCoreReplaced(pin) !== false) return undefined;
+	let reply: any;
+	try {
+		const { stdout } = await execFileAsync("hc", ["ls", "--all", "--json"], {
+			env: pin.clientEnv,
+			timeout: HC_LS_TIMEOUT_MS,
+			maxBuffer: 256 * 1024,
+		});
+		reply = JSON.parse(String(stdout).trim());
+	} catch {
+		return undefined;
+	}
+	if (await burstCoreReplaced(pin) !== false) return undefined;
+	if (!Array.isArray(reply?.terminals)) return undefined;
+	const owned = reply.terminals.filter((t: any) => t?.name === name && t?.parent === pin.rootAddress && t?.state === "live");
+	if (owned.length === 0) return null;
+	if (owned.length > 1) return undefined; // ambiguous: never pick one or claim absence
+	return typeof owned[0].address === "string" ? owned[0].address : undefined;
+}
+
 // ── Burst flash workers ──────────────────────────────────────────────────────
 
+/** pending → spawned → connected → busy/idle → retiring → gone. */
+type BurstTerminalState = "pending" | "spawned" | "connected" | "busy" | "idle" | "retiring" | "gone";
+
 interface BurstWorkerState {
-	workerId: string;
-	pid: number;
-	spawnedAt: number;
+	readonly workerId: string;
+	readonly index: number;
+	readonly spawnedAt: number;
+	readonly generation: number;
+	readonly sessionDir: string;
+	readonly logPath: string;
+	terminalState: BurstTerminalState;
+	/** Authoritative address, once hc named one. */
+	address: string | null;
+	/** Unique live name, kept while a spawn reply is uncertain. */
+	name: string | null;
+	pin: BurstCorePin | null;
 	lastTaskAt: number;
 	taskCount: number;
-	sessionDir: string;
-	logPath: string;
-	process: import("node:child_process").ChildProcess | null;
 	connectedAt: number;
 	lastEvent: string;
 	lastEventAt: number;
-	launchMode: "headless" | "kitty";
-	paneTitle: string | null;
-	kittyWindowId: number | null;
+	retireReason: string | null;
+	retireAttempts: number;
+	/** The spawn attempt has concluded (address known or proven uncertain). */
+	spawnSettled: boolean;
+	/** One retirement driver per worker; a second request never starts a second kill loop. */
+	retireRunning: boolean;
 }
 
 const burstWorkers = new Map<string, BurstWorkerState>();
@@ -479,65 +649,28 @@ let burstIdleCheckTimer: ReturnType<typeof setInterval> | null = null;
 
 // ── Burst flash helpers ──────────────────────────────────────────────────────
 
-async function findKittyPanePid(title: string): Promise<{ pid: number; windowId: number } | null> {
-	return new Promise((resolve) => {
-		let child: import("node:child_process").ChildProcess;
-		try {
-			child = spawn("kitty", ["@", "ls"], { stdio: ["ignore", "pipe", "pipe"], timeout: 5000 });
-		} catch {
-			resolve(null);
-			return;
-		}
-		let stdout = "";
-		child.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
-		child.on("close", (code) => {
-			if (code !== 0) { resolve(null); return; }
-			try {
-				const osWindows = JSON.parse(stdout);
-				for (const osWin of osWindows) {
-					for (const tab of osWin.tabs || []) {
-						for (const w of tab.windows || []) {
-							if (w.title === title) {
-								resolve({ pid: w.pid, windowId: w.id });
-								return;
-							}
-						}
-					}
-				}
-			} catch { /* parse error */ }
-			resolve(null);
-		});
-		child.on("error", () => resolve(null));
-	});
-}
-
-async function closeKittyPaneByTitle(title: string): Promise<void> {
-	return new Promise((resolve) => {
-		try {
-			const child = spawn("kitty", ["@", "close-window", "--match", `title:${title}`], { stdio: "ignore", timeout: 5000 });
-			child.on("close", () => resolve());
-			child.on("error", () => resolve());
-		} catch {
-			resolve();
-		}
-	});
-}
-
-async function discoverBurstKittyPane(title: string, retries = 10, intervalMs = 500): Promise<{ pid: number; windowId: number } | null> {
-	for (let i = 0; i < retries; i++) {
-		const result = await findKittyPanePid(title);
-		if (result) return result;
-		await new Promise(r => setTimeout(r, intervalMs));
-	}
-	return null;
-}
-
 function getBurstFlashLogPath(cwd: string, n: number): string {
 	return join(getStateDir(), `${getCwdHash(cwd)}-burst-flash-${n}.log`);
 }
 
 function getBurstFlashSessionDir(cwd: string, n: number): string {
 	return join(getAgentDir(), "sessions", `burst-flash-${getCwdHash(cwd)}-${n}`);
+}
+
+/**
+ * Full cwd + instance + generation: getCwdHash prefixes a long instance label, so
+ * it cannot be the name budget. Six hex chars leave room for an unbounded index.
+ */
+function burstNameHash(cwd: string, generation: number): string {
+	return createHash("sha256")
+		.update(`${cwd}\0${INSTANCE_LABEL ?? ""}\0${generation}`)
+		.digest("hex")
+		.slice(0, 6);
+}
+
+/** `<run hash>-b<index>`: starts alphanumeric, <=32 chars, and index is not capped. */
+function burstTerminalName(runHash: string, index: number): string {
+	return `${runHash}-b${index}`;
 }
 
 function logBurstEvent(cwd: string, workerId: string, event: string, detail?: string): void {
@@ -550,9 +683,7 @@ function logBurstEvent(cwd: string, workerId: string, event: string, detail?: st
 	try {
 		const { config } = loadConfig();
 		if (config.burstFlash.logDetail === "compact" || config.burstFlash.logDetail === "full") {
-			const fd = require("node:fs").openSync(state.logPath, "a");
-			require("node:fs").writeSync(fd, line);
-			require("node:fs").closeSync(fd);
+			appendFileSync(state.logPath, line);
 		}
 	} catch { /* ignore log write errors */ }
 }
@@ -561,6 +692,17 @@ function isBurstWorker(workerId: string): boolean {
 	return workerId.startsWith("burst-flash-");
 }
 
+/**
+ * A burst may receive work only while it is tracked and not retiring/cleanup.
+ * Static workers are unchanged. A retiring burst still consumes maxBurst until gone.
+ */
+function isBurstAvailableForWork(workerId: string): boolean {
+	if (!isBurstWorker(workerId)) return true;
+	const state = burstWorkers.get(workerId);
+	return Boolean(state && state.terminalState !== "retiring" && state.terminalState !== "gone" && !state.retireReason);
+}
+
+/** Pending spawns count: the map entry exists before any hc call. */
 function countBurstWorkers(): number {
 	return burstWorkers.size;
 }
@@ -569,8 +711,7 @@ function countIdleFlashWorkers(): number {
 	let count = 0;
 	for (const [wid, conn] of workerPool) {
 		if (conn.tier === "flash" && !conn.busy && !conn.resetting && !conn.socket.destroyed) {
-			// Skip stale burst workers whose state has been cleaned up
-			if (isBurstWorker(wid) && !burstWorkers.has(wid)) continue;
+			if (!isBurstAvailableForWork(wid)) continue;
 			count++;
 		}
 	}
@@ -591,6 +732,40 @@ function countFlashEligibleQueued(cwd: string): number {
 	return pendingQueue.filter(e => !e.reset && e.cwd === cwd && (!e.tier || e.tier === "flash" || e.tier === "default")).length;
 }
 
+function ensureBurstIdleTimer(cwd: string): void {
+	if (burstIdleCheckTimer) return;
+	burstIdleCheckTimer = setInterval(() => checkBurstIdleTtl(cwd), 5000);
+}
+
+function stopBurstIdleTimer(): void {
+	if (!burstIdleCheckTimer) return;
+	clearInterval(burstIdleCheckTimer);
+	burstIdleCheckTimer = null;
+}
+
+/** Identity travels in these vars only; hc gives the child the core's own environment. */
+function burstWorkerIdentity(p: { workerId: string; generation: number; sessionDir: string }): Record<string, string> {
+	return {
+		PI_MIND_WORKER_ROLE: "worker",
+		PI_MIND_WORKER_TIER: "flash",
+		PI_MIND_WORKER_ID: p.workerId,
+		PI_MIND_WORKER_GENERATION: String(p.generation),
+		PI_MIND_WORKER_SESSION_DIR: p.sessionDir,
+		...(INSTANCE_LABEL ? { PI_MIND_WORKER_INSTANCE: INSTANCE_LABEL } : {}),
+	};
+}
+
+/** Burst program: mise/node around the installed Pi CLI, TUI only (never --mode rpc). */
+function buildBurstWorkerArgv(p: { sessionDir: string; model: string; thinking: ThinkingLevel }): string[] {
+	return [
+		"/usr/bin/mise", "x", "node@26", "--",
+		"node", PI_CLI,
+		"--model", p.model,
+		"--thinking", p.thinking,
+		"--session-dir", p.sessionDir,
+	];
+}
+
 function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 	const { config } = loadConfig();
 	if (!config.burstFlash.enabled) return;
@@ -603,197 +778,386 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 	const pressureMet = flashQueued >= config.burstFlash.queuePressureThreshold;
 	const waitMet = getOldestFlashQueueWait(cwd) >= config.burstFlash.spawnWaitMs;
 	if (!pressureMet && !waitMet) return;
-	// Spawn
-	const n = ++burstCounter;
-	const workerId = `burst-flash-${n}`;
-	const sessionDir = getBurstFlashSessionDir(cwd, n);
-	const logPath = getBurstFlashLogPath(cwd, n);
+
+	const index = ++burstCounter;
 	const manifest = readManifest(cwd);
-	const generation = manifest?.generation ?? 0;
-	// Ensure dirs
-	try { mkdirSync(sessionDir, { recursive: true }); } catch { /* may exist */ }
-	try { mkdirSync(dirname(logPath), { recursive: true }); } catch { /* may exist */ }
-	// Build env: inherit but override mind-worker identity vars
-	const env: Record<string, string> = {};
-	for (const [k, v] of Object.entries(process.env)) {
-		if (v !== undefined && (!k.startsWith("PI_MIND_WORKER_") || k === "PI_MIND_WORKER_INSTANCE")) {
-			env[k] = v;
-		}
-	}
-	env.PI_MIND_WORKER_ROLE = "worker";
-	env.PI_MIND_WORKER_TIER = "flash";
-	env.PI_MIND_WORKER_ID = workerId;
-	env.PI_MIND_WORKER_GENERATION = String(generation);
-	env.PI_MIND_WORKER_SESSION_DIR = sessionDir;
-	const model = config.burstFlash.model;
-	const thinking = config.burstFlash.thinkingLevel;
-	const hash = getCwdHash(cwd);
-	const paneTitle = `burst-flash-${hash}-${n}`;
-	// Decide: kitty or headless?
-	if (config.burstFlash.launchMode !== "kitty") {
-		spawnBurstHeadless({ n, workerId, cwd, sessionDir, logPath, model, thinking, generation, env });
-		return;
-	}
-	// ── Kitty launch path ──
-	let fellBack = false;
-	const fallbackToHeadless = (reason: string) => {
-		if (fellBack) return;
-		fellBack = true;
-		logDiag("error", `[burst-flash] ${workerId}: ${reason}, falling back to headless`);
-		burstWorkers.delete(workerId);
-		spawnBurstHeadless({ n, workerId, cwd, sessionDir, logPath, model, thinking, generation, env });
-	};
-	const kittyArgs = [
-		"@", "launch",
-		"--location", "hsplit",
-		"--title", paneTitle,
-		"--cwd", cwd,
-		"--env", `PI_MIND_WORKER_ROLE=worker`,
-		"--env", `PI_MIND_WORKER_TIER=flash`,
-		"--env", `PI_MIND_WORKER_ID=${workerId}`,
-		"--env", `PI_MIND_WORKER_GENERATION=${String(generation)}`,
-		...(INSTANCE_LABEL ? ["--env", `PI_MIND_WORKER_INSTANCE=${INSTANCE_LABEL}`] : []),
-		"--env", `PI_MIND_WORKER_SESSION_DIR=${sessionDir}`,
-		"--env", `PATH=${process.env.PATH || ""}`,
-		PI_CLI, "--mode", "rpc", "--model", model, "--thinking", thinking, "--session-dir", sessionDir,
-	];
-	// Best-effort focus mind window before launching split
-	const mindTitle = `mind-${hash}`;
-	try {
-		const focusChild = spawn("kitty", ["@", "focus-window", "--match", `title:${mindTitle}`], { stdio: "ignore", timeout: 3000 });
-		focusChild.on("error", () => { /* best-effort */ });
-	} catch { /* best-effort */ }
-	let child: import("node:child_process").ChildProcess;
-	try {
-		child = spawn("kitty", kittyArgs, { stdio: "ignore", timeout: 10000 });
-	} catch (err: any) {
-		fallbackToHeadless(`kitty spawn threw synchronously: ${err.message}`);
-		return;
-	}
-	// Insert state first so workers list is accurate
 	const state: BurstWorkerState = {
-		workerId,
-		pid: 0,
+		workerId: `burst-flash-${index}`,
+		index,
 		spawnedAt: Date.now(),
+		generation: typeof manifest?.generation === "number" ? manifest.generation : 0,
+		sessionDir: getBurstFlashSessionDir(cwd, index),
+		logPath: getBurstFlashLogPath(cwd, index),
+		terminalState: "pending",
+		address: null,
+		name: null,
+		pin: null,
 		lastTaskAt: Date.now(),
 		taskCount: 0,
-		sessionDir,
-		logPath,
-		process: null,
 		connectedAt: 0,
-		lastEvent: "spawned (kitty)",
+		lastEvent: "pending",
 		lastEventAt: Date.now(),
-		launchMode: "kitty",
-		paneTitle,
-		kittyWindowId: null,
+		retireReason: null,
+		retireAttempts: 0,
+		spawnSettled: false,
+		retireRunning: false,
 	};
-	burstWorkers.set(workerId, state);
-	logBurstEvent(cwd, workerId, "spawned", `mode=kitty title=${paneTitle} model=${model}`);
-	logDiag("error", `[burst-flash] spawned ${workerId} in kitty pane ${paneTitle}`);
-	child.on("error", (err) => fallbackToHeadless(`kitty spawn error: ${err.message}`));
-	child.on("close", (code) => {
-		if (code !== 0) fallbackToHeadless(`kitty @ launch exit code ${code}`);
-	});
-	// Discover PID asynchronously (abort if fell back or state no longer kitty)
-	discoverBurstKittyPane(paneTitle, 10, 500).then((result) => {
-		if (fellBack) return;
-		if (!burstWorkers.has(workerId)) return;
-		const s = burstWorkers.get(workerId)!;
-		if (s.launchMode !== "kitty") return;
-		if (result) {
-			s.pid = result.pid;
-			s.kittyWindowId = result.windowId;
-			s.lastEvent = `pid discovered: ${result.pid}`;
-			s.lastEventAt = Date.now();
-			logBurstEvent(cwd, workerId, "pid-discovered", `pid=${result.pid} windowId=${result.windowId}`);
-			logDiag("error", `[burst-flash] ${workerId} pid=${result.pid} windowId=${result.windowId}`);
-		} else {
-			s.lastEvent = "pid discovery failed";
-			s.lastEventAt = Date.now();
-			logBurstEvent(cwd, workerId, "pid-discovery-failed", "tracking by title only");
-			logDiag("warn", `[burst-flash] ${workerId} PID discovery failed, tracking by title only`);
-		}
-	}).catch((err) => {
-		logDiag("warn", `[burst-flash] ${workerId} PID discovery error: ${err?.message ?? err}`);
-	});
-	if (!burstIdleCheckTimer) {
-		burstIdleCheckTimer = setInterval(() => checkBurstIdleTtl(cwd), 5000);
+	// Reserved before any probe or hc call, so a pending spawn counts against maxBurst.
+	burstWorkers.set(state.workerId, state);
+	// Persist the counter and the pending entry before the async spawn: a reload can
+	// never reuse this id/name even if the process dies before the next heartbeat.
+	writeControlFileStatus(cwd, lastDashboardStatus || "ready");
+	ensureBurstIdleTimer(cwd);
+	void spawnBurstWorker(state, cwd, manifest, config);
+}
+
+async function spawnBurstWorker(
+	state: BurstWorkerState,
+	cwd: string,
+	manifest: Record<string, unknown> | null,
+	config: MindWorkerConfig,
+): Promise<void> {
+	const pin = await pinBurstCore(manifest);
+	const current = burstWorkers.get(state.workerId) === state;
+	if (!pin) {
+		if (current) burstWorkers.delete(state.workerId);
+		if (burstWorkers.size === 0) stopBurstIdleTimer();
+		return;
 	}
+	if (!current) return; // a newer run owns this worker id: never touch it
+	state.pin = pin;
+	if (state.retireReason) {
+		// Retired while pinning: nothing was spawned yet, so there is nothing to retire.
+		logBurstEvent(cwd, state.workerId, "gone", `retired before spawn (${state.retireReason})`);
+		burstWorkers.delete(state.workerId);
+		if (burstWorkers.size === 0) stopBurstIdleTimer();
+		return;
+	}
+	const name = burstTerminalName(burstNameHash(cwd, state.generation), state.index);
+	state.name = name;
+	try { mkdirSync(state.sessionDir, { recursive: true }); } catch { /* may exist */ }
+	try { mkdirSync(dirname(state.logPath), { recursive: true }); } catch { /* may exist */ }
+	logBurstEvent(cwd, state.workerId, "spawn", `name=${name} model=${config.burstFlash.model}`);
+	logDiag("error", `[burst-flash] spawning ${state.workerId} terminal=${name} model=${config.burstFlash.model}`);
+
+	try {
+		const { address } = await spawnWorkerTerminal({
+			rootAddress: pin.rootAddress,
+			name,
+			cwd,
+			argv: buildBurstWorkerArgv({
+				sessionDir: state.sessionDir,
+				model: config.burstFlash.model,
+				thinking: config.burstFlash.thinkingLevel,
+			}),
+			env: burstWorkerIdentity({
+				workerId: state.workerId,
+				generation: state.generation,
+				sessionDir: state.sessionDir,
+			}),
+			clientEnv: pin.clientEnv,
+			expectedCoreId: pin.coreId,
+			timeoutMs: Math.min(BURST_CONNECT_TIMEOUT_MS, 15_000),
+		});
+		onBurstSpawned(state, address, cwd);
+	} catch (err) {
+		onBurstSpawnFailed(state, err, cwd);
+	}
+}
+
+/** The pool envelope/env root this spawn started under must still be the live one. */
+function burstSpawnResultStale(state: BurstWorkerState, cwd: string): boolean {
+	if (!state.pin) return true;
+	const v2 = readBurstManifest(readManifest(cwd));
+	if (!v2) return true;
+	if (state.generation !== v2.generation) return true;
+	if (state.pin.coreId !== v2.coreId) return true;
+	if (state.pin.rootAddress !== v2.rootAddress) return true;
+	if (rootTerminalAddress(process.env) !== state.pin.rootAddress) return true;
+	return false;
+}
+
+/** Only a run that still owns this state and envelope may mutate it. */
+function onBurstSpawned(state: BurstWorkerState, address: string, cwd: string): void {
+	if (burstWorkers.get(state.workerId) !== state) {
+		// A newer run owns the id: retire only what the pinned OLD core still owns.
+		void retireOldOwnedAddress(address, state.pin);
+		return;
+	}
+	if (burstSpawnResultStale(state, cwd)) {
+		// The envelope changed mid-pending: never adopt the result into this map. Mark the
+		// old attempt settled (cleanup only) and retire its pinned OLD-owned address.
+		state.spawnSettled = true;
+		void retireOldOwnedAddress(address, state.pin);
+		if (state.retireReason) retireBurstFlash(state.workerId, state.retireReason);
+		return;
+	}
+	state.address = address;
+	state.terminalState = "spawned";
+	state.spawnSettled = true;
+	state.lastEvent = `spawned ${address}`;
+	state.lastEventAt = Date.now();
+	logBurstEvent("", state.workerId, "spawned", `address=${address}`);
+	// A retirement that started before this reply now has an address to act on.
+	if (state.retireReason) retireBurstFlash(state.workerId, state.retireReason);
+}
+
+function onBurstSpawnFailed(state: BurstWorkerState, err: unknown, cwd: string): void {
+	const message = errorMessage(err);
+	const unconfirmed = (err as { spawnPending?: boolean } | null)?.spawnPending === true;
+	if (burstWorkers.get(state.workerId) !== state) {
+		// Never mutate newer state. A stale unconfirmed failure may have left a
+		// name-only terminal on the OLD root; retire it only if that core still answers.
+		if (unconfirmed && state.pin && state.name) void retireOldOwnedName(state.pin, state.name);
+		logDiag("warn", `[burst-flash] ${state.workerId} stale spawn ${unconfirmed ? "unconfirmed" : "failed"}: ${message}`);
+		return;
+	}
+	if (burstSpawnResultStale(state, cwd)) {
+		// The old attempt is over, but its result is not this map's. Never adopt it; settle
+		// only the old state so cleanup can reconcile the pinned OLD-owned name/address.
+		if (unconfirmed) {
+			state.spawnSettled = true;
+			if (state.retireReason) retireBurstFlash(state.workerId, state.retireReason);
+			if (state.pin && state.name) void retireOldOwnedName(state.pin, state.name);
+		} else {
+			// Deterministic pre-spawn failure: no terminal exists, so the old entry may go.
+			burstWorkers.delete(state.workerId);
+			if (burstWorkers.size === 0) stopBurstIdleTimer();
+		}
+		logDiag("warn", `[burst-flash] ${state.workerId} stale spawn ${unconfirmed ? "unconfirmed" : "failed"}: ${message}`);
+		return;
+	}
+	if (unconfirmed) {
+		// hc may have created the terminal: keep it tracked and reconcile by name later.
+		state.spawnSettled = true;
+		state.lastEvent = `spawn unconfirmed: ${message}`;
+		state.lastEventAt = Date.now();
+		logBurstEvent("", state.workerId, "spawn-unconfirmed", state.name ?? "");
+		// A retirement that started before this settled now has a name to reconcile.
+		if (state.retireReason) retireBurstFlash(state.workerId, state.retireReason);
+	} else {
+		state.lastEvent = `spawn failed: ${message}`;
+		state.lastEventAt = Date.now();
+		logBurstEvent("", state.workerId, "spawn-failed", message);
+		// Deterministic failure: forget it. Queued work stays queued for a static worker.
+		burstWorkers.delete(state.workerId);
+		if (burstWorkers.size === 0) stopBurstIdleTimer();
+	}
+	logDiag("error", `[burst-flash] ${state.workerId} spawn ${unconfirmed ? "unconfirmed" : "failed"}: ${message}`);
+}
+
+/** A stale name-only failure: retire the terminal only if the OLD core still answers. */
+async function retireOldOwnedName(pin: BurstCorePin, name: string): Promise<void> {
+	const replaced = await burstCoreReplaced(pin);
+	if (replaced !== false) return; // restarted or unknowable: addresses mean nothing
+	const found = await findBurstTerminalByName(pin, name);
+	if (typeof found !== "string") return;
+	await retireOldOwnedAddress(found, pin);
+}
+
+/** A late success may only kill an address the pinned OLD core still owns. */
+async function retireOldOwnedAddress(address: string, pin: BurstCorePin | null): Promise<void> {
+	if (!pin) return;
+	const replaced = await burstCoreReplaced(pin);
+	if (replaced !== false) return; // restarted or unknowable: addresses mean nothing
+	try {
+		await retireWorkerTerminal(address, {
+			env: pin.clientEnv,
+			expectedCoreId: pin.coreId,
+			rootAddress: pin.rootAddress,
+			timeoutMs: HC_PROBE_TIMEOUT_MS,
+		});
+		logDiag("warn", `[burst-flash] retired stale terminal ${address}`);
+	} catch { /* already gone or not proven ours: drop the result */ }
 }
 
 function checkBurstIdleTtl(cwd: string): void {
 	const { config } = loadConfig();
 	const now = Date.now();
-	for (const [workerId, state] of burstWorkers) {
-		const conn = workerPool.get(workerId);
-		if (!conn || conn.socket.destroyed) {
-			// Worker disconnected, cleanup
-			burstWorkers.delete(workerId);
-			continue;
+	const connectTimeoutMs = Math.min(BURST_CONNECT_TIMEOUT_MS, Math.max(1, config.burstFlash.idleTtlMs));
+	for (const state of burstWorkers.values()) {
+		if (state.terminalState === "retiring") continue; // its own bounded retry loop owns it
+		const conn = workerPool.get(state.workerId);
+		const connected = !!conn && !conn.socket.destroyed;
+		if (connected) {
+			state.terminalState = conn!.busy ? "busy" : "idle";
+			if (conn!.busy) {
+				state.lastTaskAt = now;
+				continue;
+			}
+		} else if (state.terminalState !== "pending" && state.terminalState !== "spawned") {
+			state.terminalState = "spawned";
 		}
-		if (conn.busy) {
-			state.lastTaskAt = now;
+		// Never connected, auth-blocked or disconnected: retire it instead of labelling it.
+		if (!connected && now - state.spawnedAt >= connectTimeoutMs) {
+			retireBurstFlash(state.workerId, "connect-timeout");
 			continue;
 		}
 		// Check idle TTL
-		const idleMs = now - state.lastTaskAt;
-		if (idleMs >= config.burstFlash.idleTtlMs) {
-			retireBurstFlash(workerId, "idle-ttl");
+		if (now - state.lastTaskAt >= config.burstFlash.idleTtlMs) {
+			retireBurstFlash(state.workerId, "idle-ttl");
 			continue;
 		}
 		// Check max tasks
 		if (state.taskCount >= config.burstFlash.maxTasksPerWorker) {
-			retireBurstFlash(workerId, "max-tasks");
+			retireBurstFlash(state.workerId, "max-tasks");
 			continue;
 		}
 	}
 	// Stop timer if no burst workers remain
-	if (burstWorkers.size === 0 && burstIdleCheckTimer) {
-		clearInterval(burstIdleCheckTimer);
-		burstIdleCheckTimer = null;
-	}
+	if (burstWorkers.size === 0) stopBurstIdleTimer();
 }
 
 function retireBurstFlash(workerId: string, reason: string): void {
 	const state = burstWorkers.get(workerId);
 	if (!state) return;
+	state.retireReason = reason;
 	state.lastEvent = `retire: ${reason}`;
 	state.lastEventAt = Date.now();
-	logDiag("error", `[burst-flash] retiring ${workerId} reason=${reason} tasks=${state.taskCount}`);
+	if (state.retireRunning) return; // the running driver re-reads the state, so it retires too
+	state.terminalState = "retiring";
+	state.retireAttempts = 0;
+	logDiag("error", `[burst-flash] retiring ${workerId} reason=${reason} tasks=${state.taskCount} address=${state.address ?? "pending"}`);
 	logBurstEvent("", workerId, "retire", reason);
-	// Stop sequence: socket shutdown -> (kitty close if kitty mode) -> SIGTERM -> SIGKILL
+	// The socket is this Mind's link, not the kill switch: end it, then retire the terminal.
 	const conn = workerPool.get(workerId);
 	if (conn && !conn.socket.destroyed) {
 		try { conn.socket.end(); } catch { /* ignore */ }
 	}
-	const { config } = loadConfig();
-	if (state.launchMode === "kitty" && state.paneTitle) {
-		// Kitty mode: close pane, then kill PID if known
-		closeKittyPaneByTitle(state.paneTitle).catch(() => {});
-		setTimeout(() => {
-			if (state.pid > 0) {
-				try { process.kill(state.pid, "SIGTERM"); } catch { /* ignore */ }
-				setTimeout(() => {
-					try { process.kill(state.pid, "SIGKILL"); } catch { /* ignore */ }
-				}, config.burstFlash.killTimeoutMs);
-			}
-		}, 500);
-	} else {
-		// Headless mode: existing logic
-		setTimeout(() => {
-			if (state.process && !state.process.killed) {
-				try { state.process.kill("SIGTERM"); } catch { /* ignore */ }
-			}
-			setTimeout(() => {
-				if (state.process && !state.process.killed) {
-					try { state.process.kill("SIGKILL"); } catch { /* ignore */ }
+	void driveBurstRetirement(state);
+}
+
+/**
+ * One driver per worker: a retirement that starts before the spawn reply and one that
+ * starts after it must not both kill. Bounded at every await, never kills on a guess.
+ */
+async function driveBurstRetirement(state: BurstWorkerState): Promise<void> {
+	if (state.retireRunning) return;
+	state.retireRunning = true;
+	try {
+		const pin = state.pin;
+		if (!pin) {
+			// Pinning never finished, so no terminal can exist yet.
+			finishBurstRetirement(state, null);
+			return;
+		}
+		// Wait for the spawn attempt to say what it created, or to be provably absent.
+		const settleDeadline = Date.now() + BURST_CONNECT_TIMEOUT_MS;
+		while (!state.address && !state.spawnSettled && Date.now() < settleDeadline) {
+			if (burstWorkers.get(state.workerId) !== state) return;
+			await sleepMs(100);
+		}
+		if (burstWorkers.get(state.workerId) !== state) return;
+		if (!state.address) {
+			if (!state.spawnSettled) {
+				// The old attempt is not proven settled. A name absence is not proof, but a
+				// terminal found by its unique pinned name may still be retired.
+				const found = state.name ? await findBurstTerminalByName(pin, state.name) : null;
+				if (typeof found === "string") {
+					state.address = found;
+				} else {
+					state.terminalState = "pending";
+					state.lastEvent = state.name
+						? "retire pending: spawn not settled"
+						: "retire pending: no name or address";
+					state.lastEventAt = Date.now();
+					logDiag("warn", `[burst-flash] ${state.workerId} retire pending: spawn not settled, kept tracked`);
+					return;
 				}
-			}, config.burstFlash.killTimeoutMs);
-		}, 500); // Give socket close a moment
+			} else {
+				const resolved = await resolveBurstAddress(state, pin);
+				if (burstWorkers.get(state.workerId) !== state) return;
+				if (resolved.absent) {
+					// No live terminal carries our unique name on the pinned core: it is gone.
+					logBurstEvent("", state.workerId, "gone", state.name ?? "");
+					finishBurstRetirement(state, null);
+					return;
+				}
+				if (!resolved.address) {
+					// The core cannot answer, so nothing is proven: stay tracked for a later retry
+					// instead of declaring a possible terminal gone.
+					state.terminalState = "pending";
+					state.lastEvent = "retire unresolved: core unavailable";
+					state.lastEventAt = Date.now();
+					logDiag("warn", `[burst-flash] ${state.workerId} retire unresolved: core unavailable, kept tracked`);
+					return;
+				}
+				state.address = resolved.address;
+			}
+		}
+		const address = state.address;
+		for (let attempt = 0; attempt < BURST_RETIRE_RETRY_MS.length; attempt++) {
+			if (burstWorkers.get(state.workerId) !== state) return;
+			if (attempt > 0) await sleepMs(BURST_RETIRE_RETRY_MS[attempt]);
+			state.retireAttempts = attempt + 1;
+			try {
+				// --rm: the first successful kill reports not_found ("was removed"); the helper
+				// accepts that and confirms death with bounded hc get polling on the pinned core.
+				await retireWorkerTerminal(address, {
+					env: pin.clientEnv,
+					expectedCoreId: pin.coreId,
+					rootAddress: pin.rootAddress,
+					timeoutMs: HC_PROBE_TIMEOUT_MS,
+				});
+				finishBurstRetirement(state, address);
+				return;
+			} catch (err) {
+				const kind = (err as { kind?: string } | null)?.kind ?? null;
+				if (kind === "not_owned") {
+					// The address belongs to someone else now, so our terminal is already gone.
+					finishBurstRetirement(state, address);
+					return;
+				}
+				if (kind === "core_mismatch" || kind === "unavailable" || kind === "selector_required") {
+					const replaced = await burstCoreReplaced(pin);
+					if (replaced === true) {
+						// Only a proven core-id replacement proves its children are gone.
+						finishBurstRetirement(state, address);
+						return;
+					}
+					// Unavailable/unknown core: keep the terminal tracked for a later retry.
+				}
+				logDiag("warn", `[burst-flash] ${state.workerId} retire attempt ${attempt + 1} failed for ${address}: ${errorMessage(err)}`);
+			}
+		}
+		// Bounded schedule exhausted and the terminal still reports live: stay tracked so the
+		// next sweep (idle TTL or stop-mind) retries. Never a silent leak, never a kill loop.
+		state.terminalState = "spawned";
+		state.lastEvent = `retire failed: ${state.retireReason ?? "unknown"}`;
+		state.lastEventAt = Date.now();
+		logBurstEvent("", state.workerId, "retire failed", `${state.retireReason ?? "unknown"} after ${BURST_RETIRE_RETRY_MS.length} attempts`);
+		logDiag("warn", `[burst-flash] ${state.workerId} still tracked after ${BURST_RETIRE_RETRY_MS.length} retire attempts`);
+	} finally {
+		state.retireRunning = false;
 	}
-	burstWorkers.delete(workerId);
-	// Cleanup session dir best-effort
-	try { require("node:fs").rmSync(state.sessionDir, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+/** Reconcile a name-only entry against the pinned core. */
+async function resolveBurstAddress(
+	state: BurstWorkerState,
+	pin: BurstCorePin,
+): Promise<{ address?: string; absent?: boolean }> {
+	if (!state.name) return { absent: true }; // nothing was ever spawned
+	for (let attempt = 0; attempt < BURST_RETIRE_RETRY_MS.length; attempt++) {
+		if (attempt > 0) await sleepMs(BURST_RETIRE_RETRY_MS[attempt]);
+		if (burstWorkers.get(state.workerId) !== state) return { absent: true };
+		// A restarted core cannot own our address: the terminal went with the old core.
+		if (await burstCoreReplaced(pin) === true) return { absent: true };
+		const found = await findBurstTerminalByName(pin, state.name);
+		if (typeof found === "string") return { address: found };
+		if (found === null) return { absent: true };
+		// undefined: unknown (unavailable, replaced, ambiguous or malformed list) —
+		// keep trying; never declare a possible terminal gone from an unproven core.
+	}
+	return {}; // unknown: never claim a possible terminal is gone
+}
+
+function finishBurstRetirement(state: BurstWorkerState, address: string | null): void {
+	if (burstWorkers.get(state.workerId) !== state) return;
+	logBurstEvent("", state.workerId, "retired", address ?? state.name ?? "");
+	// Transcript and session directories are never deleted here.
+	burstWorkers.delete(state.workerId);
+	if (burstWorkers.size === 0) stopBurstIdleTimer();
 }
 
 function retireAllBurstFlash(reason: string): void {
@@ -802,87 +1166,13 @@ function retireAllBurstFlash(reason: string): void {
 	}
 }
 
-interface SpawnHeadlessParams {
-	n: number;
-	workerId: string;
-	cwd: string;
-	sessionDir: string;
-	logPath: string;
-	model: string;
-	thinking: ThinkingLevel;
-	generation: number;
-	env: Record<string, string>;
-}
-
-function spawnBurstHeadless(p: SpawnHeadlessParams): void {
-	const { n, workerId, cwd, sessionDir, logPath, model, thinking, generation, env } = p;
-	let child: import("node:child_process").ChildProcess;
-	try {
-		child = spawn(PI_CLI, ["--mode", "rpc", "--model", model, "--thinking", thinking, "--session-dir", sessionDir], {
-			env,
-			cwd,
-			stdio: ["pipe", "pipe", "pipe"],
-			detached: false,
-		});
-	} catch (err: any) {
-		const syncErrMsg = `[burst-flash] ${workerId}: headless spawn threw synchronously: ${err.message}`;
-		logDiag("error", syncErrMsg);
-		appendFileSync(logPath, syncErrMsg + "\n");
-		burstWorkers.delete(workerId);
-		return;
-	}
-	child.on("error", (err) => {
-		const errMsg = `[burst-flash] ${workerId}: headless spawn error: ${err.message}`;
-		logDiag("error", errMsg);
-		appendFileSync(logPath, errMsg + "\n");
-		burstWorkers.delete(workerId);
-		try { require("node:fs").rmSync(sessionDir, { recursive: true, force: true }); } catch { /* ignore */ }
-	});
-	if (!child.pid) {
-		logDiag("error", `[burst-flash] spawn failed: no pid for ${workerId}`);
-		return;
-	}
-	const state: BurstWorkerState = {
-		workerId,
-		pid: child.pid,
-		spawnedAt: Date.now(),
-		lastTaskAt: Date.now(),
-		taskCount: 0,
-		sessionDir,
-		logPath,
-		process: child,
-		connectedAt: 0,
-		lastEvent: "spawned",
-		lastEventAt: Date.now(),
-		launchMode: "headless",
-		paneTitle: null,
-		kittyWindowId: null,
-	};
-	burstWorkers.set(workerId, state);
-	const logStream = createWriteStream(logPath, { flags: "a" });
-	logStream.on("error", (err) => logDiag("warn", `[burst-flash] ${workerId}: log stream error: ${err.message}`));
-	if (child.stdout) child.stdout.pipe(logStream, { end: false });
-	if (child.stderr) child.stderr.pipe(logStream, { end: false });
-	child.on("exit", (code, signal) => {
-		const reason = signal ? `signal=${signal}` : `code=${code}`;
-		state.lastEvent = `exited ${reason}`;
-		state.lastEventAt = Date.now();
-		logDiag("error", `[burst-flash] ${workerId} exited code=${code} signal=${signal}`);
-		logStream.end();
-		burstWorkers.delete(workerId);
-		try { require("node:fs").rmSync(sessionDir, { recursive: true, force: true }); } catch { /* ignore */ }
-	});
-	logBurstEvent(cwd, workerId, "spawned", `pid=${child.pid} model=${model}`);
-	logDiag("error", `[burst-flash] spawned ${workerId} pid=${child.pid}`);
-	if (!burstIdleCheckTimer) {
-		burstIdleCheckTimer = setInterval(() => checkBurstIdleTtl(cwd), 5000);
-	}
-}
-
 function onBurstWorkerConnected(workerId: string): void {
 	const state = burstWorkers.get(workerId);
 	if (state) {
 		state.connectedAt = Date.now();
+		// A cleanup-only (retiring) burst never becomes idle work.
+		if (state.terminalState === "retiring" || state.retireReason) return;
+		state.terminalState = "connected";
 		state.lastEvent = "connected";
 		state.lastEventAt = Date.now();
 	}
@@ -893,8 +1183,134 @@ function onBurstWorkerTaskStart(workerId: string): void {
 	if (state) {
 		state.taskCount++;
 		state.lastTaskAt = Date.now();
+		state.terminalState = "busy";
 		state.lastEvent = `task-start (#${state.taskCount})`;
 		state.lastEventAt = Date.now();
+	}
+}
+
+/** Every tracked burst, pending and disconnected included, as the durable dashboard view. */
+function burstControlEntries(): Array<Record<string, unknown>> {
+	return [...burstWorkers.values()].map((state) => ({
+		workerId: state.workerId,
+		index: state.index,
+		name: state.name,
+		address: state.address,
+		terminalState: state.terminalState,
+		generation: state.generation,
+		// Ownership metadata for a later module; never the client env or a secret.
+		coreId: state.pin?.coreId ?? null,
+		rootAddress: state.pin?.rootAddress ?? null,
+		spawnedAt: state.spawnedAt,
+		spawnSettled: state.spawnSettled,
+		retireReason: state.retireReason,
+		sessionDir: state.sessionDir,
+		logFile: state.logPath,
+		taskCount: state.taskCount,
+		lastEvent: state.lastEvent,
+	}));
+}
+
+interface PersistedBurstSnapshot {
+	entries: any[];
+	counter: number;
+	envelope: { coreId: string; rootAddress: string; generation: number } | null;
+}
+
+/** Read the durable burst snapshot BEFORE startMindServer/heartbeat overwrites it. */
+function readPersistedBurstSnapshot(cwd: string): PersistedBurstSnapshot {
+	try {
+		const control = JSON.parse(readFileSync(getControlFilePath(cwd), "utf-8"));
+		const entries = Array.isArray(control?.burstWorkers) ? control.burstWorkers : [];
+		const counter = typeof control?.burstCounter === "number"
+			&& Number.isSafeInteger(control.burstCounter) && control.burstCounter >= 0
+			? control.burstCounter
+			: 0;
+		const raw = control?.burstEnvelope;
+		const envelope = raw && typeof raw.coreId === "string" && raw.coreId
+			&& typeof raw.rootAddress === "string" && raw.rootAddress
+			&& typeof raw.generation === "number"
+			? { coreId: raw.coreId, rootAddress: raw.rootAddress, generation: raw.generation }
+			: null;
+		return { entries, counter, envelope };
+	} catch {
+		return { entries: [], counter: 0, envelope: null };
+	}
+}
+
+/** Restore the monotonic counter synchronously, before any new spawn can use it. */
+function restoreBurstCounter(snapshot: PersistedBurstSnapshot): void {
+	let highest = snapshot.counter;
+	for (const entry of snapshot.entries) {
+		const fromEntry = typeof entry?.index === "number"
+			? entry.index
+			: Number(String(entry?.workerId ?? "").replace(/^burst-flash-/, ""));
+		if (Number.isSafeInteger(fromEntry) && fromEntry > highest) highest = fromEntry;
+	}
+	if (highest > burstCounter) burstCounter = highest;
+}
+
+/**
+ * /reload re-evaluates this module and loses the map. The snapshot was taken
+ * before the heartbeat could overwrite it; adopt only entries the envelope and
+ * core prove this pool still owns, and retire them — never idle work, never a
+ * task or agent restart.
+ */
+async function adoptPersistedBursts(cwd: string, snapshot: PersistedBurstSnapshot): Promise<void> {
+	if (burstWorkers.size > 0) return;
+	if (!snapshot.envelope || snapshot.entries.length === 0) return;
+	const manifest = readManifest(cwd);
+	const v2 = readBurstManifest(manifest);
+	if (!v2) return;
+	if (v2.coreId !== snapshot.envelope.coreId
+		|| v2.rootAddress !== snapshot.envelope.rootAddress
+		|| v2.generation !== snapshot.envelope.generation) {
+		logDiag("warn", "[burst-flash] persisted burst snapshot belongs to another pool envelope — not adopted");
+		return;
+	}
+	// The envelope/manifest match already proves the pool. Do not require a live probe
+	// here: an unavailable core must not lose the durable cleanup record. Every later
+	// retirement still pins this core id and fails closed on a mismatch.
+	if (!hasCoreSelector(process.env)) return;
+	if (rootTerminalAddress(process.env) !== v2.rootAddress) return;
+	const pin: BurstCorePin = { coreId: v2.coreId, rootAddress: v2.rootAddress, clientEnv: hcClientEnv(process.env) };
+	let adopted = 0;
+	for (const entry of snapshot.entries) {
+		if (!entry || typeof entry.workerId !== "string" || !entry.workerId) continue;
+		const name = typeof entry.name === "string" && entry.name ? entry.name : null;
+		const address = typeof entry.address === "string" && entry.address ? entry.address : null;
+		if (!name && !address) continue; // nothing was ever spawned
+		if (entry.coreId !== pin.coreId || entry.rootAddress !== pin.rootAddress) continue;
+		if (typeof entry.generation === "number" && entry.generation !== v2.generation) continue;
+		const state: BurstWorkerState = {
+			workerId: entry.workerId,
+			index: typeof entry.index === "number" ? entry.index : 0,
+			spawnedAt: typeof entry.spawnedAt === "number" ? entry.spawnedAt : Date.now(),
+			generation: typeof entry.generation === "number" ? entry.generation : v2.generation,
+			sessionDir: typeof entry.sessionDir === "string" ? entry.sessionDir : "",
+			logPath: typeof entry.logFile === "string" ? entry.logFile : "",
+			terminalState: "retiring",
+			address,
+			name,
+			pin,
+			lastTaskAt: Date.now(),
+			taskCount: typeof entry.taskCount === "number" ? entry.taskCount : 0,
+			connectedAt: 0,
+			lastEvent: "adopted for reload cleanup",
+			lastEventAt: Date.now(),
+			retireReason: "reload-cleanup",
+			retireAttempts: 0,
+			spawnSettled: entry.spawnSettled === true,
+			retireRunning: false,
+		};
+		burstWorkers.set(state.workerId, state);
+		adopted += 1;
+		// Cleanup only: drive a targeted retirement; never dispatch or resume work.
+		retireBurstFlash(state.workerId, "reload-cleanup");
+	}
+	if (adopted > 0) {
+		logDiag("warn", `[burst-flash] adopted ${adopted} tracked terminal(s) for reload cleanup`);
+		ensureBurstIdleTimer(cwd);
 	}
 }
 
@@ -921,9 +1337,11 @@ function trySpawnBurstFlashWithRetry(cwd: string, ctx: ExtensionContext): void {
 		burstRetryTimers.delete(key);
 		const { config: cfg } = loadConfig();
 		const queued = countFlashEligibleQueued(cwd);
-		// Reserved = burst workers pending connection or connected idle (not busy)
+		// Reserved = non-cleanup burst workers pending connection or connected idle.
+		// Retiring/cleanup entries consume terminal capacity but never reserve queued work.
 		let reserved = 0;
 		for (const workerId of burstWorkers.keys()) {
+			if (!isBurstAvailableForWork(workerId)) continue;
 			const conn = workerPool.get(workerId);
 			if (!conn || !conn.busy) reserved++;
 		}
@@ -1132,12 +1550,26 @@ function writeControlFileStatus(cwd: string, status: string, message?: string): 
 			lastUpdated: Date.now(),
 		};
 
-		// Add worker connection counts for launcher visibility
-		const activeWorkers = [...workerPool.values()].filter(w => !w.socket.destroyed).length;
+		// Add static worker connection counts for launcher readiness. Bursts are separate.
+		const activeWorkers = [...workerPool.values()]
+			.filter(w => !isBurstWorker(w.workerId) && !w.socket.destroyed).length;
 		if (activeWorkers > 0) {
 			data.connectedWorkers = activeWorkers;
 		}
 		data.expectedWorkers = maxWorkers;
+		// Every tracked burst (pending and disconnected included): the durable dashboard view.
+		data.burstWorkers = burstControlEntries();
+		// Monotonic run counter and the pool envelope, persisted even with no entries so a
+		// reloaded module never reuses an id/name and only adopts its own core/root.
+		data.burstCounter = burstCounter;
+		{
+			const core = (manifest as any)?.coreIdentity;
+			const coreId = typeof core?.id === "string" && core.id ? core.id : null;
+			const rootAddress = typeof (manifest as any)?.rootTerminalAddress === "string" && (manifest as any).rootTerminalAddress
+				? (manifest as any).rootTerminalAddress
+				: null;
+			if (coreId && rootAddress) data.burstEnvelope = { coreId, rootAddress, generation };
+		}
 
 		// Dashboard extension: add schema v2 fields when dashboardEnabled
 		try {
@@ -1185,15 +1617,13 @@ function writeControlFileStatus(cwd: string, status: string, message?: string): 
 							const state = burstWorkers.get(w.workerId);
 							if (state) {
 								base.burst = true;
-								base.pid = state.pid;
+								base.address = state.address;
+								base.terminalState = state.terminalState;
 								base.sessionDir = state.sessionDir;
-								base.logPath = state.logPath;
+								base.logFile = state.logPath;
 								base.taskCount = state.taskCount;
 								base.lastEvent = state.lastEvent;
 								base.lastEventAt = state.lastEventAt;
-								base.launchMode = state.launchMode;
-								base.paneTitle = state.paneTitle;
-								base.kittyWindowId = state.kittyWindowId;
 							}
 						}
 						return base;
@@ -1205,7 +1635,8 @@ function writeControlFileStatus(cwd: string, status: string, message?: string): 
 					const totalBurst = burstWorkers.size;
 					const maxBurst = config.burstFlash?.maxBurst ?? 0;
 					const activeBurst = [...workerPool.values()].filter(w => isBurstWorker(w.workerId) && w.busy && !w.socket.destroyed).length;
-					const idleBurst = connectedBurst - activeBurst;
+					const idleBurst = [...workerPool.values()]
+						.filter(w => isBurstWorker(w.workerId) && !w.busy && !w.socket.destroyed && isBurstAvailableForWork(w.workerId)).length;
 					data.burstFlash = { connected: connectedBurst, total: totalBurst, max: maxBurst, active: activeBurst, idle: idleBurst };
 				}
 			}
@@ -1294,13 +1725,15 @@ function writeControlFileIdle(cwd: string): void {
 		writeControlFileStatus(cwd, "busy");
 		return;
 	}
-	const anyAlive = [...workerPool.values()].some(w => !w.socket.destroyed);
-	writeControlFileStatus(cwd, anyAlive ? "worker-connected" : "ready");
+	const anyStaticAlive = [...workerPool.values()]
+		.some(w => !isBurstWorker(w.workerId) && !w.socket.destroyed);
+	writeControlFileStatus(cwd, anyStaticAlive ? "worker-connected" : "ready");
 }
 
 /** Write "worker-connected" status with current connection count. */
 function writeControlFileWorkerConnected(cwd: string): void {
-	const activeCount = [...workerPool.values()].filter(w => !w.socket.destroyed).length;
+	const activeCount = [...workerPool.values()]
+		.filter(w => !isBurstWorker(w.workerId) && !w.socket.destroyed).length;
 	writeControlFileStatus(cwd, activeCount > 0 ? "worker-connected" : "ready");
 }
 
@@ -1366,8 +1799,8 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 		if (parsed.resetTimeout !== undefined && (typeof parsed.resetTimeout !== "number" || parsed.resetTimeout <= 0)) {
 			logDiag("warn", "[mind-worker] resetTimeout must be a positive number — using default 5");
 		}
-		if (parsed.kittyEnabled !== undefined && typeof parsed.kittyEnabled !== "boolean") {
-			logDiag("warn", "[mind-worker] kittyEnabled must be a boolean — using default false");
+		if (parsed.terminalBackend !== undefined && parsed.terminalBackend !== "hc") {
+			logDiag("warn", `[mind-worker] terminalBackend "${String(parsed.terminalBackend)}" is no longer supported — hc is the only backend; ignoring it`);
 		}
 		if (parsed.workerCount !== undefined && (typeof parsed.workerCount !== "number" || parsed.workerCount < 1 || parsed.workerCount > 10)) {
 			logDiag("warn", "[mind-worker] workerCount must be 1-10 — using default 3");
@@ -1399,13 +1832,10 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 				? rawBurst.idleTtlMs : DEFAULT_BURST_FLASH_CONFIG.idleTtlMs,
 			maxTasksPerWorker: typeof rawBurst.maxTasksPerWorker === "number" && rawBurst.maxTasksPerWorker >= 1 && rawBurst.maxTasksPerWorker <= 100
 				? rawBurst.maxTasksPerWorker : DEFAULT_BURST_FLASH_CONFIG.maxTasksPerWorker,
-			launchMode: (rawBurst.launchMode === "kitty" ? "kitty" : "headless") as "headless" | "kitty",
 			queuePressureThreshold: typeof rawBurst.queuePressureThreshold === "number" && rawBurst.queuePressureThreshold >= 1
 				? rawBurst.queuePressureThreshold : DEFAULT_BURST_FLASH_CONFIG.queuePressureThreshold,
 			spawnWaitMs: typeof rawBurst.spawnWaitMs === "number" && rawBurst.spawnWaitMs >= 500
 				? rawBurst.spawnWaitMs : DEFAULT_BURST_FLASH_CONFIG.spawnWaitMs,
-			killTimeoutMs: typeof rawBurst.killTimeoutMs === "number" && rawBurst.killTimeoutMs >= 500
-				? rawBurst.killTimeoutMs : DEFAULT_BURST_FLASH_CONFIG.killTimeoutMs,
 			logDetail: (rawBurst.logDetail === "full" ? "full" : "compact") as "compact" | "full",
 		};
 		if (burstFlash.enabled && burstFlash.maxBurst === 0) {
@@ -1428,16 +1858,7 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 			ntfyServer: parsed.ntfyServer || DEFAULT_CONFIG.ntfyServer,
 			resetTimeout: typeof parsed.resetTimeout === "number" && parsed.resetTimeout > 0
 				? parsed.resetTimeout : DEFAULT_CONFIG.resetTimeout,
-			kittyEnabled: typeof parsed.kittyEnabled === "boolean"
-				? parsed.kittyEnabled : DEFAULT_CONFIG.kittyEnabled,
-			kittyLayout: (() => {
-				const v = parsed.kittyLayout;
-				if (typeof v === "string" && v !== "default" && v !== "mind-split-workers-tab") {
-					logDiag("warn", `[mind-worker] kittyLayout "${v}" invalid — must be "default" or "mind-split-workers-tab"`);
-					return undefined;
-				}
-				return typeof v === "string" ? v : undefined;
-			})(),
+			terminalBackend: parsed.terminalBackend === "hc" ? "hc" : undefined,
 			workerCount: wc,
 			workerModels: parsed.workerModels,
 			dashboardEnabled: parsed.dashboardEnabled !== false,
@@ -1657,8 +2078,7 @@ function findIdleWorker(tier?: string): { workerId: string; connection: WorkerCo
 	for (const [wid, conn] of workerPool) {
 		if (!conn.busy && !conn.resetting && !conn.socket.destroyed) {
 			if (tier && conn.tier !== tier) continue;
-			// Skip stale burst workers whose state has been cleaned up
-			if (isBurstWorker(wid) && !burstWorkers.has(wid)) continue;
+			if (!isBurstAvailableForWork(wid)) continue;
 			return { workerId: wid, connection: conn };
 		}
 	}
@@ -1683,8 +2103,7 @@ function findAllIdleWorkers(tier?: string): Array<{ workerId: string; connection
 	for (const [wid, conn] of workerPool) {
 		if (!conn.busy && !conn.resetting && !conn.socket.destroyed) {
 			if (tier && conn.tier !== tier) continue;
-			// Skip stale burst workers whose state has been cleaned up
-			if (isBurstWorker(wid) && !burstWorkers.has(wid)) continue;
+			if (!isBurstAvailableForWork(wid)) continue;
 			idle.push({ workerId: wid, connection: conn });
 		}
 	}
@@ -1705,8 +2124,7 @@ function dispatchNextQueued(workerId: string, connection: WorkerConnection, ctx:
 	if (connection.busy || connection.resetting) return false;
 	if (pendingQueue.length === 0) return false;
 	if (connection.socket.destroyed) return false;
-	// Skip retired/stale burst workers whose state has been cleaned up
-	if (isBurstWorker(workerId) && !burstWorkers.has(workerId)) return false;
+	if (!isBurstAvailableForWork(workerId)) return false;
 
 	const burst = isBurstWorker(workerId);
 	// Scan queue for first entry matching this worker's tier (or any if entry has no tier preference).
@@ -1744,6 +2162,7 @@ function dispatchEntryToWorker(
 	entry: QueuedTask,
 	ctx: ExtensionContext,
 ): boolean {
+	if (!isBurstAvailableForWork(workerId)) return false;
 	const { config } = loadConfig();
 	const id = entry.id;
 
@@ -2081,7 +2500,7 @@ function hasEligibleActor(entry: QueuedTask): boolean {
 	// Same tier rule the dispatcher uses: an entry with no tier takes any worker.
 	const compatible = (wid: string, conn: WorkerConnection): boolean => {
 		if (conn.socket.destroyed) return false;
-		if (isBurstWorker(wid) && !burstWorkers.has(wid)) return false; // stale burst ownership
+		if (!isBurstAvailableForWork(wid)) return false;
 		return !entry.tier || conn.tier === entry.tier;
 	};
 	if (entry.reset) {
@@ -2106,11 +2525,12 @@ function hasEligibleActor(entry: QueuedTask): boolean {
 	for (const reservation of pendingResets.values()) {
 		if (!entry.tier || reservation.tier === entry.tier) return true;
 	}
-	// A burst spawn can still serve flash-eligible work (never a reset, handled above).
+	// A pending/eligible burst can still serve flash-eligible work (never a reset, above).
 	const flashEligible = !entry.tier || entry.tier === "flash" || entry.tier === "default";
 	if (flashEligible && config.burstFlash.enabled && config.burstFlash.maxBurst > 0) {
-		const connectedBurst = [...workerPool.values()].filter((w) => isBurstWorker(w.workerId) && !w.socket.destroyed).length;
-		if (connectedBurst < config.burstFlash.maxBurst) return true;
+		// A cleanup-only burst is not serviceable and still consumes terminal capacity.
+		if ([...burstWorkers.keys()].some(isBurstAvailableForWork)) return true;
+		if (countBurstWorkers() < config.burstFlash.maxBurst) return true;
 	}
 	return false;
 }
@@ -2292,7 +2712,9 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 						const { config: cfg, resolvedWorkers } = loadConfig();
 						const isBurst = (msg.workerId || "").startsWith("burst-flash-");
 						if (isBurst) {
-							// Burst workers: enforce flash tier + respect burstFlash.maxBurst cap
+							// Burst workers: enforce flash tier and a tracked identity. An untracked
+							// burst (stale run, reload without a durable entry) must not join the
+							// pool and receive work.
 							if (!cfg.burstFlash.enabled) {
 								sendJson(socket, { type: "error", code: "POOL_FULL", message: "Burst flash disabled" });
 								socket.destroy();
@@ -2303,21 +2725,19 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 								socket.destroy();
 								return;
 							}
-							// Allow known spawned burst workers even if cap reached
-							if (!burstWorkers.has(msg.workerId)) {
-								const connectedBurst = [...workerPool.values()].filter(w => isBurstWorker(w.workerId) && !w.socket.destroyed).length;
-								if (connectedBurst >= cfg.burstFlash.maxBurst) {
-									sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${cfg.burstFlash.maxBurst} burst workers already connected` });
-									socket.destroy();
-									return;
-								}
+							if (!msg.workerId || !burstWorkers.has(msg.workerId)) {
+								sendJson(socket, { type: "error", code: "UNKNOWN_BURST", message: "Burst worker is not tracked by this Mind" });
+								socket.destroy();
+								return;
 							}
 						} else {
 							const tierWorkers = resolvedWorkers.filter(w => w.tier === workerTier).length;
-							const tierConnected = [...workerPool.values()].filter(w => w.tier === workerTier && !w.socket.destroyed).length;
+							const staticConnections = [...workerPool.values()]
+								.filter(w => !isBurstWorker(w.workerId) && !w.socket.destroyed);
+							const tierConnected = staticConnections.filter(w => w.tier === workerTier).length;
 							if (tierWorkers === 0) {
-								// Tier not in resolved config (defensive) — use total pool limit
-								if (workerPool.size >= maxWorkers) {
+								// Tier not in resolved config (defensive) — static total limit; bursts are separate.
+								if (staticConnections.length >= maxWorkers) {
 									sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${maxWorkers} workers already connected` });
 									socket.destroy();
 									return;
@@ -2369,8 +2789,10 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 								burstIdleCheckTimer = setInterval(() => checkBurstIdleTtl(cwd), 5000);
 							}
 						}
-						// Dispatch any queued tasks to this new worker
-						if (pendingQueue.length > 0) {
+						// A retiring/cleanup-only burst must never receive queued work.
+						const burstState = isBurst ? burstWorkers.get(assignedWorkerId) : undefined;
+						const retiringBurst = Boolean(burstState && (burstState.terminalState === "retiring" || burstState.retireReason));
+						if (pendingQueue.length > 0 && !retiringBurst) {
 							dispatchNextQueued(assignedWorkerId, workerPool.get(assignedWorkerId)!, ctx);
 						}
 						logDiag("error", `[mind-worker] Handshake OK, worker=${assignedWorkerId}, tier=${workerTier}, gen=${msg.generation}`);
@@ -2389,8 +2811,8 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 						socket.end();
 						return;
 					}
-					// Legacy path (no handshake) — accept immediately with total pool guard
-					if (workerPool.size >= maxWorkers) {
+					// Legacy path (no handshake) — accept immediately with static pool guard
+					if ([...workerPool.values()].filter(w => !isBurstWorker(w.workerId) && !w.socket.destroyed).length >= maxWorkers) {
 						sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${maxWorkers} workers already connected` });
 						socket.destroy();
 						return;
@@ -2792,34 +3214,6 @@ function teardownMindServer(cwd: string, ctx: ExtensionContext): void {
 	}
 	try { unlinkSync(getSocketPath(cwd)); } catch { /* ignore */ }
 	ctx.ui.setStatus("mind-worker", undefined);
-}
-
-async function spawnWorkerInKitty(cwd: string): Promise<void> {
-	if (!process.env.KITTY_LISTEN_ON) return;
-	const { resolvedWorkers } = loadConfig();
-	const errors: string[] = [];
-	for (let i = 0; i < resolvedWorkers.length; i++) {
-		const entry = resolvedWorkers[i];
-		try {
-			await new Promise<void>((resolve, reject) => {
-				const title = `Pi Worker ${i} [${entry.tier}]`;
-				const child = spawn("kitty", ["@", "launch", "--cwd", cwd, "--title", title, "--env", `PI_MIND_WORKER_ID=worker-${i}`, "--env", `PI_MIND_WORKER_TIER=${entry.tier}`, "pi", "--model", entry.model, "--thinking", entry.thinkingLevel, "/be-worker"], {
-					stdio: "ignore",
-					timeout: 10000,
-				});
-				child.on("error", reject);
-				child.on("close", (code) => {
-					if (code === 0) resolve();
-					else reject(new Error(`kitty exited ${code} for worker ${i}`));
-				});
-			});
-		} catch (err: any) {
-			errors.push(err.message);
-		}
-	}
-	if (errors.length > 0) {
-		logDiag("error", `[spawnWorkerInKitty] ${errors.length}/${resolvedWorkers.length} workers failed: ${errors.join("; ")}`);
-	}
 }
 
 /** Safe ctx.ui wrappers — swallow stale-context errors so socket handlers don't crash workers. */
@@ -3256,6 +3650,8 @@ function sendWorkerTerminalError(task: WorkerTaskRecord, kind: "aborted" | "erro
 
 async function activateMindRole(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
 	if (currentRole === "mind") {
+		// /new keeps this module's burst map but suspend stopped its idle timer: resume it.
+		if (burstWorkers.size > 0) ensureBurstIdleTimer(ctx.cwd);
 		ctx.ui.notify("Already in mind role", "warning");
 		return;
 	}
@@ -3276,9 +3672,18 @@ async function activateMindRole(ctx: ExtensionContext, pi: ExtensionAPI): Promis
 
 	if (!defaultTools) defaultTools = pi.getActiveTools();
 	pi.setActiveTools(MIND_ALLOWED_TOOLS);
+	// Capture the durable burst snapshot before the server/heartbeat can overwrite it,
+	// and restore the monotonic counter before any spawn can reuse an id or name.
+	const persistedBursts = readPersistedBurstSnapshot(ctx.cwd);
+	restoreBurstCounter(persistedBursts);
 	currentRole = "mind";
 	startMindServer(ctx.cwd, ctx);
 	startDashboardHeartbeat(ctx.cwd);
+	// A replaced session keeps the tracked map but lost its timer; /reload loses the map
+	// itself, so adopt only what the durable control file and the core still prove. Never
+	// restart a task or an agent; adopted bursts are cleanup-only.
+	if (burstWorkers.size > 0) ensureBurstIdleTimer(ctx.cwd);
+	void adoptPersistedBursts(ctx.cwd, persistedBursts);
 	await setModelFromId(pi, ctx, config.mindModel);
 	if (config.mindThinkingLevel) pi.setThinkingLevel(config.mindThinkingLevel);
 
@@ -3291,11 +3696,7 @@ async function activateMindRole(ctx: ExtensionContext, pi: ExtensionAPI): Promis
 
 	// Launcher path: launcher spawns worker directly, skip auto-spawn
 	if (!LAUNCHER_ROLE_FLAG && config.autoSpawnWorker) {
-		if (config.kittyEnabled) {
-			void spawnWorkerInKitty(ctx.cwd).catch(() => {});
-		} else {
-			ctx.ui.notify("Start the Herdr worker pair with bin/mind-worker-launcher.", "warning");
-		}
+		ctx.ui.notify("Start the mind-worker pair with bin/mind-worker-launcher.", "warning");
 	}
 
 	pi.appendEntry("mind-worker-role", { role: "mind", cwd: ctx.cwd });
@@ -3437,61 +3838,6 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 			currentRole = "none";
 			pi.appendEntry("mind-worker-role", { role: "none", cwd: ctx.cwd });
 			ctx.ui.notify("Worker mode stopped", "info");
-		},
-	});
-
-	pi.registerCommand("mind-reset", {
-		description: "Hard reset mind-worker pair (stop → cleanup → spawn)",
-		handler: async (args, ctx) => {
-			if (currentRole !== "mind") {
-				ctx.ui.notify("Reset only available in mind role", "warning");
-				return;
-			}
-			if (!LAUNCHER_ROLE_FLAG) {
-				ctx.ui.notify("Reset requires launcher path (--mind-worker-role)", "warning");
-				return;
-			}
-
-			// Check busy status from control file — any worker busy counts
-			const controlPath = getControlFilePath(ctx.cwd);
-			try {
-				const ctrl = JSON.parse(readFileSync(controlPath, "utf-8"));
-				const force =
-				typeof args === "string"
-					? args.includes("force") || args.includes("--force")
-					: Array.isArray(args)
-						? args.includes("force") || args.includes("--force")
-						: typeof args === "object" && args !== null
-							? args.force === true || args["--force"] === true
-							: false;
-				if (ctrl.status === "busy" && !force) {
-					ctx.ui.notify("Mind is busy. Use /mind-reset force to reset anyway.", "error");
-					return;
-				}
-			} catch { /* control file may not exist yet — proceed */ }
-
-			// Detached spawn of launcher with --reset
-			const launcherPath = join(getAgentDir(), "bin", "mind-worker-launcher");
-			const child = spawn(launcherPath, [
-				"--reset", "--cwd", ctx.cwd,
-				...(INSTANCE_LABEL ? ["--instance", INSTANCE_LABEL] : []),
-			], {
-				stdio: "ignore",
-				detached: true,
-				env: { ...process.env },
-			});
-			let resultReported = false;
-			const reportResult = (message: string, level: "info" | "error") => {
-				if (resultReported) return;
-				resultReported = true;
-				ctx.ui.notify(message, level);
-			};
-			child.once("error", error => reportResult(`Reset request failed: ${error.message}`, "error"));
-			child.once("exit", (code, signal) => code === 0
-				? reportResult("Reset request accepted — restart requested, not yet confirmed.", "info")
-				: reportResult(`Reset request rejected (launcher exit ${code ?? signal}).`, "error"));
-			child.unref();
-			ctx.ui.notify("Reset request sent; awaiting launcher acceptance.", "info");
 		},
 	});
 
@@ -3908,6 +4254,15 @@ async function executeFanout(
 
 			if (targetWorkerId) {
 				// Explicit workerId targeting
+				// Reset is a static-worker primitive: classify the burst target before
+				// connectivity, so an untracked/refused burst still reports unsupported.
+				if (resetRequested && isBurstWorker(targetWorkerId)) {
+					return {
+						content: [{ type: "text", text: `Worker "${targetWorkerId}" is a burst worker. reset requires an idle static worker.` }],
+						isError: true,
+						details: { code: "RESET_UNSUPPORTED" },
+					};
+				}
 				const conn = workerPool.get(targetWorkerId);
 				if (!conn || conn.socket.destroyed) {
 					return {
@@ -3915,11 +4270,11 @@ async function executeFanout(
 						isError: true,
 					};
 				}
-				if (resetRequested && isBurstWorker(targetWorkerId)) {
+				if (!isBurstAvailableForWork(targetWorkerId)) {
 					return {
-						content: [{ type: "text", text: `Worker "${targetWorkerId}" is a burst worker. reset requires an idle static worker.` }],
+						content: [{ type: "text", text: `Worker "${targetWorkerId}" is retiring or cleanup-only; it cannot receive work.` }],
 						isError: true,
-						details: { code: "RESET_UNSUPPORTED" },
+						details: { code: "WORKER_UNAVAILABLE" },
 					};
 				}
 				if (conn.busy || conn.resetting) {
@@ -3934,7 +4289,8 @@ async function executeFanout(
 				// Auto-select first idle worker of requested tier (or any if no tier).
 				// A reset never spawns a worker and never targets a burst worker.
 				const idle = resetRequested ? findIdleStaticWorker(effectiveTier) : findIdleWorker(effectiveTier);
-				const connected = [...workerPool.values()].filter(w => !w.socket.destroyed).length;
+				const connected = [...workerPool.values()]
+					.filter(w => !w.socket.destroyed && isBurstAvailableForWork(w.workerId)).length;
 				if (!idle) {
 					if (!resetRequested) {
 						const isFlashTier = !effectiveTier || effectiveTier === "flash" || effectiveTier === "default";
@@ -3952,8 +4308,10 @@ async function executeFanout(
 						} else {
 							// If tier specified, check if any worker of that tier exists
 							if (effectiveTier) {
-								const tierCount = [...workerPool.values()].filter(w => w.tier === effectiveTier && !w.socket.destroyed).length;
-								const tierBusy = [...workerPool.values()].filter(w => w.tier === effectiveTier && (w.busy || w.resetting) && !w.socket.destroyed).length;
+								const tierCount = [...workerPool.values()]
+									.filter(w => w.tier === effectiveTier && !w.socket.destroyed && isBurstAvailableForWork(w.workerId)).length;
+								const tierBusy = [...workerPool.values()]
+									.filter(w => w.tier === effectiveTier && (w.busy || w.resetting) && !w.socket.destroyed && isBurstAvailableForWork(w.workerId)).length;
 								if (tierCount === 0) {
 									return {
 										content: [{ type: "text", text: `No ${effectiveTier} workers connected. Available tiers: ${[...new Set([...workerPool.values()].filter(w => !w.socket.destroyed).map(w => w.tier))].join(", ") || "(none)"}` }],
@@ -4142,12 +4500,17 @@ async function executeFanout(
 			let connection: WorkerConnection | undefined;
 
 			if (targetWorkerId) {
+				// Reset is a static-worker primitive: classify the burst target before
+				// connectivity, so an untracked/refused burst still reports unsupported.
+				if (resetRequested && isBurstWorker(targetWorkerId)) {
+					return { content: [{ type: "text", text: `Worker "${targetWorkerId}" is a burst worker. reset requires an idle static worker.` }], isError: true, details: { code: "RESET_UNSUPPORTED" } };
+				}
 				const conn = workerPool.get(targetWorkerId);
 				if (!conn || conn.socket.destroyed) {
 					return { content: [{ type: "text", text: `Worker "${targetWorkerId}" not connected. Connected: ${[...workerPool.keys()].filter(w => !workerPool.get(w)!.socket.destroyed).join(", ") || "(none)"}` }], isError: true };
 				}
-				if (resetRequested && isBurstWorker(targetWorkerId)) {
-					return { content: [{ type: "text", text: `Worker "${targetWorkerId}" is a burst worker. reset requires an idle static worker.` }], isError: true, details: { code: "RESET_UNSUPPORTED" } };
+				if (!isBurstAvailableForWork(targetWorkerId)) {
+					return { content: [{ type: "text", text: `Worker "${targetWorkerId}" is retiring or cleanup-only; it cannot receive work.` }], isError: true, details: { code: "WORKER_UNAVAILABLE" } };
 				}
 				if (conn.busy || conn.resetting) {
 					return { content: [{ type: "text", text: `Worker "${targetWorkerId}" is busy. Omit workerId for auto-routing (queues if all busy).${resetRequested ? " reset requires an idle worker." : ""}` }], isError: true };
@@ -4155,14 +4518,16 @@ async function executeFanout(
 				connection = conn;
 			} else {
 				const idle = resetRequested ? findIdleStaticWorker(effectiveTier) : findIdleWorker(effectiveTier);
-				const connected = [...workerPool.values()].filter(w => !w.socket.destroyed).length;
+				const connected = [...workerPool.values()]
+					.filter(w => !w.socket.destroyed && isBurstAvailableForWork(w.workerId)).length;
 				if (!idle) {
 					if (!resetRequested) {
 						if (connected === 0) {
 							return { content: [{ type: "text", text: "No workers connected. Workers start automatically." }], isError: true };
 						}
 						if (effectiveTier) {
-							const tierCount = [...workerPool.values()].filter(w => w.tier === effectiveTier && !w.socket.destroyed).length;
+							const tierCount = [...workerPool.values()]
+								.filter(w => w.tier === effectiveTier && !w.socket.destroyed && isBurstAvailableForWork(w.workerId)).length;
 							if (tierCount === 0) {
 								return { content: [{ type: "text", text: `No ${effectiveTier} workers connected. Available tiers: ${[...new Set([...workerPool.values()].filter(w => !w.socket.destroyed).map(w => w.tier))].join(", ") || "(none)"}` }], isError: true };
 							}
@@ -4549,7 +4914,14 @@ async function executeFanout(
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		ctx.ui.setEditorComponent(undefined);
-		if (currentRole === "mind") suspendMindServer(ctx.cwd, ctx);
+		if (currentRole === "mind") {
+			// /reload and /new replace or suspend the runtime: mark and start retiring every
+			// burst before the server and idle timer stop, then persist the cleanup snapshot
+			// for the next module. Lifetime cleanup only; static workers and resets untouched.
+			retireAllBurstFlash("session-shutdown");
+			writeControlFileStatus(ctx.cwd, "stopped");
+			suspendMindServer(ctx.cwd, ctx);
+		}
 		if (currentRole === "worker") disconnectWorker(ctx);
 		failPendingTasks("Session ended", "SESSION_END");
 		currentRole = "none";
