@@ -11,7 +11,13 @@ pi
 
 ## Mind-worker launcher
 
-`bin/mind-worker-launcher` is the supported pair launcher and requires a running Herdr session (`terminalBackend: "herdr"` in `mind-worker.json`). The legacy Kitty pair launcher has been retired. Manual `/be-mind` / `/be-worker` role restore remains available, and the optional burst-worker Kitty path is unchanged.
+`bin/mind-worker-launcher` is the supported pair launcher. It supports the `hc` (Herdr core) and `tmux` terminal backends. The backend is selected by `--backend hc|tmux`, then `terminalBackend` in `mind-worker.json`, then `hc`; the tracked config keeps `terminalBackend: "hc"` for backward compatibility, while the dotfiles `tmux-mind` entrypoint explicitly passes `--backend tmux`.
+
+`PI_CODING_AGENT_DIR` relocates the agent dir (state, config, sessions and the cleanup guard's scan) together, following pi's `getAgentDir`: a literal `~` or `~/` expands and the value is never trimmed. A relative or `file://` value is refused before anything is written or scanned.
+
+On tmux, the launcher is the root pane's direct program and runs in the invoking tmux session. The dotfiles `tmux-mind` entrypoint creates the Mind window; all static and burst workers share one `workers` window. A tmux pool is identified by a v3 record that carries the canonical root plus its exact tmux server, session and root-pane proof; global `pane-exited`, `after-kill-pane` and `window-unlinked` hooks invoke a cleanup guard that proves ownership before sweeping. The tmux backend never adopts or converts a v2/hc record, or a record from another server, session or root; it refuses instead of guessing.
+
+The legacy Kitty pair launcher has been retired. Manual `/be-mind` / `/be-worker` role restore remains available, and the optional burst-worker Kitty path is unchanged.
 
 ## Authentication
 

@@ -1,25 +1,57 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# hc entrypoint for the mind + worker pair. Mind replaces this terminal's shell
-# (run it with the shell builtin `exec`), static workers become direct
-# herdr-core (hc) children. No panes, no named sessions, no whole-pool reset.
+# Entrypoint for the mind + worker pair. Mind replaces this terminal's shell or
+# pane program (run it with the shell builtin `exec`). Backend: --backend
+# hc|tmux, else mind-worker.json terminalBackend, else hc. No whole-pool reset.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_DIR="$SCRIPT_DIR/.."
-CONFIG_FILE="$AGENT_DIR/mind-worker.json"
+# pi's agent dir may be relocated (PI_CODING_AGENT_DIR). The launcher module and
+# the tmux cleanup guard apply the same rule: a literal "~" or "~/" expands, the
+# value is never trimmed, and a relative or file:// value is refused instead of
+# guessed. The install dir stays AGENT_DIR.
+normalize_agent_config_dir() {
+    local dir="${PI_CODING_AGENT_DIR-}"
+    if [ -z "$dir" ]; then printf '%s\n' "$AGENT_DIR"; return 0; fi
+    case "$dir" in
+        "~") dir="$HOME" ;;
+        "~/"*) dir="$HOME/${dir#\~/}" ;;
+    esac
+    case "$dir" in
+        /*) printf '%s\n' "$dir" ;;
+        *)
+            printf 'ERROR: PI_CODING_AGENT_DIR must be an absolute path or start with "~/" (relative and file:// values are refused): %s\n' "$dir" >&2
+            return 1 ;;
+    esac
+}
+AGENT_CONFIG_DIR="$(normalize_agent_config_dir)" || exit 1
+CONFIG_FILE="$AGENT_CONFIG_DIR/mind-worker.json"
 # Explicit toolchain: the launcher's Node and Mind share this resolved PATH.
 NODE_CMD=("${MISE_BIN:-/usr/bin/mise}" x node@26 -- node)
 
 PASSTHROUGH_ARGS=()
-for arg in "$@"; do
-  case "$arg" in
+EXPLICIT_BACKEND=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --background)
       echo "ERROR: Mind runs in the invoking terminal; --background is gone." >&2
       exit 2 ;;
     --reset)
       echo "ERROR: Whole-pool reset is gone. Stop this root terminal and start a fresh one." >&2
       exit 2 ;;
-    *) PASSTHROUGH_ARGS+=("$arg") ;;
+    --backend)
+      if [ $# -lt 2 ]; then
+        echo "ERROR: --backend needs hc or tmux." >&2
+        exit 2
+      fi
+      EXPLICIT_BACKEND="$2"
+      PASSTHROUGH_ARGS+=("$1" "$2")
+      shift 2 ;;
+    --backend=*)
+      EXPLICIT_BACKEND="${1#--backend=}"
+      PASSTHROUGH_ARGS+=("$1")
+      shift ;;
+    *) PASSTHROUGH_ARGS+=("$1"); shift ;;
   esac
 done
 set -- "${PASSTHROUGH_ARGS[@]}"
@@ -29,9 +61,38 @@ if [ -n "${MIND_WORKER_LAUNCHER_BACKGROUND:-}" ]; then
   exit 2
 fi
 
-if [ -z "${HC_TERMINAL_ID:-}" ]; then
-  echo "ERROR: HC_TERMINAL_ID is not set. Start this from a herdr-app (hc) terminal, not a plain shell." >&2
-  exit 2
+# The flag wins over the config; an absent config selects hc. Nothing is written.
+if [ -n "$EXPLICIT_BACKEND" ]; then
+  BACKEND="$EXPLICIT_BACKEND"
+elif [ -f "$CONFIG_FILE" ]; then
+  BACKEND="$("${NODE_CMD[@]}" -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf-8")).terminalBackend||"")}catch{console.log("")}' "$CONFIG_FILE" 2>/dev/null)"
+else
+  BACKEND=""
+fi
+if [ -z "$BACKEND" ]; then
+  BACKEND="hc"
+fi
+case "$BACKEND" in
+  hc|tmux) ;;
+  *)
+    echo "ERROR: unknown terminal backend \"$BACKEND\"; --backend must be hc or tmux." >&2
+    exit 1 ;;
+esac
+
+if [ "$BACKEND" = "hc" ]; then
+  if [ -z "${HC_TERMINAL_ID:-}" ]; then
+    echo "ERROR: HC_TERMINAL_ID is not set. Start this from a herdr-app (hc) terminal, not a plain shell." >&2
+    exit 2
+  fi
+else
+  if [ -z "${TMUX:-}" ]; then
+    echo "ERROR: TMUX is not set. Start this from a tmux pane, not a plain shell." >&2
+    exit 2
+  fi
+  if [ -z "${TMUX_PANE:-}" ]; then
+    echo "ERROR: TMUX_PANE is not set; refusing to guess the root pane." >&2
+    exit 2
+  fi
 fi
 
 if [ ! -t 0 ] || [ ! -t 1 ] || [ ! -t 2 ]; then
@@ -49,20 +110,11 @@ if [ -z "$CURRENT_PGID" ] || [ "$CURRENT_PGID" != "$TTY_PGID" ]; then
   exit 2
 fi
 
-BACKEND=""
-if [ -f "$CONFIG_FILE" ]; then
-  BACKEND="$("${NODE_CMD[@]}" -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf-8")).terminalBackend||"")}catch{console.log("")}' "$CONFIG_FILE" 2>/dev/null)"
-fi
-if [ "$BACKEND" != "hc" ]; then
-  echo "ERROR: mind-worker launcher requires terminalBackend=hc; refusing any other backend." >&2
-  exit 1
-fi
-
 HC_LAUNCHER="$AGENT_DIR/lib/mind-worker/hc-launcher.mjs"
 if [ ! -f "$HC_LAUNCHER" ]; then
-  echo "ERROR: hc launcher not found at $HC_LAUNCHER" >&2
+  echo "ERROR: launcher module not found at $HC_LAUNCHER" >&2
   exit 1
 fi
 
-# exec keeps this PID: the launcher must be the root terminal's recorded program.
+# exec keeps this PID: the launcher must be the terminal's/pane's root program.
 exec "${NODE_CMD[@]}" "$HC_LAUNCHER" "$@"

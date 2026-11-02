@@ -10,10 +10,22 @@ import { Type } from "typebox";
 import { parseGitArgs } from "../lib/mind-worker/git-command.mjs";
 // The one place that starts and retires hc terminals (argv only, no HC_* passthrough).
 import {
+	getTerminal as getHcTerminal,
 	probeCoreIdentity,
 	retireWorkerTerminal,
 	spawnWorkerTerminal,
 } from "../lib/mind-worker/hc-terminal.mjs";
+// The tmux side of the same seam: a v3 record is proved and driven by that module
+// only. It is imported statically because it reads nothing at import time.
+import {
+	getTerminal as getTmuxTerminal,
+	inspectPool,
+	listOwnedTerminals,
+	probeTmuxRoot,
+	retireWorkerTerminal as retireTmuxWorkerTerminal,
+	spawnWorkerTerminal as spawnTmuxWorkerTerminal,
+	updatePoolManifest,
+} from "../lib/mind-worker/tmux-terminal.mjs";
 // Pi's package entry does not export the ThinkingLevel union; the helper owns it.
 import { resolveThinkingLevel, type ThinkingLevel } from "../lib/mind-worker/thinking-level.mjs";
 
@@ -57,8 +69,11 @@ interface MindWorkerConfig {
 	ntfyTopic: string;
 	ntfyServer: string;
 	resetTimeout: number;
-	/** Only the hc backend exists; a legacy value is reported and ignored. */
-	terminalBackend?: "hc";
+	/**
+	 * Advisory only: the launcher's own record selects the backend (v2/hc or
+	 * v3/tmux). An unknown value is reported and ignored.
+	 */
+	terminalBackend?: "hc" | "tmux";
 	workerCount: number;
 	workerModels?: Array<{ model: string; count: number; tier?: string; thinkingLevel?: ThinkingLevel }>;
 	dashboardEnabled: boolean;
@@ -495,46 +510,184 @@ function hasCoreSelector(env: NodeJS.ProcessEnv = process.env): boolean {
 	return Boolean(env.HC_SESSION?.trim() || env.HC_SOCKET?.trim());
 }
 
+type BurstBackend = "hc" | "tmux";
+
 /**
- * The core this pool belongs to. The id is the real one probed from
- * `hc server status`; HC_SCOPE is per-terminal and is never identity.
+ * The pool this run belongs to, proved before any worker exists. The backend is
+ * never config or guesswork: it is the launcher's own record, v2/hc or v3/tmux.
  */
-interface BurstCorePin {
+interface BurstHostPin {
+	readonly backend: BurstBackend;
+	/** hc's probed core id, or the v3 record's coreIdentity.id. Never derived here. */
+	readonly coreId: string;
+	/** hc terminal address, or the tmux root %pane of the pool. */
+	readonly rootAddress: string;
+	readonly generation: number;
+	/** Selector snapshot every later call reuses. Never written to disk. */
+	readonly clientEnv: Record<string, string>;
+	/** v3 only: the record the module locks, and its identity as pinned. */
+	readonly manifestPath?: string;
+	readonly poolKey?: string;
+}
+
+interface BurstManifestHc {
+	readonly backend: "hc";
 	readonly coreId: string;
 	readonly rootAddress: string;
-	/** Selector snapshot every later hc call reuses. Never written to disk. */
-	readonly clientEnv: Record<string, string>;
+	readonly generation: number;
 }
 
-interface BurstManifestV2 {
-	coreId: string;
-	rootAddress: string;
-	generation: number;
+interface BurstManifestTmux {
+	readonly backend: "tmux";
+	readonly coreId: string;
+	readonly rootAddress: string;
+	readonly generation: number;
+	readonly owner: string;
+	readonly run: string;
+	readonly server: { socketPath: string; pid: number; startTime: number; version: string };
+	readonly session: { id: string; created: number };
+	readonly rootPane: { paneId: string; panePid: number; startCommand: string };
 }
 
-/** Manifest v2 identity: the pool's core id and root terminal address. */
-function readBurstManifest(manifest: Record<string, unknown> | null): BurstManifestV2 | null {
+type BurstManifest = BurstManifestHc | BurstManifestTmux;
+
+const PANE_ID_RE = /^%[0-9]+$/;
+const SESSION_ID_RE = /^\$[0-9]+$/;
+
+function positiveInt(value: unknown): number | null {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function nonNegativeInt(value: unknown): number | null {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function oneLineText(value: unknown): string | null {
+	return typeof value === "string" && value && !/[\0\n\r]/.test(value) ? value : null;
+}
+
+/**
+ * A v3/tmux record, read strictly. Every identity field is required: a v2,
+ * legacy, cross (v3 with another backend) or malformed record is not a pool.
+ */
+function readTmuxManifest(manifest: Record<string, any>): BurstManifestTmux | null {
+	if (manifest.schemaVersion !== 3 || manifest.terminalBackend !== "tmux") return null;
+	const coreId = oneLineText(manifest.coreIdentity?.id);
+	const owner = oneLineText(manifest.owner);
+	const run = oneLineText(manifest.run);
+	const generation = positiveInt(manifest.generation);
+	const server = manifest.server;
+	const session = manifest.session;
+	const rootPane = manifest.rootPane;
+	if (!coreId || !owner || !run || generation === null) return null;
+	if (!server || !rootPane || !session) return null;
+	const socketPath = oneLineText(server.socketPath);
+	const serverPid = positiveInt(server.pid);
+	const startTime = nonNegativeInt(server.startTime);
+	const version = oneLineText(server.version);
+	if (!socketPath || !socketPath.startsWith("/") || serverPid === null || startTime === null || !version) return null;
+	if (typeof session.id !== "string" || !SESSION_ID_RE.test(session.id)) return null;
+	const created = nonNegativeInt(session.created);
+	if (created === null) return null;
+	if (typeof rootPane.paneId !== "string" || !PANE_ID_RE.test(rootPane.paneId)) return null;
+	const rootPid = positiveInt(rootPane.panePid);
+	if (rootPid === null || typeof rootPane.startCommand !== "string") return null;
+	return {
+		backend: "tmux",
+		coreId,
+		rootAddress: rootPane.paneId,
+		generation,
+		owner,
+		run,
+		server: { socketPath, pid: serverPid, startTime, version },
+		session: { id: session.id, created },
+		rootPane: { paneId: rootPane.paneId, panePid: rootPid, startCommand: rootPane.startCommand },
+	};
+}
+
+/** The pool record, or null for anything cross or unknown: those are never adopted. */
+function readBurstManifest(manifest: Record<string, unknown> | null): BurstManifest | null {
+	if (!manifest) return null;
+	if (manifest.schemaVersion === 3 || manifest.terminalBackend === "tmux") {
+		return readTmuxManifest(manifest as Record<string, any>);
+	}
 	// Exact v2 markers only: a record without them is legacy/unproven, never a burst pool.
-	if (!manifest || manifest.schemaVersion !== 2 || manifest.terminalBackend !== "hc") return null;
+	if (manifest.schemaVersion !== 2 || manifest.terminalBackend !== "hc") return null;
 	const core = (manifest as any)?.coreIdentity;
 	const coreId = typeof core?.id === "string" && core.id ? core.id : null;
 	const rootAddress = typeof (manifest as any)?.rootTerminalAddress === "string"
 		? (manifest as any).rootTerminalAddress
 		: null;
-	const generation = typeof manifest.generation === "number"
-		&& Number.isSafeInteger(manifest.generation) && manifest.generation > 0
-		? manifest.generation
-		: null;
+	const generation = positiveInt(manifest.generation);
 	if (!coreId || !rootAddress || generation === null) return null;
-	return { coreId, rootAddress, generation };
+	return { backend: "hc", coreId, rootAddress, generation };
+}
+
+/** One canonical string for the whole v3 pool identity, so "same pool" is one compare. */
+function tmuxPoolKey(record: BurstManifestTmux): string {
+	return [
+		record.owner, record.run, record.generation, record.coreId,
+		record.server.socketPath, record.server.pid, record.server.startTime, record.server.version,
+		record.session.id, record.session.created,
+		record.rootPane.paneId, record.rootPane.panePid, record.rootPane.startCommand,
+	].join("\0");
+}
+
+/** The tmux server this Mind was started in, as tmux exports it: <socket>,<pid>,<start>. */
+function tmuxServerHint(env: NodeJS.ProcessEnv = process.env): { socketPath: string; pid: number } | null {
+	const tmux = typeof env.TMUX === "string" ? env.TMUX.trim() : "";
+	const parts = tmux.split(",");
+	if (parts.length !== 3) return null;
+	const pid = Number(parts[1]);
+	if (!parts[0].startsWith("/") || !Number.isSafeInteger(pid) || pid <= 0) return null;
+	return { socketPath: parts[0], pid };
+}
+
+/** The pool root pane this Mind runs in, or null. */
+function tmuxRootPane(env: NodeJS.ProcessEnv = process.env): string | null {
+	const pane = env.TMUX_PANE;
+	return typeof pane === "string" && PANE_ID_RE.test(pane) ? pane : null;
+}
+
+/** Memory-only client tuple for the tmux module. Never persisted, never a secret. */
+function tmuxClientEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+	const snapshot: Record<string, string> = {};
+	for (const key of ["TMUX", "TMUX_PANE"]) {
+		const value = env[key];
+		if (typeof value === "string" && value) snapshot[key] = value;
+	}
+	return snapshot;
+}
+
+/** Mind is the launcher's child; the pane's direct program is the launcher, not Mind. */
+function tmuxLauncherPid(env: NodeJS.ProcessEnv = process.env): number | null {
+	return positiveInt(Number(env.PI_MIND_WORKER_LAUNCHER_PID));
+}
+
+/** The root this run must see: hc's root terminal id or the tmux root %pane. */
+function currentRootAddress(backend: BurstBackend, env: NodeJS.ProcessEnv = process.env): string | null {
+	return backend === "tmux" ? tmuxRootPane(env) : rootTerminalAddress(env);
 }
 
 /**
- * Pin the run to one core before any worker exists: an explicit selector, a live
- * root terminal, and a probe whose id matches the manifest's core. Anything else
- * fails closed, because a wrong core would give us addresses we cannot own.
+ * Pin the run to one pool before any worker exists. The record picks the host;
+ * anything cross or unknown refuses here rather than at the first worker.
  */
-async function pinBurstCore(manifest: Record<string, unknown> | null): Promise<BurstCorePin | null> {
+async function pinBurstCore(manifest: Record<string, unknown> | null, cwd: string): Promise<BurstHostPin | null> {
+	const record = readBurstManifest(manifest);
+	if (!record) {
+		logDiag("error", "[burst-flash] manifest is not v2/hc or v3/tmux (no pool identity) — burst spawn refused");
+		return null;
+	}
+	return record.backend === "tmux" ? pinTmuxPool(record, getManifestPath(cwd)) : pinHcPool(record);
+}
+
+/**
+ * v2/hc pin: an explicit selector, a live root terminal, and a probe whose id
+ * matches the record's core. Anything else fails closed, because a wrong core
+ * would give us addresses we cannot own.
+ */
+async function pinHcPool(record: BurstManifestHc): Promise<BurstHostPin | null> {
 	const env = process.env;
 	const rootAddress = rootTerminalAddress(env);
 	if (!rootAddress) {
@@ -545,13 +698,8 @@ async function pinBurstCore(manifest: Record<string, unknown> | null): Promise<B
 		logDiag("error", "[burst-flash] HC_SESSION/HC_SOCKET is not set — refusing to run against the default core");
 		return null;
 	}
-	const v2 = readBurstManifest(manifest);
-	if (!v2) {
-		logDiag("error", "[burst-flash] manifest is not v2 (no coreIdentity.id/rootTerminalAddress) — burst spawn refused");
-		return null;
-	}
-	if (rootAddress !== v2.rootAddress) {
-		logDiag("error", `[burst-flash] HC_TERMINAL_ID ${rootAddress} is not the pool root ${v2.rootAddress} — burst spawn refused`);
+	if (rootAddress !== record.rootAddress) {
+		logDiag("error", `[burst-flash] HC_TERMINAL_ID ${rootAddress} is not the pool root ${record.rootAddress} — burst spawn refused`);
 		return null;
 	}
 	const clientEnv = hcClientEnv(env);
@@ -566,50 +714,302 @@ async function pinBurstCore(manifest: Record<string, unknown> | null): Promise<B
 		logDiag("error", "[burst-flash] core probe returned no core id — burst spawn refused");
 		return null;
 	}
-	if (actual.id !== v2.coreId) {
-		logDiag("error", `[burst-flash] reached core ${actual.id}, not the pool core ${v2.coreId} — burst spawn refused`);
+	if (actual.id !== record.coreId) {
+		logDiag("error", `[burst-flash] reached core ${actual.id}, not the pool core ${record.coreId} — burst spawn refused`);
 		return null;
 	}
-	return { coreId: actual.id, rootAddress, clientEnv };
-}
-
-/** true = the pinned core is gone or replaced; null = cannot tell right now. */
-async function burstCoreReplaced(pin: BurstCorePin): Promise<boolean | null> {
-	try {
-		const actual = await probeCoreIdentity({ env: pin.clientEnv, timeoutMs: HC_PROBE_TIMEOUT_MS });
-		return actual.id !== pin.coreId;
-	} catch {
-		return null;
-	}
+	return { backend: "hc", coreId: actual.id, rootAddress, generation: record.generation, clientEnv };
 }
 
 /**
- * Reconcile a name whose spawn reply was uncertain. The helper already retires a
- * terminal it could prove; this covers the rest.
- * shortcut: reads `hc ls` here instead of through the helper, which does not
- * export its list helper yet; drop this once it does.
+ * v3/tmux pin: this pane's captured server tuple, the launcher pid that is the
+ * pane's direct program, the live complete tuple/session/root pane, and the
+ * module's own read-only snapshot must all describe one live pool.
  */
-async function findBurstTerminalByName(pin: BurstCorePin, name: string): Promise<string | null | undefined> {
-	// Prove the same pinned core before and after the list. Unavailable, replaced or
-	// ambiguous cores can never prove absence; only a valid list on the same core can.
-	if (await burstCoreReplaced(pin) !== false) return undefined;
-	let reply: any;
-	try {
-		const { stdout } = await execFileAsync("hc", ["ls", "--all", "--json"], {
-			env: pin.clientEnv,
-			timeout: HC_LS_TIMEOUT_MS,
-			maxBuffer: 256 * 1024,
-		});
-		reply = JSON.parse(String(stdout).trim());
-	} catch {
-		return undefined;
+async function pinTmuxPool(record: BurstManifestTmux, manifestPath: string): Promise<BurstHostPin | null> {
+	const refuse = (message: string): null => {
+		logDiag("error", `[burst-flash] ${message} — burst spawn refused`);
+		return null;
+	};
+	const env = process.env;
+	const rootAddress = tmuxRootPane(env);
+	if (!rootAddress) return refuse("TMUX_PANE is not set: this Mind is not running in a tmux pane");
+	if (rootAddress !== record.rootAddress) {
+		return refuse(`TMUX_PANE ${rootAddress} is not the pool root ${record.rootAddress}`);
 	}
-	if (await burstCoreReplaced(pin) !== false) return undefined;
-	if (!Array.isArray(reply?.terminals)) return undefined;
-	const owned = reply.terminals.filter((t: any) => t?.name === name && t?.parent === pin.rootAddress && t?.state === "live");
+	const captured = tmuxServerHint(env);
+	if (!captured) return refuse("TMUX is not <socket>,<pid>,<start-time>");
+	if (captured.socketPath !== record.server.socketPath || captured.pid !== record.server.pid) {
+		return refuse(`this pane is on tmux server ${captured.socketPath},${captured.pid}, not the recorded ${record.server.socketPath},${record.server.pid}`);
+	}
+	// The launcher is the pane's direct program; Mind is its child, so process.pid
+	// can never prove root ownership here.
+	const launcherPid = tmuxLauncherPid(env);
+	if (launcherPid === null) {
+		return refuse("PI_MIND_WORKER_LAUNCHER_PID is not set: cannot prove the pane's root program");
+	}
+	const clientEnv = tmuxClientEnv(env);
+	let probe: Awaited<ReturnType<typeof probeTmuxRoot>>;
+	try {
+		probe = probeTmuxRoot({ clientEnv, expectedPid: launcherPid });
+	} catch (err) {
+		return refuse(`root probe failed: ${errorMessage(err)}`);
+	}
+	const live = probe.server;
+	if (live.socketPath !== record.server.socketPath || live.pid !== record.server.pid
+		|| live.startTime !== record.server.startTime || live.version !== record.server.version) {
+		return refuse(`tmux server ${live.socketPath}#${live.pid}.${live.startTime} is not the recorded tuple`);
+	}
+	if (probe.session.id !== record.session.id || probe.session.created !== record.session.created) {
+		return refuse(`tmux session ${probe.session.id} is not the recorded ${record.session.id}`);
+	}
+	if (probe.rootPane.paneId !== record.rootPane.paneId || probe.rootPane.panePid !== record.rootPane.panePid
+		|| probe.rootPane.startCommand !== record.rootPane.startCommand) {
+		return refuse(`root pane ${probe.rootPane.paneId} does not match the recorded root pane`);
+	}
+	// The record's coreIdentity.id is authoritative; the probe derives it from the
+	// same tuple, so this compares the two instead of inventing a format here.
+	if (probe.coreIdentity.id !== record.coreId) {
+		return refuse(`live core ${probe.coreIdentity.id} is not the recorded core ${record.coreId}`);
+	}
+	let snapshot: Awaited<ReturnType<typeof inspectPool>>;
+	try {
+		snapshot = await inspectPool({ manifestPath });
+	} catch (err) {
+		return refuse(`pool snapshot failed: ${errorMessage(err)}`);
+	}
+	if (!snapshot.valid || snapshot.server !== "live" || snapshot.root !== "live") {
+		return refuse(`pool is not live (server ${snapshot.server}, root ${snapshot.root})`);
+	}
+	const fresh = readBurstManifest(snapshot.record as Record<string, unknown> | null);
+	if (!fresh || fresh.backend !== "tmux" || tmuxPoolKey(fresh) !== tmuxPoolKey(record)) {
+		return refuse("the pool record changed while pinning");
+	}
+	return {
+		backend: "tmux",
+		coreId: record.coreId,
+		rootAddress,
+		generation: record.generation,
+		clientEnv,
+		manifestPath,
+		poolKey: tmuxPoolKey(record),
+	};
+}
+
+/** The pool record must still be the pinned one: a launcher restart is not our run. */
+function pinStillCurrent(pin: BurstHostPin, cwd: string): boolean {
+	if (pin.backend !== "tmux" || !pin.poolKey) return true;
+	const record = readBurstManifest(readManifest(cwd));
+	return Boolean(record && record.backend === "tmux" && tmuxPoolKey(record) === pin.poolKey);
+}
+
+/** true = the pinned pool is gone or replaced; null = cannot tell right now. */
+async function burstCoreReplaced(pin: BurstHostPin): Promise<boolean | null> {
+	return burstHost(pin).replaced(pin);
+}
+
+/** One owned terminal on the pinned pool. `name` is hc's name or the tmux workerId. */
+interface BurstHostTerminal {
+	readonly address: string;
+	readonly name: string | null;
+}
+
+interface BurstHostSpawn {
+	readonly workerId: string;
+	readonly name: string | null;
+	readonly cwd: string;
+	readonly argv: string[];
+	readonly identity: Record<string, string>;
+}
+
+/**
+ * The host seam: hc and tmux differ only here. Every member proves the pinned
+ * pool itself, so no caller can reach a terminal on another pool.
+ */
+interface BurstHost {
+	spawn(pin: BurstHostPin, spec: BurstHostSpawn): Promise<{ address: string }>;
+	/** Live owned proof of one address; tmux's retire requires it before a kill. */
+	get(pin: BurstHostPin, address: string): Promise<BurstHostTerminal | null>;
+	/** Owned live terminals; null = cannot tell, never an empty proof. */
+	list(pin: BurstHostPin): Promise<BurstHostTerminal[] | null>;
+	retire(pin: BurstHostPin, address: string): Promise<void>;
+	replaced(pin: BurstHostPin): Promise<boolean | null>;
+}
+
+const HC_HOST: BurstHost = {
+	async spawn(pin, spec) {
+		const { address } = await spawnWorkerTerminal({
+			rootAddress: pin.rootAddress,
+			name: spec.name ?? undefined,
+			cwd: spec.cwd,
+			argv: spec.argv,
+			env: spec.identity,
+			clientEnv: pin.clientEnv,
+			expectedCoreId: pin.coreId,
+			timeoutMs: Math.min(BURST_CONNECT_TIMEOUT_MS, 15_000),
+		});
+		return { address };
+	},
+	async get(pin, address) {
+		const record = await getHcTerminal(address, {
+			env: pin.clientEnv,
+			expectedCoreId: pin.coreId,
+			rootAddress: pin.rootAddress,
+			timeoutMs: HC_PROBE_TIMEOUT_MS,
+		});
+		if (!record) return null;
+		return { address, name: typeof record.name === "string" ? record.name : null };
+	},
+	// shortcut: reads `hc ls` here instead of through the helper, which does not
+	// export its list helper yet; drop this once it does.
+	async list(pin) {
+		// Prove the same pinned core before and after the list. Unavailable, replaced or
+		// ambiguous cores can never prove absence; only a valid list on the same core can.
+		if (await HC_HOST.replaced(pin) !== false) return null;
+		let reply: any;
+		try {
+			const { stdout } = await execFileAsync("hc", ["ls", "--all", "--json"], {
+				env: pin.clientEnv,
+				timeout: HC_LS_TIMEOUT_MS,
+				maxBuffer: 256 * 1024,
+			});
+			reply = JSON.parse(String(stdout).trim());
+		} catch {
+			return null;
+		}
+		if (await HC_HOST.replaced(pin) !== false) return null;
+		if (!Array.isArray(reply?.terminals)) return null;
+		const owned = reply.terminals.filter((t: any) => t?.parent === pin.rootAddress && t?.state === "live");
+		// A record without a usable address proves nothing: cannot tell, not absent.
+		if (owned.some((t: any) => typeof t?.address !== "string" || !t.address)) return null;
+		return owned.map((t: any) => ({
+			address: t.address as string,
+			name: typeof t.name === "string" ? t.name : null,
+		}));
+	},
+	async retire(pin, address) {
+		await retireWorkerTerminal(address, {
+			env: pin.clientEnv,
+			expectedCoreId: pin.coreId,
+			rootAddress: pin.rootAddress,
+			timeoutMs: HC_PROBE_TIMEOUT_MS,
+		});
+	},
+	async replaced(pin) {
+		try {
+			const actual = await probeCoreIdentity({ env: pin.clientEnv, timeoutMs: HC_PROBE_TIMEOUT_MS });
+			return actual.id !== pin.coreId;
+		} catch {
+			return null;
+		}
+	},
+};
+
+function tmuxCallOptions(pin: BurstHostPin): Record<string, unknown> {
+	return {
+		manifestPath: pin.manifestPath,
+		clientEnv: pin.clientEnv,
+		expectedCoreId: pin.coreId,
+		rootAddress: pin.rootAddress,
+	};
+}
+
+const TMUX_HOST: BurstHost = {
+	async spawn(pin, spec) {
+		if (!pin.manifestPath) throw new Error("tmux pool pin carries no record path");
+		const { address } = await spawnTmuxWorkerTerminal({
+			manifestPath: pin.manifestPath,
+			workerId: spec.workerId,
+			rootAddress: pin.rootAddress,
+			name: spec.name ?? undefined,
+			cwd: spec.cwd,
+			argv: spec.argv,
+			env: spec.identity,
+			clientEnv: pin.clientEnv,
+			expectedCoreId: pin.coreId,
+		});
+		return { address };
+	},
+	async get(pin, address) {
+		const terminal = await getTmuxTerminal(address, tmuxCallOptions(pin));
+		if (!terminal) return null;
+		return { address, name: typeof terminal.name === "string" ? terminal.name : null };
+	},
+	async list(pin) {
+		let terminals: Awaited<ReturnType<typeof listOwnedTerminals>>;
+		try {
+			terminals = await listOwnedTerminals(tmuxCallOptions(pin));
+		} catch {
+			return null; // cannot tell: never an empty proof of absence
+		}
+		return terminals.map((terminal) => ({
+			address: terminal.address,
+			name: typeof terminal.name === "string" ? terminal.name : null,
+		}));
+	},
+	async retire(pin, address) {
+		// The module's own get is the live proof: an unproven or absent pane is never killed.
+		if (!(await TMUX_HOST.get(pin, address))) return;
+		await retireTmuxWorkerTerminal(address, tmuxCallOptions(pin));
+	},
+	async replaced(pin) {
+		if (!pin.manifestPath || !pin.poolKey) return true;
+		let snapshot: Awaited<ReturnType<typeof inspectPool>>;
+		try {
+			snapshot = await inspectPool({ manifestPath: pin.manifestPath });
+		} catch {
+			return null;
+		}
+		if (!snapshot.valid || snapshot.server !== "live" || snapshot.root !== "live") return true;
+		const record = readBurstManifest(snapshot.record as Record<string, unknown> | null);
+		if (!record || record.backend !== "tmux" || tmuxPoolKey(record) !== pin.poolKey) return true;
+		return false;
+	},
+};
+
+function burstHost(pin: BurstHostPin): BurstHost {
+	return pin.backend === "tmux" ? TMUX_HOST : HC_HOST;
+}
+
+/**
+ * hc and tmux name the same outcomes differently; they are mapped here, once, so
+ * the reconciliation and retirement logic above sees one vocabulary. A kind that
+ * stays unknown is "cannot tell", never "gone".
+ */
+function mapBurstError(pin: BurstHostPin, err: unknown): unknown {
+	if (pin.backend !== "tmux") return err; // hc's own kinds/spawnPending are the reference
+	const source = err as { kind?: string | null; spawnUnconfirmed?: boolean } | null;
+	const kind = source?.kind ?? null;
+	const mapped = new Error(errorMessage(err)) as Error & { kind?: string; spawnPending?: boolean };
+	if (source?.spawnUnconfirmed === true || kind === "spawn_unconfirmed") {
+		mapped.spawnPending = true;
+		mapped.kind = "spawn_unconfirmed";
+		return mapped;
+	}
+	// A record that changed identity is the pool restarting, not our terminal: the
+	// retirement logic treats this like a proven core replacement and never kills.
+	mapped.kind = kind === "stale_tuple" || kind === "stale_generation" || kind === "stale"
+		? "core_mismatch"
+		: kind ?? undefined;
+	return mapped;
+}
+
+/**
+ * Reconcile a worker whose spawn reply was uncertain. The helper already retires
+ * a terminal it could prove; this covers the rest. A tmux pane's recorded name is
+ * its workerId (the pane title is not identity); hc matches on the name it gave.
+ */
+async function findBurstTerminalByName(
+	pin: BurstHostPin,
+	ids: { workerId: string; name: string | null },
+): Promise<string | null | undefined> {
+	const terminals = await burstHost(pin).list(pin);
+	if (terminals === null) return undefined;
+	const wanted = pin.backend === "tmux" ? ids.workerId : ids.name;
+	const owned = terminals.filter((terminal) => terminal.name === wanted);
 	if (owned.length === 0) return null;
 	if (owned.length > 1) return undefined; // ambiguous: never pick one or claim absence
-	return typeof owned[0].address === "string" ? owned[0].address : undefined;
+	return owned[0].address;
 }
 
 // ── Burst flash workers ──────────────────────────────────────────────────────
@@ -629,7 +1029,7 @@ interface BurstWorkerState {
 	address: string | null;
 	/** Unique live name, kept while a spawn reply is uncertain. */
 	name: string | null;
-	pin: BurstCorePin | null;
+	pin: BurstHostPin | null;
 	lastTaskAt: number;
 	taskCount: number;
 	connectedAt: number;
@@ -817,7 +1217,7 @@ async function spawnBurstWorker(
 	manifest: Record<string, unknown> | null,
 	config: MindWorkerConfig,
 ): Promise<void> {
-	const pin = await pinBurstCore(manifest);
+	const pin = await pinBurstCore(manifest, cwd);
 	const current = burstWorkers.get(state.workerId) === state;
 	if (!pin) {
 		if (current) burstWorkers.delete(state.workerId);
@@ -841,8 +1241,12 @@ async function spawnBurstWorker(
 	logDiag("error", `[burst-flash] spawning ${state.workerId} terminal=${name} model=${config.burstFlash.model}`);
 
 	try {
-		const { address } = await spawnWorkerTerminal({
-			rootAddress: pin.rootAddress,
+		// A launcher restart between the pin and this spawn must not get a pane.
+		if (!pinStillCurrent(pin, cwd)) {
+			throw new Error(`pool ${pin.coreId} is no longer the live record; refusing to spawn`);
+		}
+		const { address } = await burstHost(pin).spawn(pin, {
+			workerId: state.workerId,
 			name,
 			cwd,
 			argv: buildBurstWorkerArgv({
@@ -850,30 +1254,27 @@ async function spawnBurstWorker(
 				model: config.burstFlash.model,
 				thinking: config.burstFlash.thinkingLevel,
 			}),
-			env: burstWorkerIdentity({
+			identity: burstWorkerIdentity({
 				workerId: state.workerId,
 				generation: state.generation,
 				sessionDir: state.sessionDir,
 			}),
-			clientEnv: pin.clientEnv,
-			expectedCoreId: pin.coreId,
-			timeoutMs: Math.min(BURST_CONNECT_TIMEOUT_MS, 15_000),
 		});
 		onBurstSpawned(state, address, cwd);
 	} catch (err) {
-		onBurstSpawnFailed(state, err, cwd);
+		onBurstSpawnFailed(state, mapBurstError(pin, err), cwd);
 	}
 }
 
 /** The pool envelope/env root this spawn started under must still be the live one. */
 function burstSpawnResultStale(state: BurstWorkerState, cwd: string): boolean {
 	if (!state.pin) return true;
-	const v2 = readBurstManifest(readManifest(cwd));
-	if (!v2) return true;
-	if (state.generation !== v2.generation) return true;
-	if (state.pin.coreId !== v2.coreId) return true;
-	if (state.pin.rootAddress !== v2.rootAddress) return true;
-	if (rootTerminalAddress(process.env) !== state.pin.rootAddress) return true;
+	const record = readBurstManifest(readManifest(cwd));
+	if (!record) return true;
+	if (state.generation !== record.generation) return true;
+	if (state.pin.coreId !== record.coreId) return true;
+	if (state.pin.rootAddress !== record.rootAddress) return true;
+	if (currentRootAddress(state.pin.backend) !== state.pin.rootAddress) return true;
 	return false;
 }
 
@@ -908,7 +1309,7 @@ function onBurstSpawnFailed(state: BurstWorkerState, err: unknown, cwd: string):
 	if (burstWorkers.get(state.workerId) !== state) {
 		// Never mutate newer state. A stale unconfirmed failure may have left a
 		// name-only terminal on the OLD root; retire it only if that core still answers.
-		if (unconfirmed && state.pin && state.name) void retireOldOwnedName(state.pin, state.name);
+		if (unconfirmed && state.pin && state.name) void retireOldOwnedName(state.pin, state.workerId, state.name);
 		logDiag("warn", `[burst-flash] ${state.workerId} stale spawn ${unconfirmed ? "unconfirmed" : "failed"}: ${message}`);
 		return;
 	}
@@ -918,7 +1319,7 @@ function onBurstSpawnFailed(state: BurstWorkerState, err: unknown, cwd: string):
 		if (unconfirmed) {
 			state.spawnSettled = true;
 			if (state.retireReason) retireBurstFlash(state.workerId, state.retireReason);
-			if (state.pin && state.name) void retireOldOwnedName(state.pin, state.name);
+			if (state.pin && state.name) void retireOldOwnedName(state.pin, state.workerId, state.name);
 		} else {
 			// Deterministic pre-spawn failure: no terminal exists, so the old entry may go.
 			burstWorkers.delete(state.workerId);
@@ -946,27 +1347,22 @@ function onBurstSpawnFailed(state: BurstWorkerState, err: unknown, cwd: string):
 	logDiag("error", `[burst-flash] ${state.workerId} spawn ${unconfirmed ? "unconfirmed" : "failed"}: ${message}`);
 }
 
-/** A stale name-only failure: retire the terminal only if the OLD core still answers. */
-async function retireOldOwnedName(pin: BurstCorePin, name: string): Promise<void> {
+/** A stale name-only failure: retire the terminal only if the OLD pool still answers. */
+async function retireOldOwnedName(pin: BurstHostPin, workerId: string, name: string): Promise<void> {
 	const replaced = await burstCoreReplaced(pin);
 	if (replaced !== false) return; // restarted or unknowable: addresses mean nothing
-	const found = await findBurstTerminalByName(pin, name);
+	const found = await findBurstTerminalByName(pin, { workerId, name });
 	if (typeof found !== "string") return;
 	await retireOldOwnedAddress(found, pin);
 }
 
-/** A late success may only kill an address the pinned OLD core still owns. */
-async function retireOldOwnedAddress(address: string, pin: BurstCorePin | null): Promise<void> {
+/** A late success may only kill an address the pinned OLD pool still owns. */
+async function retireOldOwnedAddress(address: string, pin: BurstHostPin | null): Promise<void> {
 	if (!pin) return;
 	const replaced = await burstCoreReplaced(pin);
 	if (replaced !== false) return; // restarted or unknowable: addresses mean nothing
 	try {
-		await retireWorkerTerminal(address, {
-			env: pin.clientEnv,
-			expectedCoreId: pin.coreId,
-			rootAddress: pin.rootAddress,
-			timeoutMs: HC_PROBE_TIMEOUT_MS,
-		});
+		await burstHost(pin).retire(pin, address);
 		logDiag("warn", `[burst-flash] retired stale terminal ${address}`);
 	} catch { /* already gone or not proven ours: drop the result */ }
 }
@@ -1052,7 +1448,9 @@ async function driveBurstRetirement(state: BurstWorkerState): Promise<void> {
 			if (!state.spawnSettled) {
 				// The old attempt is not proven settled. A name absence is not proof, but a
 				// terminal found by its unique pinned name may still be retired.
-				const found = state.name ? await findBurstTerminalByName(pin, state.name) : null;
+				const found = state.name
+					? await findBurstTerminalByName(pin, { workerId: state.workerId, name: state.name })
+					: null;
 				if (typeof found === "string") {
 					state.address = found;
 				} else {
@@ -1091,18 +1489,15 @@ async function driveBurstRetirement(state: BurstWorkerState): Promise<void> {
 			if (attempt > 0) await sleepMs(BURST_RETIRE_RETRY_MS[attempt]);
 			state.retireAttempts = attempt + 1;
 			try {
-				// --rm: the first successful kill reports not_found ("was removed"); the helper
-				// accepts that and confirms death with bounded hc get polling on the pinned core.
-				await retireWorkerTerminal(address, {
-					env: pin.clientEnv,
-					expectedCoreId: pin.coreId,
-					rootAddress: pin.rootAddress,
-					timeoutMs: HC_PROBE_TIMEOUT_MS,
-				});
+				// hc: --rm reports the first successful kill as not_found ("was removed") and the
+				// helper confirms death with bounded get polling. tmux: the module re-proves the
+				// pane (markers, window, pid, start command) before it kills it.
+				await burstHost(pin).retire(pin, address);
 				finishBurstRetirement(state, address);
 				return;
 			} catch (err) {
-				const kind = (err as { kind?: string } | null)?.kind ?? null;
+				const error = mapBurstError(pin, err);
+				const kind = (error as { kind?: string } | null)?.kind ?? null;
 				if (kind === "not_owned") {
 					// The address belongs to someone else now, so our terminal is already gone.
 					finishBurstRetirement(state, address);
@@ -1117,7 +1512,7 @@ async function driveBurstRetirement(state: BurstWorkerState): Promise<void> {
 					}
 					// Unavailable/unknown core: keep the terminal tracked for a later retry.
 				}
-				logDiag("warn", `[burst-flash] ${state.workerId} retire attempt ${attempt + 1} failed for ${address}: ${errorMessage(err)}`);
+				logDiag("warn", `[burst-flash] ${state.workerId} retire attempt ${attempt + 1} failed for ${address}: ${errorMessage(error)}`);
 			}
 		}
 		// Bounded schedule exhausted and the terminal still reports live: stay tracked so the
@@ -1132,10 +1527,10 @@ async function driveBurstRetirement(state: BurstWorkerState): Promise<void> {
 	}
 }
 
-/** Reconcile a name-only entry against the pinned core. */
+/** Reconcile a name-only entry against the pinned pool. */
 async function resolveBurstAddress(
 	state: BurstWorkerState,
-	pin: BurstCorePin,
+	pin: BurstHostPin,
 ): Promise<{ address?: string; absent?: boolean }> {
 	if (!state.name) return { absent: true }; // nothing was ever spawned
 	for (let attempt = 0; attempt < BURST_RETIRE_RETRY_MS.length; attempt++) {
@@ -1143,7 +1538,7 @@ async function resolveBurstAddress(
 		if (burstWorkers.get(state.workerId) !== state) return { absent: true };
 		// A restarted core cannot own our address: the terminal went with the old core.
 		if (await burstCoreReplaced(pin) === true) return { absent: true };
-		const found = await findBurstTerminalByName(pin, state.name);
+		const found = await findBurstTerminalByName(pin, { workerId: state.workerId, name: state.name });
 		if (typeof found === "string") return { address: found };
 		if (found === null) return { absent: true };
 		// undefined: unknown (unavailable, replaced, ambiguous or malformed list) —
@@ -1251,6 +1646,36 @@ function restoreBurstCounter(snapshot: PersistedBurstSnapshot): void {
 }
 
 /**
+ * The pin an adopted entry retires against: the same selectors this process has
+ * now, or null when this process is not in the pool's own host.
+ */
+function persistedHostPin(pool: BurstManifest, cwd: string): BurstHostPin | null {
+	if (pool.backend === "hc") {
+		if (!hasCoreSelector(process.env)) return null;
+		if (rootTerminalAddress(process.env) !== pool.rootAddress) return null;
+		return {
+			backend: "hc",
+			coreId: pool.coreId,
+			rootAddress: pool.rootAddress,
+			generation: pool.generation,
+			clientEnv: hcClientEnv(process.env),
+		};
+	}
+	if (tmuxRootPane(process.env) !== pool.rootAddress) return null;
+	const captured = tmuxServerHint(process.env);
+	if (!captured || captured.socketPath !== pool.server.socketPath || captured.pid !== pool.server.pid) return null;
+	return {
+		backend: "tmux",
+		coreId: pool.coreId,
+		rootAddress: pool.rootAddress,
+		generation: pool.generation,
+		clientEnv: tmuxClientEnv(process.env),
+		manifestPath: getManifestPath(cwd),
+		poolKey: tmuxPoolKey(pool),
+	};
+}
+
+/**
  * /reload re-evaluates this module and loses the map. The snapshot was taken
  * before the heartbeat could overwrite it; adopt only entries the envelope and
  * core prove this pool still owns, and retire them — never idle work, never a
@@ -1260,20 +1685,19 @@ async function adoptPersistedBursts(cwd: string, snapshot: PersistedBurstSnapsho
 	if (burstWorkers.size > 0) return;
 	if (!snapshot.envelope || snapshot.entries.length === 0) return;
 	const manifest = readManifest(cwd);
-	const v2 = readBurstManifest(manifest);
-	if (!v2) return;
-	if (v2.coreId !== snapshot.envelope.coreId
-		|| v2.rootAddress !== snapshot.envelope.rootAddress
-		|| v2.generation !== snapshot.envelope.generation) {
+	const pool = readBurstManifest(manifest);
+	if (!pool) return;
+	if (pool.coreId !== snapshot.envelope.coreId
+		|| pool.rootAddress !== snapshot.envelope.rootAddress
+		|| pool.generation !== snapshot.envelope.generation) {
 		logDiag("warn", "[burst-flash] persisted burst snapshot belongs to another pool envelope — not adopted");
 		return;
 	}
-	// The envelope/manifest match already proves the pool. Do not require a live probe
-	// here: an unavailable core must not lose the durable cleanup record. Every later
-	// retirement still pins this core id and fails closed on a mismatch.
-	if (!hasCoreSelector(process.env)) return;
-	if (rootTerminalAddress(process.env) !== v2.rootAddress) return;
-	const pin: BurstCorePin = { coreId: v2.coreId, rootAddress: v2.rootAddress, clientEnv: hcClientEnv(process.env) };
+	// The envelope/record match already proves the pool. Do not require a live probe
+	// here: an unavailable host must not lose the durable cleanup record. Every later
+	// retirement still pins this pool and fails closed on a mismatch.
+	const pin = persistedHostPin(pool, cwd);
+	if (!pin) return;
 	let adopted = 0;
 	for (const entry of snapshot.entries) {
 		if (!entry || typeof entry.workerId !== "string" || !entry.workerId) continue;
@@ -1281,12 +1705,12 @@ async function adoptPersistedBursts(cwd: string, snapshot: PersistedBurstSnapsho
 		const address = typeof entry.address === "string" && entry.address ? entry.address : null;
 		if (!name && !address) continue; // nothing was ever spawned
 		if (entry.coreId !== pin.coreId || entry.rootAddress !== pin.rootAddress) continue;
-		if (typeof entry.generation === "number" && entry.generation !== v2.generation) continue;
+		if (typeof entry.generation === "number" && entry.generation !== pool.generation) continue;
 		const state: BurstWorkerState = {
 			workerId: entry.workerId,
 			index: typeof entry.index === "number" ? entry.index : 0,
 			spawnedAt: typeof entry.spawnedAt === "number" ? entry.spawnedAt : Date.now(),
-			generation: typeof entry.generation === "number" ? entry.generation : v2.generation,
+			generation: typeof entry.generation === "number" ? entry.generation : pool.generation,
 			sessionDir: typeof entry.sessionDir === "string" ? entry.sessionDir : "",
 			logPath: typeof entry.logFile === "string" ? entry.logFile : "",
 			terminalState: "retiring",
@@ -1563,12 +1987,9 @@ function writeControlFileStatus(cwd: string, status: string, message?: string): 
 		// reloaded module never reuses an id/name and only adopts its own core/root.
 		data.burstCounter = burstCounter;
 		{
-			const core = (manifest as any)?.coreIdentity;
-			const coreId = typeof core?.id === "string" && core.id ? core.id : null;
-			const rootAddress = typeof (manifest as any)?.rootTerminalAddress === "string" && (manifest as any).rootTerminalAddress
-				? (manifest as any).rootTerminalAddress
-				: null;
-			if (coreId && rootAddress) data.burstEnvelope = { coreId, rootAddress, generation };
+			// v2/hc and v3/tmux both name their pool here: core id, root address, generation.
+			const pool = readBurstManifest(manifest);
+			if (pool) data.burstEnvelope = { coreId: pool.coreId, rootAddress: pool.rootAddress, generation };
 		}
 
 		// Dashboard extension: add schema v2 fields when dashboardEnabled
@@ -1699,6 +2120,30 @@ function writeManifestRunning(cwd: string): void {
 	try {
 		const manifest = readManifest(cwd);
 		if (!manifest) return; // no manifest → legacy path, skip
+		// v3 records are written only through the module's locked update helper: a
+		// plain read-modify-write here would drop a fresh owner/run/generation or a
+		// worker pane the launcher registered since we read the file.
+		if (manifest.schemaVersion === 3 || manifest.terminalBackend === "tmux") {
+			const pool = readBurstManifest(manifest);
+			if (!pool || pool.backend !== "tmux") {
+				logDiag("warn", "[mind-worker] v3 manifest state update skipped: the record is not a valid tmux pool");
+				return;
+			}
+			const currentState = typeof manifest.state === "string" ? manifest.state : "starting";
+			if (currentState === "running") return;
+			if (!validateStateTransition(currentState, "running")) {
+				logDiag("error", `[mind-worker] Invalid manifest transition: ${currentState} → running`);
+				return;
+			}
+			void updatePoolManifest(
+				manifestPath,
+				{ state: "running", lastUpdated: Date.now() },
+				{ owner: pool.owner, run: pool.run, generation: pool.generation, expectedCoreId: pool.coreId },
+			).catch((err: unknown) => {
+				logDiag("warn", `[mind-worker] v3 manifest state update refused: ${errorMessage(err)}`);
+			});
+			return;
+		}
 		if (manifest.state === "running") return;
 		if (!validateStateTransition(manifest.state as string, "running")) {
 			logDiag("error", `[mind-worker] Invalid manifest transition: ${manifest.state} → running`);
@@ -1799,8 +2244,8 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 		if (parsed.resetTimeout !== undefined && (typeof parsed.resetTimeout !== "number" || parsed.resetTimeout <= 0)) {
 			logDiag("warn", "[mind-worker] resetTimeout must be a positive number — using default 5");
 		}
-		if (parsed.terminalBackend !== undefined && parsed.terminalBackend !== "hc") {
-			logDiag("warn", `[mind-worker] terminalBackend "${String(parsed.terminalBackend)}" is no longer supported — hc is the only backend; ignoring it`);
+		if (parsed.terminalBackend !== undefined && parsed.terminalBackend !== "hc" && parsed.terminalBackend !== "tmux") {
+			logDiag("warn", `[mind-worker] terminalBackend "${String(parsed.terminalBackend)}" is not hc or tmux — the launcher record decides; ignoring it`);
 		}
 		if (parsed.workerCount !== undefined && (typeof parsed.workerCount !== "number" || parsed.workerCount < 1 || parsed.workerCount > 10)) {
 			logDiag("warn", "[mind-worker] workerCount must be 1-10 — using default 3");
@@ -1858,7 +2303,7 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 			ntfyServer: parsed.ntfyServer || DEFAULT_CONFIG.ntfyServer,
 			resetTimeout: typeof parsed.resetTimeout === "number" && parsed.resetTimeout > 0
 				? parsed.resetTimeout : DEFAULT_CONFIG.resetTimeout,
-			terminalBackend: parsed.terminalBackend === "hc" ? "hc" : undefined,
+			terminalBackend: parsed.terminalBackend === "hc" || parsed.terminalBackend === "tmux" ? parsed.terminalBackend : undefined,
 			workerCount: wc,
 			workerModels: parsed.workerModels,
 			dashboardEnabled: parsed.dashboardEnabled !== false,

@@ -1,8 +1,8 @@
 # Mind-Worker Reset & Launcher Design
 
-**Status:** Ratified — resolved in mind-worker grilling session 2.
+**Status:** Ratified — resolved in mind-worker grilling session 2. Preserved as historical HC/Herdr design.
 
-> **Current runtime:** `bin/mind-worker-launcher` is Herdr-only. Mind stays in the invoking Herdr session; workers use the separate shared `pi-workers` session with per-project workspaces. Kitty-specific references below describe the retired Kitty pair launcher and are historical only. Manual `/be-mind` / `/be-worker` role restore and the optional burst-worker Kitty path remain supported and are not that retired pair launcher.
+> **Historical HC/Herdr design note:** This document specifies the original Kitty/Herdr launcher and reset design. It is not the current runtime description. The current `bin/mind-worker-launcher` supports the `hc` and `tmux` backends (`--backend` > `mind-worker.json` > `hc`); see `README.md` and `lib/mind-worker/tmux-terminal.mjs` / `tmux-cleanup.mjs`. The body below is preserved as the original design; Kitty-specific passages remain historical.
 
 **Supersedes:** Legacy command-based role switching (`/be-mind`, `/be-worker`, etc.) for startup/reset lifecycle. Core protocol (socket, delegate tool, workflow steps) remains unchanged.
 
