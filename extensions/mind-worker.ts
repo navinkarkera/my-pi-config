@@ -3013,9 +3013,9 @@ function handleWorkerConnectionClose(
 	ctx: ExtensionContext,
 	opts?: { deferQueueFlush?: boolean },
 ): void {
+	// Ignore unregistered or retired sockets before reading a possibly stale session ctx.
+	if (!workerId || workerPool.get(workerId)?.socket !== socket) return;
 	const cwd = ctx.cwd;
-	// Stale socket: a replacement for this worker is already installed (I5).
-	if (workerId && workerPool.get(workerId)?.socket !== socket) return;
 	// A drain captured on this socket can never be acknowledged now.
 	for (const drain of [...abortDrains.values()]) {
 		if (drain.socket !== socket) continue;
