@@ -12,7 +12,6 @@
   ],
   "workerModel": "opencode-go/deepseek-v4.1-flash",
   "workerThinkingLevel": "max",
-  "terminalBackend": "hc",
   "resetTimeout": 5,
   "workerCount": 3,
   "dashboardEnabled": true,

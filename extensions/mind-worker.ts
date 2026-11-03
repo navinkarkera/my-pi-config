@@ -5,35 +5,26 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CustomEditor, getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { parseGitArgs } from "../lib/mind-worker/git-command.mjs";
-// The one place that starts and retires hc terminals (argv only, no HC_* passthrough).
+// The Go adapter seam: the only host. Every export is inert unless
+// MINDMUX_ADAPTER_SOCKET and MINDMUX_MANIFEST are both set.
 import {
-	getTerminal as getHcTerminal,
-	probeCoreIdentity,
-	retireWorkerTerminal,
-	spawnWorkerTerminal,
-} from "../lib/mind-worker/hc-terminal.mjs";
-// The tmux side of the same seam: a v3 record is proved and driven by that module
-// only. It is imported statically because it reads nothing at import time.
-import {
-	getTerminal as getTmuxTerminal,
-	inspectPool,
-	listOwnedTerminals,
-	probeTmuxRoot,
-	retireWorkerTerminal as retireTmuxWorkerTerminal,
-	spawnWorkerTerminal as spawnTmuxWorkerTerminal,
-	updatePoolManifest,
-} from "../lib/mind-worker/tmux-terminal.mjs";
+	appendEditorDraft as appendMindmuxDraft,
+	createMindmuxClient,
+	instanceLabel as mindmuxInstanceLabel,
+	mindmuxEnvProblem,
+	readMindmuxEnv,
+	scopedTaskId as mindmuxScopedTaskId,
+	startDraftSocket as startMindmuxDraftSocket,
+} from "../lib/mind-worker/mindmux-host.mjs";
 // Pi's package entry does not export the ThinkingLevel union; the helper owns it.
 import { resolveThinkingLevel, type ThinkingLevel } from "../lib/mind-worker/thinking-level.mjs";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
-/** Resolved path to the pi CLI binary via the installed package. */
-const PI_CLI = join(getPackageDir(), "dist", "cli.js");
 
 type Role = "none" | "mind" | "worker";
 
@@ -64,16 +55,10 @@ interface MindWorkerConfig {
 	workerThinkingLevel: ThinkingLevel;
 	timeout: number;
 	statusStream: boolean;
-	autoSpawnWorker: boolean;
 	notifyOnMindIdle: boolean;
 	ntfyTopic: string;
 	ntfyServer: string;
 	resetTimeout: number;
-	/**
-	 * Advisory only: the launcher's own record selects the backend (v2/hc or
-	 * v3/tmux). An unknown value is reported and ignored.
-	 */
-	terminalBackend?: "hc" | "tmux";
 	workerCount: number;
 	workerModels?: Array<{ model: string; count: number; tier?: string; thinkingLevel?: ThinkingLevel }>;
 	dashboardEnabled: boolean;
@@ -142,12 +127,10 @@ const DEFAULT_CONFIG: MindWorkerConfig = {
 	workerThinkingLevel: "max",
 	timeout: 120,
 	statusStream: true,
-	autoSpawnWorker: true,
 	notifyOnMindIdle: false,
 	ntfyTopic: "",
 	ntfyServer: "https://ntfy.sh",
 	resetTimeout: 5,
-	terminalBackend: "hc",
 	workerCount: 3,
 	workerModels: undefined,
 	dashboardEnabled: true,
@@ -167,8 +150,16 @@ const GIT_TIMEOUT_MS = 120_000;
 /** Parsed from env var PI_MIND_WORKER_ROLE (launcher path) or --mind-worker-role CLI flag (legacy). null = legacy path. */
 const LAUNCHER_ROLE_FLAG: Role | null = parseEnvRole() ?? parseRoleFlag(process.argv);
 
-/** Launcher instance label (--instance). Prefixes every cwd-derived id so parallel pairs in one cwd stay isolated. */
-const INSTANCE_LABEL = process.env.PI_MIND_WORKER_INSTANCE || null;
+/**
+ * Launcher instance label (--instance), or the mindmux session+generation key.
+ * Prefixes every cwd-derived id, so parallel pairs in one cwd stay isolated and a
+ * force-orphan of an older generation can never share a socket, control file or
+ * manifest with the live pool. Read per call: the env is set before module import
+ * on the launcher path, and the Go adapter re-reads it after a reload.
+ */
+function taskInstanceLabel(): string | null {
+	return mindmuxInstanceLabel(process.env);
+}
 
 /** Parsed from env var PI_MIND_WORKER_GENERATION (launcher path). null = not set. */
 const LAUNCHER_GENERATION: number | null = parseEnvGeneration();
@@ -470,14 +461,12 @@ let dashboardHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let lastDashboardStatus = "";
 let lastDashboardCwd = "";
 
-// // ── Burst identity ───────────────────────────────────────────────────────────
+// ── Burst identity ──────────────────────────────────────────────────────────
 
 /** A child that has not handshaked by now is retired, not merely labelled. */
 const BURST_CONNECT_TIMEOUT_MS = 60_000;
 /** Bounded retirement: after these attempts the record stays tracked for the next sweep. */
 const BURST_RETIRE_RETRY_MS = [500, 1500, 3000];
-const HC_PROBE_TIMEOUT_MS = 5_000;
-const HC_LS_TIMEOUT_MS = 5_000;
 
 const sleepMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -485,330 +474,77 @@ function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
 
-/** The parentless app terminal this Mind runs in; the parent of every worker. */
-function rootTerminalAddress(env: NodeJS.ProcessEnv = process.env): string | null {
-	return env.HC_TERMINAL_ID || null;
-}
 
-/** Selectors and dirs the hc CLI needs to reach the same core. Memory only, never persisted. */
-const HC_CLIENT_ENV_KEYS = [
-	"HC_SOCKET", "HC_TERMINAL_SOCKET", "HC_SESSION", "HC_SCOPE",
-	"XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "PATH", "HOME",
-];
-
-function hcClientEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
-	const snapshot: Record<string, string> = {};
-	for (const key of HC_CLIENT_ENV_KEYS) {
-		const value = env[key];
-		if (typeof value === "string" && value) snapshot[key] = value;
-	}
-	return snapshot;
-}
-
-/** Without HC_SESSION or HC_SOCKET, hc silently selects the user's default core. */
-function hasCoreSelector(env: NodeJS.ProcessEnv = process.env): boolean {
-	return Boolean(env.HC_SESSION?.trim() || env.HC_SOCKET?.trim());
-}
-
-type BurstBackend = "hc" | "tmux";
-
-/**
- * The pool this run belongs to, proved before any worker exists. The backend is
- * never config or guesswork: it is the launcher's own record, v2/hc or v3/tmux.
- */
+/** The pool this run belongs to, pinned from the Go adapter env before any worker exists. */
 interface BurstHostPin {
-	readonly backend: BurstBackend;
-	/** hc's probed core id, or the v3 record's coreIdentity.id. Never derived here. */
-	readonly coreId: string;
-	/** hc terminal address, or the tmux root %pane of the pool. */
-	readonly rootAddress: string;
 	readonly generation: number;
-	/** Selector snapshot every later call reuses. Never written to disk. */
-	readonly clientEnv: Record<string, string>;
-	/** v3 only: the record the module locks, and its identity as pinned. */
-	readonly manifestPath?: string;
-	readonly poolKey?: string;
+	/** The namespace label this run derived its paths from. */
+	readonly instance: string | null;
+	/** The adapter socket this run is fenced to. Never re-read from env. */
+	readonly adapterSocket: string;
+	/** The client created with that env: every op stays on this pool, even after an env swap. */
+	readonly client: ReturnType<typeof createMindmuxClient>;
 }
-
-interface BurstManifestHc {
-	readonly backend: "hc";
-	readonly coreId: string;
-	readonly rootAddress: string;
-	readonly generation: number;
-}
-
-interface BurstManifestTmux {
-	readonly backend: "tmux";
-	readonly coreId: string;
-	readonly rootAddress: string;
-	readonly generation: number;
-	readonly owner: string;
-	readonly run: string;
-	readonly server: { socketPath: string; pid: number; startTime: number; version: string };
-	readonly session: { id: string; created: number };
-	readonly rootPane: { paneId: string; panePid: number; startCommand: string };
-}
-
-type BurstManifest = BurstManifestHc | BurstManifestTmux;
 
 const PANE_ID_RE = /^%[0-9]+$/;
-const SESSION_ID_RE = /^\$[0-9]+$/;
 
-function positiveInt(value: unknown): number | null {
-	return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
-}
-
-function nonNegativeInt(value: unknown): number | null {
-	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
 
 function oneLineText(value: unknown): string | null {
 	return typeof value === "string" && value && !/[\0\n\r]/.test(value) ? value : null;
 }
 
 /**
- * A v3/tmux record, read strictly. Every identity field is required: a v2,
- * legacy, cross (v3 with another backend) or malformed record is not a pool.
+ * Pin the run to one pool before any worker exists. The Go adapter env is the only
+ * proof; anything cross or unknown refuses here rather than at the first worker.
  */
-function readTmuxManifest(manifest: Record<string, any>): BurstManifestTmux | null {
-	if (manifest.schemaVersion !== 3 || manifest.terminalBackend !== "tmux") return null;
-	const coreId = oneLineText(manifest.coreIdentity?.id);
-	const owner = oneLineText(manifest.owner);
-	const run = oneLineText(manifest.run);
-	const generation = positiveInt(manifest.generation);
-	const server = manifest.server;
-	const session = manifest.session;
-	const rootPane = manifest.rootPane;
-	if (!coreId || !owner || !run || generation === null) return null;
-	if (!server || !rootPane || !session) return null;
-	const socketPath = oneLineText(server.socketPath);
-	const serverPid = positiveInt(server.pid);
-	const startTime = nonNegativeInt(server.startTime);
-	const version = oneLineText(server.version);
-	if (!socketPath || !socketPath.startsWith("/") || serverPid === null || startTime === null || !version) return null;
-	if (typeof session.id !== "string" || !SESSION_ID_RE.test(session.id)) return null;
-	const created = nonNegativeInt(session.created);
-	if (created === null) return null;
-	if (typeof rootPane.paneId !== "string" || !PANE_ID_RE.test(rootPane.paneId)) return null;
-	const rootPid = positiveInt(rootPane.panePid);
-	if (rootPid === null || typeof rootPane.startCommand !== "string") return null;
+async function pinBurstCore(): Promise<BurstHostPin | null> {
+	// The Go adapter is the only host: no hc probe, no record read, no tmux call.
+	const mindmux = readMindmuxEnv();
+	if (!mindmux) {
+		logDiag("error", "[burst-flash] mindmux adapter env is not set (MINDMUX_ADAPTER_SOCKET/MINDMUX_MANIFEST) - burst spawn refused");
+		return null;
+	}
+	return pinMindmuxPool(mindmux);
+}
+
+/**
+ * mindmux pin: the adapter env is the whole proof. Go owns the pool, the running
+ * transition and every worker's lifetime, so nothing here probes hc or reads the
+ * old record shape.
+ */
+function pinMindmuxPool(mx: NonNullable<ReturnType<typeof readMindmuxEnv>>): BurstHostPin | null {
+	if (mx.generation <= 0) {
+		logDiag("error", "[burst-flash] MINDMUX_GENERATION is missing — burst spawn refused");
+		return null;
+	}
+	const label = taskInstanceLabel();
+	if (!label) {
+		// Generation still isolates the Mind, but a worker can only derive the same
+		// path when Go passes the shared label. Reported, never silently shared.
+		logDiag("warn", "[mindmux] no PI_MIND_WORKER_INSTANCE/MINDMUX_SESSION_KEY: worker socket paths cannot be namespaced by session+generation (see /tmp/mindmux-pi-contract.txt)");
+	}
+	// Freeze the adapter for the life of this pin: a reload or an env swap must never
+	// redirect a late spawn reply or a cleanup sweep at a different pool.
 	return {
-		backend: "tmux",
-		coreId,
-		rootAddress: rootPane.paneId,
-		generation,
-		owner,
-		run,
-		server: { socketPath, pid: serverPid, startTime, version },
-		session: { id: session.id, created },
-		rootPane: { paneId: rootPane.paneId, panePid: rootPid, startCommand: rootPane.startCommand },
+		generation: mx.generation,
+		instance: label,
+		adapterSocket: mx.adapterSocket,
+		client: createMindmuxClient(process.env),
 	};
 }
 
-/** The pool record, or null for anything cross or unknown: those are never adopted. */
-function readBurstManifest(manifest: Record<string, unknown> | null): BurstManifest | null {
-	if (!manifest) return null;
-	if (manifest.schemaVersion === 3 || manifest.terminalBackend === "tmux") {
-		return readTmuxManifest(manifest as Record<string, any>);
-	}
-	// Exact v2 markers only: a record without them is legacy/unproven, never a burst pool.
-	if (manifest.schemaVersion !== 2 || manifest.terminalBackend !== "hc") return null;
-	const core = (manifest as any)?.coreIdentity;
-	const coreId = typeof core?.id === "string" && core.id ? core.id : null;
-	const rootAddress = typeof (manifest as any)?.rootTerminalAddress === "string"
-		? (manifest as any).rootTerminalAddress
-		: null;
-	const generation = positiveInt(manifest.generation);
-	if (!coreId || !rootAddress || generation === null) return null;
-	return { backend: "hc", coreId, rootAddress, generation };
+/** The pool must still be the pinned one: a reload or replacement is not our run. */
+function pinStillCurrent(pin: BurstHostPin): boolean {
+	const mx = readMindmuxEnv();
+	return Boolean(
+		mx
+		&& mx.generation === pin.generation
+		&& mx.adapterSocket === pin.adapterSocket
+		&& taskInstanceLabel() === pin.instance,
+	);
 }
 
-/** One canonical string for the whole v3 pool identity, so "same pool" is one compare. */
-function tmuxPoolKey(record: BurstManifestTmux): string {
-	return [
-		record.owner, record.run, record.generation, record.coreId,
-		record.server.socketPath, record.server.pid, record.server.startTime, record.server.version,
-		record.session.id, record.session.created,
-		record.rootPane.paneId, record.rootPane.panePid, record.rootPane.startCommand,
-	].join("\0");
-}
-
-/** The tmux server this Mind was started in, as tmux exports it: <socket>,<pid>,<start>. */
-function tmuxServerHint(env: NodeJS.ProcessEnv = process.env): { socketPath: string; pid: number } | null {
-	const tmux = typeof env.TMUX === "string" ? env.TMUX.trim() : "";
-	const parts = tmux.split(",");
-	if (parts.length !== 3) return null;
-	const pid = Number(parts[1]);
-	if (!parts[0].startsWith("/") || !Number.isSafeInteger(pid) || pid <= 0) return null;
-	return { socketPath: parts[0], pid };
-}
-
-/** The pool root pane this Mind runs in, or null. */
-function tmuxRootPane(env: NodeJS.ProcessEnv = process.env): string | null {
-	const pane = env.TMUX_PANE;
-	return typeof pane === "string" && PANE_ID_RE.test(pane) ? pane : null;
-}
-
-/** Memory-only client tuple for the tmux module. Never persisted, never a secret. */
-function tmuxClientEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
-	const snapshot: Record<string, string> = {};
-	for (const key of ["TMUX", "TMUX_PANE"]) {
-		const value = env[key];
-		if (typeof value === "string" && value) snapshot[key] = value;
-	}
-	return snapshot;
-}
-
-/** Mind is the launcher's child; the pane's direct program is the launcher, not Mind. */
-function tmuxLauncherPid(env: NodeJS.ProcessEnv = process.env): number | null {
-	return positiveInt(Number(env.PI_MIND_WORKER_LAUNCHER_PID));
-}
-
-/** The root this run must see: hc's root terminal id or the tmux root %pane. */
-function currentRootAddress(backend: BurstBackend, env: NodeJS.ProcessEnv = process.env): string | null {
-	return backend === "tmux" ? tmuxRootPane(env) : rootTerminalAddress(env);
-}
-
-/**
- * Pin the run to one pool before any worker exists. The record picks the host;
- * anything cross or unknown refuses here rather than at the first worker.
- */
-async function pinBurstCore(manifest: Record<string, unknown> | null, cwd: string): Promise<BurstHostPin | null> {
-	const record = readBurstManifest(manifest);
-	if (!record) {
-		logDiag("error", "[burst-flash] manifest is not v2/hc or v3/tmux (no pool identity) — burst spawn refused");
-		return null;
-	}
-	return record.backend === "tmux" ? pinTmuxPool(record, getManifestPath(cwd)) : pinHcPool(record);
-}
-
-/**
- * v2/hc pin: an explicit selector, a live root terminal, and a probe whose id
- * matches the record's core. Anything else fails closed, because a wrong core
- * would give us addresses we cannot own.
- */
-async function pinHcPool(record: BurstManifestHc): Promise<BurstHostPin | null> {
-	const env = process.env;
-	const rootAddress = rootTerminalAddress(env);
-	if (!rootAddress) {
-		logDiag("error", "[burst-flash] HC_TERMINAL_ID is not set — not a root app terminal, spawn refused");
-		return null;
-	}
-	if (!hasCoreSelector(env)) {
-		logDiag("error", "[burst-flash] HC_SESSION/HC_SOCKET is not set — refusing to run against the default core");
-		return null;
-	}
-	if (rootAddress !== record.rootAddress) {
-		logDiag("error", `[burst-flash] HC_TERMINAL_ID ${rootAddress} is not the pool root ${record.rootAddress} — burst spawn refused`);
-		return null;
-	}
-	const clientEnv = hcClientEnv(env);
-	let actual: Awaited<ReturnType<typeof probeCoreIdentity>>;
-	try {
-		actual = await probeCoreIdentity({ env: clientEnv, timeoutMs: HC_PROBE_TIMEOUT_MS });
-	} catch (err) {
-		logDiag("error", `[burst-flash] core probe failed: ${errorMessage(err)} — burst spawn refused`);
-		return null;
-	}
-	if (!actual?.id) {
-		logDiag("error", "[burst-flash] core probe returned no core id — burst spawn refused");
-		return null;
-	}
-	if (actual.id !== record.coreId) {
-		logDiag("error", `[burst-flash] reached core ${actual.id}, not the pool core ${record.coreId} — burst spawn refused`);
-		return null;
-	}
-	return { backend: "hc", coreId: actual.id, rootAddress, generation: record.generation, clientEnv };
-}
-
-/**
- * v3/tmux pin: this pane's captured server tuple, the launcher pid that is the
- * pane's direct program, the live complete tuple/session/root pane, and the
- * module's own read-only snapshot must all describe one live pool.
- */
-async function pinTmuxPool(record: BurstManifestTmux, manifestPath: string): Promise<BurstHostPin | null> {
-	const refuse = (message: string): null => {
-		logDiag("error", `[burst-flash] ${message} — burst spawn refused`);
-		return null;
-	};
-	const env = process.env;
-	const rootAddress = tmuxRootPane(env);
-	if (!rootAddress) return refuse("TMUX_PANE is not set: this Mind is not running in a tmux pane");
-	if (rootAddress !== record.rootAddress) {
-		return refuse(`TMUX_PANE ${rootAddress} is not the pool root ${record.rootAddress}`);
-	}
-	const captured = tmuxServerHint(env);
-	if (!captured) return refuse("TMUX is not <socket>,<pid>,<start-time>");
-	if (captured.socketPath !== record.server.socketPath || captured.pid !== record.server.pid) {
-		return refuse(`this pane is on tmux server ${captured.socketPath},${captured.pid}, not the recorded ${record.server.socketPath},${record.server.pid}`);
-	}
-	// The launcher is the pane's direct program; Mind is its child, so process.pid
-	// can never prove root ownership here.
-	const launcherPid = tmuxLauncherPid(env);
-	if (launcherPid === null) {
-		return refuse("PI_MIND_WORKER_LAUNCHER_PID is not set: cannot prove the pane's root program");
-	}
-	const clientEnv = tmuxClientEnv(env);
-	let probe: Awaited<ReturnType<typeof probeTmuxRoot>>;
-	try {
-		probe = probeTmuxRoot({ clientEnv, expectedPid: launcherPid });
-	} catch (err) {
-		return refuse(`root probe failed: ${errorMessage(err)}`);
-	}
-	const live = probe.server;
-	if (live.socketPath !== record.server.socketPath || live.pid !== record.server.pid
-		|| live.startTime !== record.server.startTime || live.version !== record.server.version) {
-		return refuse(`tmux server ${live.socketPath}#${live.pid}.${live.startTime} is not the recorded tuple`);
-	}
-	if (probe.session.id !== record.session.id || probe.session.created !== record.session.created) {
-		return refuse(`tmux session ${probe.session.id} is not the recorded ${record.session.id}`);
-	}
-	if (probe.rootPane.paneId !== record.rootPane.paneId || probe.rootPane.panePid !== record.rootPane.panePid
-		|| probe.rootPane.startCommand !== record.rootPane.startCommand) {
-		return refuse(`root pane ${probe.rootPane.paneId} does not match the recorded root pane`);
-	}
-	// The record's coreIdentity.id is authoritative; the probe derives it from the
-	// same tuple, so this compares the two instead of inventing a format here.
-	if (probe.coreIdentity.id !== record.coreId) {
-		return refuse(`live core ${probe.coreIdentity.id} is not the recorded core ${record.coreId}`);
-	}
-	let snapshot: Awaited<ReturnType<typeof inspectPool>>;
-	try {
-		snapshot = await inspectPool({ manifestPath });
-	} catch (err) {
-		return refuse(`pool snapshot failed: ${errorMessage(err)}`);
-	}
-	if (!snapshot.valid || snapshot.server !== "live" || snapshot.root !== "live") {
-		return refuse(`pool is not live (server ${snapshot.server}, root ${snapshot.root})`);
-	}
-	const fresh = readBurstManifest(snapshot.record as Record<string, unknown> | null);
-	if (!fresh || fresh.backend !== "tmux" || tmuxPoolKey(fresh) !== tmuxPoolKey(record)) {
-		return refuse("the pool record changed while pinning");
-	}
-	return {
-		backend: "tmux",
-		coreId: record.coreId,
-		rootAddress,
-		generation: record.generation,
-		clientEnv,
-		manifestPath,
-		poolKey: tmuxPoolKey(record),
-	};
-}
-
-/** The pool record must still be the pinned one: a launcher restart is not our run. */
-function pinStillCurrent(pin: BurstHostPin, cwd: string): boolean {
-	if (pin.backend !== "tmux" || !pin.poolKey) return true;
-	const record = readBurstManifest(readManifest(cwd));
-	return Boolean(record && record.backend === "tmux" && tmuxPoolKey(record) === pin.poolKey);
-}
-
-/** true = the pinned pool is gone or replaced; null = cannot tell right now. */
-async function burstCoreReplaced(pin: BurstHostPin): Promise<boolean | null> {
-	return burstHost(pin).replaced(pin);
-}
-
-/** One owned terminal on the pinned pool. `name` is hc's name or the tmux workerId. */
+/** One owned terminal on the pinned pool. Go reports the worker id as `name`. */
 interface BurstHostTerminal {
 	readonly address: string;
 	readonly name: string | null;
@@ -816,197 +552,102 @@ interface BurstHostTerminal {
 
 interface BurstHostSpawn {
 	readonly workerId: string;
-	readonly name: string | null;
-	readonly cwd: string;
-	readonly argv: string[];
-	readonly identity: Record<string, string>;
+	/** Go builds the worker argv itself from these. */
+	readonly tier: string;
+	readonly model: string;
+	readonly thinking: string;
+	readonly sessionDir: string;
 }
 
 /**
- * The host seam: hc and tmux differ only here. Every member proves the pinned
- * pool itself, so no caller can reach a terminal on another pool.
+ * mindmux host: every member speaks the Go adapter's NDJSON ops. Go owns state and
+ * liveness, so a failed call is "cannot tell" and never an empty proof of absence.
  */
-interface BurstHost {
-	spawn(pin: BurstHostPin, spec: BurstHostSpawn): Promise<{ address: string }>;
-	/** Live owned proof of one address; tmux's retire requires it before a kill. */
-	get(pin: BurstHostPin, address: string): Promise<BurstHostTerminal | null>;
-	/** Owned live terminals; null = cannot tell, never an empty proof. */
-	list(pin: BurstHostPin): Promise<BurstHostTerminal[] | null>;
-	retire(pin: BurstHostPin, address: string): Promise<void>;
-	replaced(pin: BurstHostPin): Promise<boolean | null>;
-}
-
-const HC_HOST: BurstHost = {
+const MINDMUX_HOST: BurstHost = {
 	async spawn(pin, spec) {
-		const { address } = await spawnWorkerTerminal({
-			rootAddress: pin.rootAddress,
-			name: spec.name ?? undefined,
-			cwd: spec.cwd,
-			argv: spec.argv,
-			env: spec.identity,
-			clientEnv: pin.clientEnv,
-			expectedCoreId: pin.coreId,
-			timeoutMs: Math.min(BURST_CONNECT_TIMEOUT_MS, 15_000),
-		});
-		return { address };
-	},
-	async get(pin, address) {
-		const record = await getHcTerminal(address, {
-			env: pin.clientEnv,
-			expectedCoreId: pin.coreId,
-			rootAddress: pin.rootAddress,
-			timeoutMs: HC_PROBE_TIMEOUT_MS,
-		});
-		if (!record) return null;
-		return { address, name: typeof record.name === "string" ? record.name : null };
-	},
-	// shortcut: reads `hc ls` here instead of through the helper, which does not
-	// export its list helper yet; drop this once it does.
-	async list(pin) {
-		// Prove the same pinned core before and after the list. Unavailable, replaced or
-		// ambiguous cores can never prove absence; only a valid list on the same core can.
-		if (await HC_HOST.replaced(pin) !== false) return null;
-		let reply: any;
-		try {
-			const { stdout } = await execFileAsync("hc", ["ls", "--all", "--json"], {
-				env: pin.clientEnv,
-				timeout: HC_LS_TIMEOUT_MS,
-				maxBuffer: 256 * 1024,
-			});
-			reply = JSON.parse(String(stdout).trim());
-		} catch {
-			return null;
-		}
-		if (await HC_HOST.replaced(pin) !== false) return null;
-		if (!Array.isArray(reply?.terminals)) return null;
-		const owned = reply.terminals.filter((t: any) => t?.parent === pin.rootAddress && t?.state === "live");
-		// A record without a usable address proves nothing: cannot tell, not absent.
-		if (owned.some((t: any) => typeof t?.address !== "string" || !t.address)) return null;
-		return owned.map((t: any) => ({
-			address: t.address as string,
-			name: typeof t.name === "string" ? t.name : null,
-		}));
-	},
-	async retire(pin, address) {
-		await retireWorkerTerminal(address, {
-			env: pin.clientEnv,
-			expectedCoreId: pin.coreId,
-			rootAddress: pin.rootAddress,
-			timeoutMs: HC_PROBE_TIMEOUT_MS,
-		});
-	},
-	async replaced(pin) {
-		try {
-			const actual = await probeCoreIdentity({ env: pin.clientEnv, timeoutMs: HC_PROBE_TIMEOUT_MS });
-			return actual.id !== pin.coreId;
-		} catch {
-			return null;
-		}
-	},
-};
-
-function tmuxCallOptions(pin: BurstHostPin): Record<string, unknown> {
-	return {
-		manifestPath: pin.manifestPath,
-		clientEnv: pin.clientEnv,
-		expectedCoreId: pin.coreId,
-		rootAddress: pin.rootAddress,
-	};
-}
-
-const TMUX_HOST: BurstHost = {
-	async spawn(pin, spec) {
-		if (!pin.manifestPath) throw new Error("tmux pool pin carries no record path");
-		const { address } = await spawnTmuxWorkerTerminal({
-			manifestPath: pin.manifestPath,
+		const reply = await pin.client.spawn({
 			workerId: spec.workerId,
-			rootAddress: pin.rootAddress,
-			name: spec.name ?? undefined,
-			cwd: spec.cwd,
-			argv: spec.argv,
-			env: spec.identity,
-			clientEnv: pin.clientEnv,
-			expectedCoreId: pin.coreId,
+			tier: spec.tier,
+			model: spec.model,
+			thinking: spec.thinking,
+			// Go passes this to the worker as PI_MIND_WORKER_SESSION_DIR.
+			sessionDir: spec.sessionDir,
 		});
-		return { address };
+		const pane = oneLineText((reply as { pane?: unknown } | null)?.pane);
+		if (!pane || !PANE_ID_RE.test(pane)) {
+			// Go said ok without a usable pane: the terminal is unknown, not absent.
+			const uncertain = new Error("mindmux spawn reply carried no usable pane") as Error & {
+				spawnPending?: boolean;
+				kind?: string;
+			};
+			uncertain.spawnPending = true;
+			uncertain.kind = "spawn_unconfirmed";
+			throw uncertain;
+		}
+		return { address: pane };
 	},
 	async get(pin, address) {
-		const terminal = await getTmuxTerminal(address, tmuxCallOptions(pin));
-		if (!terminal) return null;
-		return { address, name: typeof terminal.name === "string" ? terminal.name : null };
+		const terminals = await MINDMUX_HOST.list(pin);
+		if (terminals === null) {
+			// Cannot tell is not absent: a retirement must keep the terminal tracked.
+			const uncertain = new Error("mindmux list did not answer: no live proof for " + address) as Error & {
+				kind?: string;
+			};
+			uncertain.kind = "unavailable";
+			throw uncertain;
+		}
+		return terminals.find((terminal) => terminal.address === address) ?? null;
 	},
 	async list(pin) {
-		let terminals: Awaited<ReturnType<typeof listOwnedTerminals>>;
+		let reply: { workers?: unknown };
 		try {
-			terminals = await listOwnedTerminals(tmuxCallOptions(pin));
-		} catch {
-			return null; // cannot tell: never an empty proof of absence
+			reply = await pin.client.list();
+		} catch (err) {
+			// An error reply is not an empty pool. A retirement must stay tracked.
+			logDiag("warn", `[mindmux] list failed: ${errorMessage(err)}`);
+			return null;
 		}
-		return terminals.map((terminal) => ({
-			address: terminal.address,
-			name: typeof terminal.name === "string" ? terminal.name : null,
-		}));
+		if (!Array.isArray(reply?.workers)) return null;
+		const terminals: BurstHostTerminal[] = [];
+		for (const worker of reply.workers as Array<Record<string, unknown>>) {
+			const pane = oneLineText(worker?.pane);
+			// A malformed record proves nothing about the rest: cannot tell, not absent.
+			if (!pane || !PANE_ID_RE.test(pane)) return null;
+			terminals.push({ address: pane, name: oneLineText(worker?.worker_id) });
+		}
+		return terminals;
 	},
 	async retire(pin, address) {
-		// The module's own get is the live proof: an unproven or absent pane is never killed.
-		if (!(await TMUX_HOST.get(pin, address))) return;
-		await retireTmuxWorkerTerminal(address, tmuxCallOptions(pin));
+		// Go's own list is the live proof: an address it does not report is never retired.
+		if (!(await MINDMUX_HOST.get(pin, address))) return;
+		await pin.client.retire(address);
 	},
 	async replaced(pin) {
-		if (!pin.manifestPath || !pin.poolKey) return true;
-		let snapshot: Awaited<ReturnType<typeof inspectPool>>;
+		// Go owns liveness and the running transition. An adapter that stopped
+		// answering is "cannot tell", never "gone": claiming a replacement would let a
+		// retirement decide a terminal went with it.
 		try {
-			snapshot = await inspectPool({ manifestPath: pin.manifestPath });
+			await pin.client.list();
+			return false;
 		} catch {
 			return null;
 		}
-		if (!snapshot.valid || snapshot.server !== "live" || snapshot.root !== "live") return true;
-		const record = readBurstManifest(snapshot.record as Record<string, unknown> | null);
-		if (!record || record.backend !== "tmux" || tmuxPoolKey(record) !== pin.poolKey) return true;
-		return false;
 	},
 };
 
-function burstHost(pin: BurstHostPin): BurstHost {
-	return pin.backend === "tmux" ? TMUX_HOST : HC_HOST;
-}
 
 /**
- * hc and tmux name the same outcomes differently; they are mapped here, once, so
- * the reconciliation and retirement logic above sees one vocabulary. A kind that
- * stays unknown is "cannot tell", never "gone".
- */
-function mapBurstError(pin: BurstHostPin, err: unknown): unknown {
-	if (pin.backend !== "tmux") return err; // hc's own kinds/spawnPending are the reference
-	const source = err as { kind?: string | null; spawnUnconfirmed?: boolean } | null;
-	const kind = source?.kind ?? null;
-	const mapped = new Error(errorMessage(err)) as Error & { kind?: string; spawnPending?: boolean };
-	if (source?.spawnUnconfirmed === true || kind === "spawn_unconfirmed") {
-		mapped.spawnPending = true;
-		mapped.kind = "spawn_unconfirmed";
-		return mapped;
-	}
-	// A record that changed identity is the pool restarting, not our terminal: the
-	// retirement logic treats this like a proven core replacement and never kills.
-	mapped.kind = kind === "stale_tuple" || kind === "stale_generation" || kind === "stale"
-		? "core_mismatch"
-		: kind ?? undefined;
-	return mapped;
-}
-
-/**
- * Reconcile a worker whose spawn reply was uncertain. The helper already retires
- * a terminal it could prove; this covers the rest. A tmux pane's recorded name is
- * its workerId (the pane title is not identity); hc matches on the name it gave.
+ * Reconcile a worker whose spawn reply was uncertain: Go's own list is the proof,
+ * and the worker id is the name it reports.
  */
 async function findBurstTerminalByName(
 	pin: BurstHostPin,
-	ids: { workerId: string; name: string | null },
+	workerId: string,
 ): Promise<string | null | undefined> {
-	const terminals = await burstHost(pin).list(pin);
+	const terminals = await MINDMUX_HOST.list(pin);
 	if (terminals === null) return undefined;
-	const wanted = pin.backend === "tmux" ? ids.workerId : ids.name;
-	const owned = terminals.filter((terminal) => terminal.name === wanted);
+	// Go reports the worker id as the terminal name.
+	const owned = terminals.filter((terminal) => terminal.name === workerId);
 	if (owned.length === 0) return null;
 	if (owned.length > 1) return undefined; // ambiguous: never pick one or claim absence
 	return owned[0].address;
@@ -1025,10 +666,8 @@ interface BurstWorkerState {
 	readonly sessionDir: string;
 	readonly logPath: string;
 	terminalState: BurstTerminalState;
-	/** Authoritative address, once hc named one. */
+	/** Authoritative address, once Go reported a pane. */
 	address: string | null;
-	/** Unique live name, kept while a spawn reply is uncertain. */
-	name: string | null;
 	pin: BurstHostPin | null;
 	lastTaskAt: number;
 	taskCount: number;
@@ -1055,22 +694,6 @@ function getBurstFlashLogPath(cwd: string, n: number): string {
 
 function getBurstFlashSessionDir(cwd: string, n: number): string {
 	return join(getAgentDir(), "sessions", `burst-flash-${getCwdHash(cwd)}-${n}`);
-}
-
-/**
- * Full cwd + instance + generation: getCwdHash prefixes a long instance label, so
- * it cannot be the name budget. Six hex chars leave room for an unbounded index.
- */
-function burstNameHash(cwd: string, generation: number): string {
-	return createHash("sha256")
-		.update(`${cwd}\0${INSTANCE_LABEL ?? ""}\0${generation}`)
-		.digest("hex")
-		.slice(0, 6);
-}
-
-/** `<run hash>-b<index>`: starts alphanumeric, <=32 chars, and index is not capped. */
-function burstTerminalName(runHash: string, index: number): string {
-	return `${runHash}-b${index}`;
 }
 
 function logBurstEvent(cwd: string, workerId: string, event: string, detail?: string): void {
@@ -1102,7 +725,7 @@ function isBurstAvailableForWork(workerId: string): boolean {
 	return Boolean(state && state.terminalState !== "retiring" && state.terminalState !== "gone" && !state.retireReason);
 }
 
-/** Pending spawns count: the map entry exists before any hc call. */
+/** Pending spawns count: the map entry exists before any Go call. */
 function countBurstWorkers(): number {
 	return burstWorkers.size;
 }
@@ -1143,28 +766,6 @@ function stopBurstIdleTimer(): void {
 	burstIdleCheckTimer = null;
 }
 
-/** Identity travels in these vars only; hc gives the child the core's own environment. */
-function burstWorkerIdentity(p: { workerId: string; generation: number; sessionDir: string }): Record<string, string> {
-	return {
-		PI_MIND_WORKER_ROLE: "worker",
-		PI_MIND_WORKER_TIER: "flash",
-		PI_MIND_WORKER_ID: p.workerId,
-		PI_MIND_WORKER_GENERATION: String(p.generation),
-		PI_MIND_WORKER_SESSION_DIR: p.sessionDir,
-		...(INSTANCE_LABEL ? { PI_MIND_WORKER_INSTANCE: INSTANCE_LABEL } : {}),
-	};
-}
-
-/** Burst program: mise/node around the installed Pi CLI, TUI only (never --mode rpc). */
-function buildBurstWorkerArgv(p: { sessionDir: string; model: string; thinking: ThinkingLevel }): string[] {
-	return [
-		"/usr/bin/mise", "x", "node@26", "--",
-		"node", PI_CLI,
-		"--model", p.model,
-		"--thinking", p.thinking,
-		"--session-dir", p.sessionDir,
-	];
-}
 
 function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 	const { config } = loadConfig();
@@ -1180,17 +781,15 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 	if (!pressureMet && !waitMet) return;
 
 	const index = ++burstCounter;
-	const manifest = readManifest(cwd);
 	const state: BurstWorkerState = {
 		workerId: `burst-flash-${index}`,
 		index,
 		spawnedAt: Date.now(),
-		generation: typeof manifest?.generation === "number" ? manifest.generation : 0,
+		generation: poolGeneration(),
 		sessionDir: getBurstFlashSessionDir(cwd, index),
 		logPath: getBurstFlashLogPath(cwd, index),
 		terminalState: "pending",
 		address: null,
-		name: null,
 		pin: null,
 		lastTaskAt: Date.now(),
 		taskCount: 0,
@@ -1202,22 +801,21 @@ function trySpawnBurstFlash(cwd: string, ctx: ExtensionContext): void {
 		spawnSettled: false,
 		retireRunning: false,
 	};
-	// Reserved before any probe or hc call, so a pending spawn counts against maxBurst.
+	// Reserved before any probe or Go call, so a pending spawn counts against maxBurst.
 	burstWorkers.set(state.workerId, state);
 	// Persist the counter and the pending entry before the async spawn: a reload can
-	// never reuse this id/name even if the process dies before the next heartbeat.
+	// never reuse this id even if the process dies before the next heartbeat.
 	writeControlFileStatus(cwd, lastDashboardStatus || "ready");
 	ensureBurstIdleTimer(cwd);
-	void spawnBurstWorker(state, cwd, manifest, config);
+	void spawnBurstWorker(state, cwd, config);
 }
 
 async function spawnBurstWorker(
 	state: BurstWorkerState,
 	cwd: string,
-	manifest: Record<string, unknown> | null,
 	config: MindWorkerConfig,
 ): Promise<void> {
-	const pin = await pinBurstCore(manifest, cwd);
+	const pin = await pinBurstCore();
 	const current = burstWorkers.get(state.workerId) === state;
 	if (!pin) {
 		if (current) burstWorkers.delete(state.workerId);
@@ -1233,49 +831,34 @@ async function spawnBurstWorker(
 		if (burstWorkers.size === 0) stopBurstIdleTimer();
 		return;
 	}
-	const name = burstTerminalName(burstNameHash(cwd, state.generation), state.index);
-	state.name = name;
 	try { mkdirSync(state.sessionDir, { recursive: true }); } catch { /* may exist */ }
 	try { mkdirSync(dirname(state.logPath), { recursive: true }); } catch { /* may exist */ }
-	logBurstEvent(cwd, state.workerId, "spawn", `name=${name} model=${config.burstFlash.model}`);
-	logDiag("error", `[burst-flash] spawning ${state.workerId} terminal=${name} model=${config.burstFlash.model}`);
+	logBurstEvent(cwd, state.workerId, "spawn", `model=${config.burstFlash.model}`);
+	logDiag("error", `[burst-flash] spawning ${state.workerId} model=${config.burstFlash.model}`);
 
 	try {
 		// A launcher restart between the pin and this spawn must not get a pane.
-		if (!pinStillCurrent(pin, cwd)) {
-			throw new Error(`pool ${pin.coreId} is no longer the live record; refusing to spawn`);
+		if (!pinStillCurrent(pin)) {
+			throw new Error(`mindmux generation ${pin.generation} is no longer the live one; refusing to spawn`);
 		}
-		const { address } = await burstHost(pin).spawn(pin, {
+		const { address } = await MINDMUX_HOST.spawn(pin, {
 			workerId: state.workerId,
-			name,
-			cwd,
-			argv: buildBurstWorkerArgv({
-				sessionDir: state.sessionDir,
-				model: config.burstFlash.model,
-				thinking: config.burstFlash.thinkingLevel,
-			}),
-			identity: burstWorkerIdentity({
-				workerId: state.workerId,
-				generation: state.generation,
-				sessionDir: state.sessionDir,
-			}),
+			tier: "flash",
+			model: config.burstFlash.model,
+			thinking: config.burstFlash.thinkingLevel,
+			sessionDir: state.sessionDir,
 		});
 		onBurstSpawned(state, address, cwd);
 	} catch (err) {
-		onBurstSpawnFailed(state, mapBurstError(pin, err), cwd);
+		onBurstSpawnFailed(state, err, cwd);
 	}
 }
 
-/** The pool envelope/env root this spawn started under must still be the live one. */
-function burstSpawnResultStale(state: BurstWorkerState, cwd: string): boolean {
+/** The generation this spawn started under must still be the live one. */
+function burstSpawnResultStale(state: BurstWorkerState): boolean {
 	if (!state.pin) return true;
-	const record = readBurstManifest(readManifest(cwd));
-	if (!record) return true;
-	if (state.generation !== record.generation) return true;
-	if (state.pin.coreId !== record.coreId) return true;
-	if (state.pin.rootAddress !== record.rootAddress) return true;
-	if (currentRootAddress(state.pin.backend) !== state.pin.rootAddress) return true;
-	return false;
+	const mindmux = readMindmuxEnv();
+	return !mindmux || mindmux.generation !== state.pin.generation;
 }
 
 /** Only a run that still owns this state and envelope may mutate it. */
@@ -1285,8 +868,8 @@ function onBurstSpawned(state: BurstWorkerState, address: string, cwd: string): 
 		void retireOldOwnedAddress(address, state.pin);
 		return;
 	}
-	if (burstSpawnResultStale(state, cwd)) {
-		// The envelope changed mid-pending: never adopt the result into this map. Mark the
+	if (burstSpawnResultStale(state)) {
+		// The generation changed mid-pending: never adopt the result into this map. Mark the
 		// old attempt settled (cleanup only) and retire its pinned OLD-owned address.
 		state.spawnSettled = true;
 		void retireOldOwnedAddress(address, state.pin);
@@ -1309,17 +892,17 @@ function onBurstSpawnFailed(state: BurstWorkerState, err: unknown, cwd: string):
 	if (burstWorkers.get(state.workerId) !== state) {
 		// Never mutate newer state. A stale unconfirmed failure may have left a
 		// name-only terminal on the OLD root; retire it only if that core still answers.
-		if (unconfirmed && state.pin && state.name) void retireOldOwnedName(state.pin, state.workerId, state.name);
+		if (unconfirmed && state.pin) void retireOldOwnedName(state.pin, state.workerId);
 		logDiag("warn", `[burst-flash] ${state.workerId} stale spawn ${unconfirmed ? "unconfirmed" : "failed"}: ${message}`);
 		return;
 	}
-	if (burstSpawnResultStale(state, cwd)) {
+	if (burstSpawnResultStale(state)) {
 		// The old attempt is over, but its result is not this map's. Never adopt it; settle
 		// only the old state so cleanup can reconcile the pinned OLD-owned name/address.
 		if (unconfirmed) {
 			state.spawnSettled = true;
 			if (state.retireReason) retireBurstFlash(state.workerId, state.retireReason);
-			if (state.pin && state.name) void retireOldOwnedName(state.pin, state.workerId, state.name);
+			if (state.pin) void retireOldOwnedName(state.pin, state.workerId);
 		} else {
 			// Deterministic pre-spawn failure: no terminal exists, so the old entry may go.
 			burstWorkers.delete(state.workerId);
@@ -1329,12 +912,12 @@ function onBurstSpawnFailed(state: BurstWorkerState, err: unknown, cwd: string):
 		return;
 	}
 	if (unconfirmed) {
-		// hc may have created the terminal: keep it tracked and reconcile by name later.
+		// The host may have created the terminal: keep it tracked and reconcile by id later.
 		state.spawnSettled = true;
 		state.lastEvent = `spawn unconfirmed: ${message}`;
 		state.lastEventAt = Date.now();
-		logBurstEvent("", state.workerId, "spawn-unconfirmed", state.name ?? "");
-		// A retirement that started before this settled now has a name to reconcile.
+		logBurstEvent("", state.workerId, "spawn-unconfirmed", "");
+		// A retirement that started before this settled now has an id to reconcile.
 		if (state.retireReason) retireBurstFlash(state.workerId, state.retireReason);
 	} else {
 		state.lastEvent = `spawn failed: ${message}`;
@@ -1347,11 +930,11 @@ function onBurstSpawnFailed(state: BurstWorkerState, err: unknown, cwd: string):
 	logDiag("error", `[burst-flash] ${state.workerId} spawn ${unconfirmed ? "unconfirmed" : "failed"}: ${message}`);
 }
 
-/** A stale name-only failure: retire the terminal only if the OLD pool still answers. */
-async function retireOldOwnedName(pin: BurstHostPin, workerId: string, name: string): Promise<void> {
-	const replaced = await burstCoreReplaced(pin);
+/** A stale spawn failure: retire the worker only if the OLD pool still answers. */
+async function retireOldOwnedName(pin: BurstHostPin, workerId: string): Promise<void> {
+	const replaced = await MINDMUX_HOST.replaced(pin);
 	if (replaced !== false) return; // restarted or unknowable: addresses mean nothing
-	const found = await findBurstTerminalByName(pin, { workerId, name });
+	const found = await findBurstTerminalByName(pin, workerId);
 	if (typeof found !== "string") return;
 	await retireOldOwnedAddress(found, pin);
 }
@@ -1359,10 +942,10 @@ async function retireOldOwnedName(pin: BurstHostPin, workerId: string, name: str
 /** A late success may only kill an address the pinned OLD pool still owns. */
 async function retireOldOwnedAddress(address: string, pin: BurstHostPin | null): Promise<void> {
 	if (!pin) return;
-	const replaced = await burstCoreReplaced(pin);
+	const replaced = await MINDMUX_HOST.replaced(pin);
 	if (replaced !== false) return; // restarted or unknowable: addresses mean nothing
 	try {
-		await burstHost(pin).retire(pin, address);
+		await MINDMUX_HOST.retire(pin, address);
 		logDiag("warn", `[burst-flash] retired stale terminal ${address}`);
 	} catch { /* already gone or not proven ours: drop the result */ }
 }
@@ -1446,18 +1029,14 @@ async function driveBurstRetirement(state: BurstWorkerState): Promise<void> {
 		if (burstWorkers.get(state.workerId) !== state) return;
 		if (!state.address) {
 			if (!state.spawnSettled) {
-				// The old attempt is not proven settled. A name absence is not proof, but a
-				// terminal found by its unique pinned name may still be retired.
-				const found = state.name
-					? await findBurstTerminalByName(pin, { workerId: state.workerId, name: state.name })
-					: null;
+				// The old attempt is not proven settled. A missing list is not proof, but a
+				// terminal found by its worker id may still be retired.
+				const found = await findBurstTerminalByName(pin, state.workerId);
 				if (typeof found === "string") {
 					state.address = found;
 				} else {
 					state.terminalState = "pending";
-					state.lastEvent = state.name
-						? "retire pending: spawn not settled"
-						: "retire pending: no name or address";
+					state.lastEvent = "retire pending: spawn not settled";
 					state.lastEventAt = Date.now();
 					logDiag("warn", `[burst-flash] ${state.workerId} retire pending: spawn not settled, kept tracked`);
 					return;
@@ -1466,8 +1045,8 @@ async function driveBurstRetirement(state: BurstWorkerState): Promise<void> {
 				const resolved = await resolveBurstAddress(state, pin);
 				if (burstWorkers.get(state.workerId) !== state) return;
 				if (resolved.absent) {
-					// No live terminal carries our unique name on the pinned core: it is gone.
-					logBurstEvent("", state.workerId, "gone", state.name ?? "");
+					// No live terminal carries our id on the pinned pool: it is gone.
+					logBurstEvent("", state.workerId, "gone", "");
 					finishBurstRetirement(state, null);
 					return;
 				}
@@ -1489,14 +1068,12 @@ async function driveBurstRetirement(state: BurstWorkerState): Promise<void> {
 			if (attempt > 0) await sleepMs(BURST_RETIRE_RETRY_MS[attempt]);
 			state.retireAttempts = attempt + 1;
 			try {
-				// hc: --rm reports the first successful kill as not_found ("was removed") and the
-				// helper confirms death with bounded get polling. tmux: the module re-proves the
-				// pane (markers, window, pid, start command) before it kills it.
-				await burstHost(pin).retire(pin, address);
+				// Go's own list is the live proof: an address it does not report is never retired.
+				await MINDMUX_HOST.retire(pin, address);
 				finishBurstRetirement(state, address);
 				return;
 			} catch (err) {
-				const error = mapBurstError(pin, err);
+				const error = err;
 				const kind = (error as { kind?: string } | null)?.kind ?? null;
 				if (kind === "not_owned") {
 					// The address belongs to someone else now, so our terminal is already gone.
@@ -1504,7 +1081,7 @@ async function driveBurstRetirement(state: BurstWorkerState): Promise<void> {
 					return;
 				}
 				if (kind === "core_mismatch" || kind === "unavailable" || kind === "selector_required") {
-					const replaced = await burstCoreReplaced(pin);
+					const replaced = await MINDMUX_HOST.replaced(pin);
 					if (replaced === true) {
 						// Only a proven core-id replacement proves its children are gone.
 						finishBurstRetirement(state, address);
@@ -1527,18 +1104,17 @@ async function driveBurstRetirement(state: BurstWorkerState): Promise<void> {
 	}
 }
 
-/** Reconcile a name-only entry against the pinned pool. */
+/** Reconcile a tracked entry against its pinned pool. */
 async function resolveBurstAddress(
 	state: BurstWorkerState,
 	pin: BurstHostPin,
 ): Promise<{ address?: string; absent?: boolean }> {
-	if (!state.name) return { absent: true }; // nothing was ever spawned
 	for (let attempt = 0; attempt < BURST_RETIRE_RETRY_MS.length; attempt++) {
 		if (attempt > 0) await sleepMs(BURST_RETIRE_RETRY_MS[attempt]);
 		if (burstWorkers.get(state.workerId) !== state) return { absent: true };
-		// A restarted core cannot own our address: the terminal went with the old core.
-		if (await burstCoreReplaced(pin) === true) return { absent: true };
-		const found = await findBurstTerminalByName(pin, { workerId: state.workerId, name: state.name });
+		// A replaced pool cannot own our address: the terminal went with the old one.
+		if (await MINDMUX_HOST.replaced(pin) === true) return { absent: true };
+		const found = await findBurstTerminalByName(pin, state.workerId);
 		if (typeof found === "string") return { address: found };
 		if (found === null) return { absent: true };
 		// undefined: unknown (unavailable, replaced, ambiguous or malformed list) —
@@ -1549,7 +1125,7 @@ async function resolveBurstAddress(
 
 function finishBurstRetirement(state: BurstWorkerState, address: string | null): void {
 	if (burstWorkers.get(state.workerId) !== state) return;
-	logBurstEvent("", state.workerId, "retired", address ?? state.name ?? "");
+	logBurstEvent("", state.workerId, "retired", address ?? "");
 	// Transcript and session directories are never deleted here.
 	burstWorkers.delete(state.workerId);
 	if (burstWorkers.size === 0) stopBurstIdleTimer();
@@ -1589,13 +1165,9 @@ function burstControlEntries(): Array<Record<string, unknown>> {
 	return [...burstWorkers.values()].map((state) => ({
 		workerId: state.workerId,
 		index: state.index,
-		name: state.name,
 		address: state.address,
 		terminalState: state.terminalState,
 		generation: state.generation,
-		// Ownership metadata for a later module; never the client env or a secret.
-		coreId: state.pin?.coreId ?? null,
-		rootAddress: state.pin?.rootAddress ?? null,
 		spawnedAt: state.spawnedAt,
 		spawnSettled: state.spawnSettled,
 		retireReason: state.retireReason,
@@ -1606,125 +1178,112 @@ function burstControlEntries(): Array<Record<string, unknown>> {
 	}));
 }
 
-interface PersistedBurstSnapshot {
-	entries: any[];
-	counter: number;
-	envelope: { coreId: string; rootAddress: string; generation: number } | null;
+
+/** The durable burst state the previous run left in Go's control file. */
+interface BurstRecovery {
+	readonly counter: number;
+	readonly entries: Array<{ workerId: string; index: number; address: string | null; sessionDir: string; logFile: string }>;
 }
 
-/** Read the durable burst snapshot BEFORE startMindServer/heartbeat overwrites it. */
-function readPersistedBurstSnapshot(cwd: string): PersistedBurstSnapshot {
+/**
+ * Read it synchronously before startMindServer can overwrite the control file.
+ * Go is the source: another generation's record is not this run's proof, and a
+ * cold start simply has no file yet.
+ */
+function readBurstRecovery(cwd: string): BurstRecovery | null {
+	const mindmux = readMindmuxEnv();
+	if (!mindmux) return null;
 	try {
 		const control = JSON.parse(readFileSync(getControlFilePath(cwd), "utf-8"));
-		const entries = Array.isArray(control?.burstWorkers) ? control.burstWorkers : [];
-		const counter = typeof control?.burstCounter === "number"
-			&& Number.isSafeInteger(control.burstCounter) && control.burstCounter >= 0
-			? control.burstCounter
-			: 0;
-		const raw = control?.burstEnvelope;
-		const envelope = raw && typeof raw.coreId === "string" && raw.coreId
-			&& typeof raw.rootAddress === "string" && raw.rootAddress
-			&& typeof raw.generation === "number"
-			? { coreId: raw.coreId, rootAddress: raw.rootAddress, generation: raw.generation }
-			: null;
-		return { entries, counter, envelope };
+		if (Number(control?.generation) !== mindmux.generation) return null;
+		const listed = Array.isArray(control?.burstWorkers) ? control.burstWorkers : [];
+		const entries: BurstRecovery["entries"] = [];
+		for (const entry of listed) {
+			const workerId = typeof entry?.workerId === "string" ? entry.workerId : "";
+			if (!workerId.startsWith("burst-flash-")) continue;
+			const recorded = Number(workerId.slice("burst-flash-".length));
+			const index = Number.isSafeInteger(entry?.index) && entry.index >= 0 ? entry.index : Number(recorded) || 0;
+			entries.push({
+				workerId,
+				index,
+				address: oneLineText(entry?.address),
+				sessionDir: oneLineText(entry?.sessionDir) ?? "",
+				logFile: oneLineText(entry?.logFile) ?? "",
+			});
+		}
+		const counter = Number.isSafeInteger(control?.burstCounter) && control.burstCounter >= 0 ? control.burstCounter : 0;
+		return { counter, entries };
 	} catch {
-		return { entries: [], counter: 0, envelope: null };
+		return null; // cold start: nothing to recover
 	}
 }
 
-/** Restore the monotonic counter synchronously, before any new spawn can use it. */
-function restoreBurstCounter(snapshot: PersistedBurstSnapshot): void {
-	let highest = snapshot.counter;
-	for (const entry of snapshot.entries) {
-		const fromEntry = typeof entry?.index === "number"
-			? entry.index
-			: Number(String(entry?.workerId ?? "").replace(/^burst-flash-/, ""));
-		if (Number.isSafeInteger(fromEntry) && fromEntry > highest) highest = fromEntry;
-	}
+/** Reserve every id the previous run used or had pending: Go rejects a reused burst id. */
+function reserveBurstIds(recovery: BurstRecovery | null): void {
+	if (!recovery) return;
+	let highest = recovery.counter;
+	for (const entry of recovery.entries) highest = Math.max(highest, entry.index);
 	if (highest > burstCounter) burstCounter = highest;
 }
 
-/**
- * The pin an adopted entry retires against: the same selectors this process has
- * now, or null when this process is not in the pool's own host.
- */
-function persistedHostPin(pool: BurstManifest, cwd: string): BurstHostPin | null {
-	if (pool.backend === "hc") {
-		if (!hasCoreSelector(process.env)) return null;
-		if (rootTerminalAddress(process.env) !== pool.rootAddress) return null;
-		return {
-			backend: "hc",
-			coreId: pool.coreId,
-			rootAddress: pool.rootAddress,
-			generation: pool.generation,
-			clientEnv: hcClientEnv(process.env),
-		};
+/** Go's same-generation record, the fallback when the adapter cannot answer at startup. */
+function readGoRecordTerminals(manifestPath: string | undefined, generation: number): BurstHostTerminal[] | null {
+	if (!manifestPath) return null;
+	try {
+		const record = JSON.parse(readFileSync(manifestPath, "utf-8"));
+		if (Number(record?.generation) !== generation || !Array.isArray(record?.workers)) return null;
+		const terminals: BurstHostTerminal[] = [];
+		for (const worker of record.workers) {
+			const address = oneLineText(worker?.paneId ?? worker?.pane);
+			const name = oneLineText(worker?.id ?? worker?.workerId);
+			if (!address || !PANE_ID_RE.test(address) || !name) return null;
+			terminals.push({ address, name });
+		}
+		return terminals;
+	} catch {
+		return null;
 	}
-	if (tmuxRootPane(process.env) !== pool.rootAddress) return null;
-	const captured = tmuxServerHint(process.env);
-	if (!captured || captured.socketPath !== pool.server.socketPath || captured.pid !== pool.server.pid) return null;
-	return {
-		backend: "tmux",
-		coreId: pool.coreId,
-		rootAddress: pool.rootAddress,
-		generation: pool.generation,
-		clientEnv: tmuxClientEnv(process.env),
-		manifestPath: getManifestPath(cwd),
-		poolKey: tmuxPoolKey(pool),
-	};
 }
 
 /**
- * /reload re-evaluates this module and loses the map. The snapshot was taken
- * before the heartbeat could overwrite it; adopt only entries the envelope and
- * core prove this pool still owns, and retire them — never idle work, never a
- * task or agent restart.
+ * /reload loses this module's burst map, not Go's workers. Reseed the survivors
+ * cleanup-only: they are retiring, can never receive work, and are retired only
+ * with Go's live proof. An unanswered adapter keeps them tracked instead of
+ * claiming them gone.
  */
-async function adoptPersistedBursts(cwd: string, snapshot: PersistedBurstSnapshot): Promise<void> {
+async function adoptRecoveredBursts(cwd: string, recovery: BurstRecovery): Promise<void> {
 	if (burstWorkers.size > 0) return;
-	if (!snapshot.envelope || snapshot.entries.length === 0) return;
-	const manifest = readManifest(cwd);
-	const pool = readBurstManifest(manifest);
-	if (!pool) return;
-	if (pool.coreId !== snapshot.envelope.coreId
-		|| pool.rootAddress !== snapshot.envelope.rootAddress
-		|| pool.generation !== snapshot.envelope.generation) {
-		logDiag("warn", "[burst-flash] persisted burst snapshot belongs to another pool envelope — not adopted");
-		return;
-	}
-	// The envelope/record match already proves the pool. Do not require a live probe
-	// here: an unavailable host must not lose the durable cleanup record. Every later
-	// retirement still pins this pool and fails closed on a mismatch.
-	const pin = persistedHostPin(pool, cwd);
+	const pin = await pinBurstCore();
 	if (!pin) return;
+	// Only an answering list proves absence. Go's record can name a worker's pane
+	// while the adapter is still starting, but its silence proves nothing.
+	const listed = await MINDMUX_HOST.list(pin);
+	const recorded = listed === null ? readGoRecordTerminals(readMindmuxEnv()?.manifestPath, pin.generation) : null;
+	const live = listed ? new Map(listed.map((terminal) => [terminal.name ?? "", terminal.address])) : null;
+	const known = recorded ? new Map(recorded.map((terminal) => [terminal.name ?? "", terminal.address])) : null;
 	let adopted = 0;
-	for (const entry of snapshot.entries) {
-		if (!entry || typeof entry.workerId !== "string" || !entry.workerId) continue;
-		const name = typeof entry.name === "string" && entry.name ? entry.name : null;
-		const address = typeof entry.address === "string" && entry.address ? entry.address : null;
-		if (!name && !address) continue; // nothing was ever spawned
-		if (entry.coreId !== pin.coreId || entry.rootAddress !== pin.rootAddress) continue;
-		if (typeof entry.generation === "number" && entry.generation !== pool.generation) continue;
+	for (const entry of recovery.entries) {
+		if (burstWorkers.has(entry.workerId)) continue;
+		// A pool that answered and does not list it proves this worker is gone.
+		if (live && !live.has(entry.workerId)) continue;
 		const state: BurstWorkerState = {
 			workerId: entry.workerId,
-			index: typeof entry.index === "number" ? entry.index : 0,
-			spawnedAt: typeof entry.spawnedAt === "number" ? entry.spawnedAt : Date.now(),
-			generation: typeof entry.generation === "number" ? entry.generation : pool.generation,
-			sessionDir: typeof entry.sessionDir === "string" ? entry.sessionDir : "",
-			logPath: typeof entry.logFile === "string" ? entry.logFile : "",
+			index: entry.index,
+			spawnedAt: Date.now(),
+			generation: pin.generation,
+			sessionDir: entry.sessionDir,
+			logPath: entry.logFile || join(getStateDir(), `${getCwdHash(cwd)}-${entry.workerId}.log`),
 			terminalState: "retiring",
-			address,
-			name,
+			address: live?.get(entry.workerId) ?? known?.get(entry.workerId) ?? entry.address,
 			pin,
 			lastTaskAt: Date.now(),
-			taskCount: typeof entry.taskCount === "number" ? entry.taskCount : 0,
+			taskCount: 0,
 			connectedAt: 0,
 			lastEvent: "adopted for reload cleanup",
 			lastEventAt: Date.now(),
 			retireReason: "reload-cleanup",
 			retireAttempts: 0,
-			spawnSettled: entry.spawnSettled === true,
+			spawnSettled: true,
 			retireRunning: false,
 		};
 		burstWorkers.set(state.workerId, state);
@@ -1733,7 +1292,7 @@ async function adoptPersistedBursts(cwd: string, snapshot: PersistedBurstSnapsho
 		retireBurstFlash(state.workerId, "reload-cleanup");
 	}
 	if (adopted > 0) {
-		logDiag("warn", `[burst-flash] adopted ${adopted} tracked terminal(s) for reload cleanup`);
+		logDiag("warn", `[burst-flash] adopted ${adopted} surviving Go worker(s) for cleanup only`);
 		ensureBurstIdleTimer(cwd);
 	}
 }
@@ -1896,9 +1455,9 @@ function stopDashboardHeartbeat(): void {
 	lastDashboardCwd = "";
 }
 
+/** One namespace rule for every derived path, shared with the adapter module. */
 function getCwdHash(cwd: string): string {
-	const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 16);
-	return INSTANCE_LABEL ? `${INSTANCE_LABEL}-${hash}` : hash;
+	return mindmuxScopedTaskId(cwd, process.env);
 }
 
 function ensureDir(path: string): void {
@@ -1926,13 +1485,31 @@ function getPlanPath(cwd: string): string {
 }
 
 function getControlFilePath(cwd: string): string {
-	return join(getStateDir(), `${getCwdHash(cwd)}-mind-control.json`);
+	// Go reads and writes this exact file, in its own per-generation runtime dir.
+	return readMindmuxEnv()?.controlFile ?? join(getStateDir(), `${getCwdHash(cwd)}-mind-control.json`);
+}
+
+/**
+ * The generation this run fences against. The Go adapter owns it; a legacy pool
+ * reads the v2/v3 record. The old record shape is never read in Go mode, and Go's
+ * own record is never written by this extension.
+ */
+function poolGeneration(): number {
+	// Go owns the generation; nothing else is read.
+	return readMindmuxEnv()?.generation ?? 0;
+}
+
+/** Go's own static-worker count for this run; null when it did not supply one. */
+function mindmuxExpectedWorkers(): number | null {
+	const raw = process.env.MINDMUX_EXPECTED_WORKERS;
+	if (!raw) return null;
+	const count = Number(raw);
+	return Number.isSafeInteger(count) && count > 0 ? count : null;
 }
 
 /** Check if supervisor is in stop phase — extension must not write control file during stop. */
 function isStopPhase(cwd: string): boolean {
-	const manifest = readManifest(cwd);
-	const generation = manifest?.generation ?? 0;
+	const generation = poolGeneration();
 	const controlPath = getControlFilePath(cwd);
 	try {
 		const ctrl = JSON.parse(readFileSync(controlPath, "utf-8"));
@@ -1951,13 +1528,15 @@ function writeControlFileStatus(cwd: string, status: string, message?: string): 
 	if (LAUNCHER_ROLE_FLAG !== "mind") return;
 	// Stop phase: supervisor owns status, extension must not write
 	if (isStopPhase(cwd)) return;
+	// A failed Go startup must stay failed. Worker handshakes (worker-connected)
+	// and task transitions cannot overwrite the error that Go is waiting on.
+	if (readMindmuxEnv() && mindmuxStartupError && status !== "error" && status !== "stopped") return;
 
 	// Track last status for heartbeat writes
 	lastDashboardStatus = status;
 
 	const controlPath = getControlFilePath(cwd);
-	const manifest = readManifest(cwd);
-	const generation = manifest?.generation ?? 0;
+	const generation = poolGeneration();
 	ensureDir(dirname(controlPath));
 	try {
 		// Read existing to preserve command/message fields (e.g. pending stop)
@@ -1983,14 +1562,9 @@ function writeControlFileStatus(cwd: string, status: string, message?: string): 
 		data.expectedWorkers = maxWorkers;
 		// Every tracked burst (pending and disconnected included): the durable dashboard view.
 		data.burstWorkers = burstControlEntries();
-		// Monotonic run counter and the pool envelope, persisted even with no entries so a
-		// reloaded module never reuses an id/name and only adopts its own core/root.
+		// Monotonic run counter, persisted even with no entries so a reloaded module never
+		// reuses an id.
 		data.burstCounter = burstCounter;
-		{
-			// v2/hc and v3/tmux both name their pool here: core id, root address, generation.
-			const pool = readBurstManifest(manifest);
-			if (pool) data.burstEnvelope = { coreId: pool.coreId, rootAddress: pool.rootAddress, generation };
-		}
 
 		// Dashboard extension: add schema v2 fields when dashboardEnabled
 		try {
@@ -2091,74 +1665,6 @@ function writeControlFileReady(cwd: string): void {
 	writeControlFileStatus(cwd, "ready");
 }
 
-function getManifestPath(cwd: string): string {
-	return join(getStateDir(), `${getCwdHash(cwd)}-manifest.json`);
-}
-
-function readManifest(cwd: string): Record<string, unknown> | null {
-	const path = getManifestPath(cwd);
-	try {
-		return JSON.parse(readFileSync(path, "utf-8"));
-	} catch {
-		return null;
-	}
-}
-
-const STATE_TRANSITIONS: Record<string, string[]> = {
-	starting: ["running", "stopped"],
-	running: ["stopped"],
-	stopped: [],
-};
-
-function validateStateTransition(current: string, next: string): boolean {
-	return STATE_TRANSITIONS[current]?.includes(next) ?? false;
-}
-
-/** Write manifest state to "running" with generation confirmation. */
-function writeManifestRunning(cwd: string): void {
-	const manifestPath = getManifestPath(cwd);
-	try {
-		const manifest = readManifest(cwd);
-		if (!manifest) return; // no manifest → legacy path, skip
-		// v3 records are written only through the module's locked update helper: a
-		// plain read-modify-write here would drop a fresh owner/run/generation or a
-		// worker pane the launcher registered since we read the file.
-		if (manifest.schemaVersion === 3 || manifest.terminalBackend === "tmux") {
-			const pool = readBurstManifest(manifest);
-			if (!pool || pool.backend !== "tmux") {
-				logDiag("warn", "[mind-worker] v3 manifest state update skipped: the record is not a valid tmux pool");
-				return;
-			}
-			const currentState = typeof manifest.state === "string" ? manifest.state : "starting";
-			if (currentState === "running") return;
-			if (!validateStateTransition(currentState, "running")) {
-				logDiag("error", `[mind-worker] Invalid manifest transition: ${currentState} → running`);
-				return;
-			}
-			void updatePoolManifest(
-				manifestPath,
-				{ state: "running", lastUpdated: Date.now() },
-				{ owner: pool.owner, run: pool.run, generation: pool.generation, expectedCoreId: pool.coreId },
-			).catch((err: unknown) => {
-				logDiag("warn", `[mind-worker] v3 manifest state update refused: ${errorMessage(err)}`);
-			});
-			return;
-		}
-		if (manifest.state === "running") return;
-		if (!validateStateTransition(manifest.state as string, "running")) {
-			logDiag("error", `[mind-worker] Invalid manifest transition: ${manifest.state} → running`);
-			return;
-		}
-		manifest.state = "running";
-		manifest.lastUpdated = Date.now();
-		const tmpPath = manifestPath + ".tmp";
-		writeFileSync(tmpPath, JSON.stringify(manifest, null, 2), "utf-8");
-		renameSync(tmpPath, manifestPath);
-	} catch {
-		// Best-effort
-	}
-}
-
 /** Write "busy" status (delegate in progress). */
 function writeControlFileBusy(cwd: string): void {
 	writeControlFileStatus(cwd, "busy");
@@ -2244,9 +1750,6 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 		if (parsed.resetTimeout !== undefined && (typeof parsed.resetTimeout !== "number" || parsed.resetTimeout <= 0)) {
 			logDiag("warn", "[mind-worker] resetTimeout must be a positive number — using default 5");
 		}
-		if (parsed.terminalBackend !== undefined && parsed.terminalBackend !== "hc" && parsed.terminalBackend !== "tmux") {
-			logDiag("warn", `[mind-worker] terminalBackend "${String(parsed.terminalBackend)}" is not hc or tmux — the launcher record decides; ignoring it`);
-		}
 		if (parsed.workerCount !== undefined && (typeof parsed.workerCount !== "number" || parsed.workerCount < 1 || parsed.workerCount > 10)) {
 			logDiag("warn", "[mind-worker] workerCount must be 1-10 — using default 3");
 		}
@@ -2297,13 +1800,11 @@ function loadConfig(): { config: MindWorkerConfig; created: boolean; resolvedWor
 			workerThinkingLevel,
 			timeout: typeof parsed.timeout === "number" ? parsed.timeout : DEFAULT_CONFIG.timeout,
 			statusStream: parsed.statusStream !== false,
-			autoSpawnWorker: parsed.autoSpawnWorker !== false,
 			notifyOnMindIdle: parsed.notifyOnMindIdle === true,
 			ntfyTopic: parsed.ntfyTopic || DEFAULT_CONFIG.ntfyTopic,
 			ntfyServer: parsed.ntfyServer || DEFAULT_CONFIG.ntfyServer,
 			resetTimeout: typeof parsed.resetTimeout === "number" && parsed.resetTimeout > 0
 				? parsed.resetTimeout : DEFAULT_CONFIG.resetTimeout,
-			terminalBackend: parsed.terminalBackend === "hc" || parsed.terminalBackend === "tmux" ? parsed.terminalBackend : undefined,
 			workerCount: wc,
 			workerModels: parsed.workerModels,
 			dashboardEnabled: parsed.dashboardEnabled !== false,
@@ -3076,9 +2577,80 @@ function clearAbortDrains(): void {
 	}
 }
 
+/** Bumped on every Mind start and teardown so a stale draft run can never append. */
+let mindEpoch = 0;
+let mindmuxDraft: { close(): void } | null = null;
+/** A failed Go startup keeps status error; worker statuses must not erase it. */
+let mindmuxStartupError: string | null = null;
+
+function stopMindmuxDraft(): void {
+	mindmuxStartupError = null;
+	const draft = mindmuxDraft;
+	mindmuxDraft = null;
+	if (draft) {
+		try { draft.close(); } catch { /* ignore */ }
+	}
+}
+
+/**
+ * Go-managed readiness, in this order: the private draft socket listens, then the
+ * control file keeps carrying the real Mind task readiness, then Go is told ready.
+ * A draft that cannot listen never registers the Mind as ready.
+ */
+async function startMindmuxRuntime(cwd: string, ctx: ExtensionContext, epoch: number): Promise<void> {
+	const mindmux = readMindmuxEnv();
+	if (!mindmux) return;
+	if (!mindmux.draftSocket) {
+		const message = "MINDMUX_DRAFT_SOCKET is not set: no draft, so no ready registration";
+		mindmuxStartupError = message;
+		logDiag("error", `[mindmux] ${message}`);
+		writeControlFileStatus(cwd, "error", message);
+		return;
+	}
+	try {
+		stopMindmuxDraft();
+		const draft = await startMindmuxDraftSocket({
+			socketPath: mindmux.draftSocket,
+			append: (text: string) => {
+				// A replaced or stopped Mind must never write into the new session's draft.
+				if (currentRole !== "mind" || mindEpoch !== epoch) {
+					throw new Error("mind is not the active draft owner");
+				}
+				appendMindmuxDraft(ctx.ui, text);
+			},
+			onError: (err: unknown) => logDiag("warn", `[mindmux] draft socket error: ${errorMessage(err)}`),
+		});
+		if (currentRole !== "mind" || mindEpoch !== epoch) {
+			draft.close();
+			return;
+		}
+		mindmuxDraft = draft;
+		await createMindmuxClient(process.env).ready(mindmux.draftSocket);
+		if (currentRole !== "mind" || mindEpoch !== epoch) {
+			stopMindmuxDraft();
+			return;
+		}
+		// Go has the draft and ACKed ready. Only now may Go observe control "ready".
+		mindmuxStartupError = null;
+		writeControlFileReady(cwd);
+		logDiag("error", `[mindmux] ready gen=${mindmux.generation} instance=${taskInstanceLabel() ?? "none"} draft=${mindmux.draftSocket}`);
+	} catch (err) {
+		const message = errorMessage(err);
+		stopMindmuxDraft();
+		mindmuxStartupError = message;
+		logDiag("error", `[mindmux] draft/ready registration failed: ${message}`);
+		writeControlFileStatus(cwd, "error", message);
+	}
+}
+
 function startMindServer(cwd: string, ctx: ExtensionContext): void {
 	const socketPath = getSocketPath(cwd);
 	ensureDir(dirname(socketPath));
+	const epoch = ++mindEpoch;
+	mindmuxStartupError = null;
+	// Half a Go opt-in is a misconfiguration, not a mode: reported once per start.
+	const envProblem = mindmuxEnvProblem();
+	if (envProblem) logDiag("warn", `[mindmux] ${envProblem}`);
 
 	if (mindServer) {
 		try { mindServer.close(); } catch { /* ignore */ }
@@ -3180,7 +2752,15 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 							const staticConnections = [...workerPool.values()]
 								.filter(w => !isBurstWorker(w.workerId) && !w.socket.destroyed);
 							const tierConnected = staticConnections.filter(w => w.tier === workerTier).length;
-							if (tierWorkers === 0) {
+							const goExpected = mindmuxExpectedWorkers();
+							if (goExpected !== null) {
+								// Go decides how many static workers exist; admit exactly that many.
+								if (staticConnections.length >= goExpected) {
+									sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${goExpected} workers already connected` });
+									socket.destroy();
+									return;
+								}
+							} else if (tierWorkers === 0) {
 								// Tier not in resolved config (defensive) — static total limit; bursts are separate.
 								if (staticConnections.length >= maxWorkers) {
 									sendJson(socket, { type: "error", code: "POOL_FULL", message: `Max ${maxWorkers} workers already connected` });
@@ -3194,11 +2774,11 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 							}
 						}
 
-					// Launcher-path worker: validate generation
-						const manifest = readManifest(cwd);
-						const manifestGen = (manifest?.generation as number) ?? 0;
-						if (!msg.generation || !manifestGen || msg.generation !== manifestGen) {
-							const errMsg = `Generation mismatch: worker=${msg.generation || "none"}, mind=${manifestGen}. Reconnecting.`;
+						// Go owns the generation and it is authoritative. A manual role restore has
+						// no pinned generation, so it accepts the worker's own rather than rejecting it.
+						const poolGen = poolGeneration();
+						if (poolGen && msg.generation !== poolGen) {
+							const errMsg = `Generation mismatch: worker=${msg.generation || "none"}, mind=${poolGen}. Reconnecting.`;
 							logDiag("error", `[mind-worker] HANDSHAKE REJECT: ${errMsg}`);
 							sendJson(socket, { type: "error", code: "GENERATION_MISMATCH", message: errMsg });
 							if (LAUNCHER_ROLE_FLAG === "mind") {
@@ -3207,6 +2787,7 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 							socket.end();
 							return;
 						}
+						const manifestGen = poolGen || msg.generation || 0;
 
 						// Determine workerId from handshake or auto-assign
 						const candidateId = msg.workerId || `auto-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -3606,8 +3187,15 @@ function startMindServer(cwd: string, ctx: ExtensionContext): void {
 	mindServer.listen(socketPath, () => {
 		ctx.ui.setStatus("mind-worker", `🔵 mind (0/${maxWorkers})`);
 		if (LAUNCHER_ROLE_FLAG === "mind") {
-			writeControlFileReady(cwd);
-			writeManifestRunning(cwd);
+			// A Go opt-in is a pair: any half-set or invalid env publishes nothing here.
+			const adapterEnv = Boolean((process.env.MINDMUX_ADAPTER_SOCKET ?? "").trim() || (process.env.MINDMUX_MANIFEST ?? "").trim());
+			if (readMindmuxEnv()) {
+				// Go mode becomes ready only after the draft listens and Go ACKs ready.
+				void startMindmuxRuntime(cwd, ctx, epoch);
+			} else if (!adapterEnv) {
+				// Manual roles and fixtures have no adapter: the worker socket is the gate.
+				writeControlFileReady(cwd);
+			}
 		}
 	});
 
@@ -3650,6 +3238,10 @@ function suspendMindServer(cwd: string, ctx: ExtensionContext): void {
 }
 
 function teardownMindServer(cwd: string, ctx: ExtensionContext): void {
+	// Any run started after this point owns a fresh draft; this one is closed.
+	mindEpoch += 1;
+	mindmuxStartupError = null;
+	stopMindmuxDraft();
 	workerPool.clear();
 	taskWorkerMap.clear();
 	asyncTaskWorkerMap.clear();
@@ -3680,24 +3272,15 @@ async function connectWorker(
 	const socketPath = getSocketPath(cwd);
 	const isLauncherPath = LAUNCHER_ROLE_FLAG === "worker";
 
-	// Launcher path: read generation from manifest before connecting
+	// The generation this process was started with is authoritative: Go passes it.
+	// Mind re-checks it at handshake and answers GENERATION_MISMATCH, so a stale
+	// worker never joins a pool.
 	let generation = 0;
 	if (isLauncherPath) {
-		const manifest = readManifest(cwd);
-		generation = (manifest?.generation as number) ?? 0;
+		generation = LAUNCHER_GENERATION ?? 0;
 	}
 
 	if (isLauncherPath) {
-		// Pre-connect generation check: compare env expectation vs manifest
-		const expectedGen = LAUNCHER_GENERATION;
-		if (expectedGen !== null && generation !== 0 && generation !== expectedGen) {
-			safeUiNotify(ctx,
-				`Generation mismatch: manifest=${generation}, expected=${expectedGen}. Stale worker from prior reset.`,
-				"error",
-			);
-			process.exit(1);
-		}
-
 		// Launcher path: single attempt, no retry loop.
 		// Exit immediately on disconnect/error.
 		return new Promise((resolve) => {
@@ -4111,24 +3694,24 @@ async function activateMindRole(ctx: ExtensionContext, pi: ExtensionAPI): Promis
 		ctx.ui.notify("Tip: enable notifyOnMindIdle in mind-worker.json for desktop notify-send + optional ntfy phone push", "info");
 	}
 
-	// Set max workers and queue size from resolved worker list
-	maxWorkers = resolvedWorkers.length;
-	maxQueueSize = resolvedWorkers.length * 2;
+	// Go starts the static workers, so its own expected count is the capacity proof.
+	// The Pi resolver is narrower (it can undercount what Go launches) and stays the
+	// manual-role fallback when the Go env is absent.
+	maxWorkers = mindmuxExpectedWorkers() ?? resolvedWorkers.length;
+	maxQueueSize = maxWorkers * 2;
 
 	if (!defaultTools) defaultTools = pi.getActiveTools();
 	pi.setActiveTools(MIND_ALLOWED_TOOLS);
-	// Capture the durable burst snapshot before the server/heartbeat can overwrite it,
-	// and restore the monotonic counter before any spawn can reuse an id or name.
-	const persistedBursts = readPersistedBurstSnapshot(ctx.cwd);
-	restoreBurstCounter(persistedBursts);
+	// Before the server's first control write: reserve the ids a reload must not reuse.
+	const recovery = readBurstRecovery(ctx.cwd);
+	reserveBurstIds(recovery);
 	currentRole = "mind";
 	startMindServer(ctx.cwd, ctx);
 	startDashboardHeartbeat(ctx.cwd);
-	// A replaced session keeps the tracked map but lost its timer; /reload loses the map
-	// itself, so adopt only what the durable control file and the core still prove. Never
-	// restart a task or an agent; adopted bursts are cleanup-only.
+	// A replaced session keeps the tracked map but lost its timer.
 	if (burstWorkers.size > 0) ensureBurstIdleTimer(ctx.cwd);
-	void adoptPersistedBursts(ctx.cwd, persistedBursts);
+	// /reload lost the map: reseed Go's own survivors as cleanup-only retirements.
+	if (recovery) void adoptRecoveredBursts(ctx.cwd, recovery);
 	await setModelFromId(pi, ctx, config.mindModel);
 	if (config.mindThinkingLevel) pi.setThinkingLevel(config.mindThinkingLevel);
 
@@ -4137,11 +3720,6 @@ async function activateMindRole(ctx: ExtensionContext, pi: ExtensionAPI): Promis
 		void pi.sendMessage({ customType: "mind-worker-context", content: snapshot, display: false }, { triggerTurn: false });
 	} catch {
 		/* ignore */
-	}
-
-	// Launcher path: launcher spawns worker directly, skip auto-spawn
-	if (!LAUNCHER_ROLE_FLAG && config.autoSpawnWorker) {
-		ctx.ui.notify("Start the mind-worker pair with bin/mind-worker-launcher.", "warning");
 	}
 
 	pi.appendEntry("mind-worker-role", { role: "mind", cwd: ctx.cwd });

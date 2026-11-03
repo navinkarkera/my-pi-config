@@ -9,15 +9,38 @@ git clone <this-repo> ~/.pi/agent
 pi
 ```
 
-## Mind-worker launcher
+## Mind-worker hosting (mindmux)
 
-`bin/mind-worker-launcher` is the supported pair launcher. It supports the `hc` (Herdr core) and `tmux` terminal backends. The backend is selected by `--backend hc|tmux`, then `terminalBackend` in `mind-worker.json`, then `hc`; the tracked config keeps `terminalBackend: "hc"` for backward compatibility, while the dotfiles `tmux-mind` entrypoint explicitly passes `--backend tmux`.
+Mind and its workers are hosted by `mindmux`, a separate Go supervisor that is not part of this
+repository: this repo carries only the Pi extension. Install the binary on `PATH` (it is built from
+`~/work/mindmux` and currently lives at `~/.local/share/go/bin/mindmux`) and bind it in tmux. The
+dotfiles binding is `C-a p` in the invoking pane's session (`tmux.conf:73`):
 
-`PI_CODING_AGENT_DIR` relocates the agent dir (state, config, sessions and the cleanup guard's scan) together, following pi's `getAgentDir`: a literal `~` or `~/` expands and the value is never trimmed. A relative or `file://` value is refused before anything is written or scanned.
+```tmux
+bind p run-shell -c '#{pane_current_path}' 'TMUX_PANE=#{pane_id} mindmux start >/dev/null'
+```
 
-On tmux, the launcher is the root pane's direct program and runs in the invoking tmux session. The dotfiles `tmux-mind` entrypoint creates the Mind window; all static and burst workers share one `workers` window. A tmux pool is identified by a v3 record that carries the canonical root plus its exact tmux server, session and root-pane proof; global `pane-exited`, `after-kill-pane` and `window-unlinked` hooks invoke a cleanup guard that proves ownership before sweeping. The tmux backend never adopts or converts a v2/hc record, or a record from another server, session or root; it refuses instead of guessing.
+- `mindmux start [--force]` starts or focuses the one Mind for that tmux session.
+- `printf '%s' "$TEXT" | mindmux send` appends to that Mind's editor draft and never submits it.
+- `mindmux check-stopped --cwd "$PWD"` is the read-only worktree/directory-removal safety guard: it
+  answers whether this directory may be removed, and stops nothing itself.
 
-The legacy Kitty pair launcher has been retired. Manual `/be-mind` / `/be-worker` role restore remains available, and the optional burst-worker Kitty path is unchanged.
+`mindmux` owns placement, generations and process lifetime, and passes `MINDMUX_*` plus the
+`PI_MIND_WORKER_*` role identity into every process it launches. The extension keeps what it always
+did — task scheduling, delegation to workers and their results — and speaks the adapter socket plus
+the private draft socket. There is no `hc` (Herdr core) or launcher-managed `tmux` fallback in the
+TypeScript: with no adapter env, no pool is pinned and burst spawns are refused.
+
+Manual `/be-mind` / `/be-worker` role restore remains available. The remaining legacy files are
+intentional remnants: `bin/mind-worker-launcher` is only a `mindmux` compatibility shim, and
+`tmux-cleanup.mjs` is only a read-only legacy removal guard.
+
+Pools started by the retired launcher are not adopted: quit their Mind normally, then start the
+session with `mindmux start`. Nothing in this repo stops or kills a process for you.
+
+`PI_CODING_AGENT_DIR` relocates the agent dir (state, config, sessions) together, following pi's
+`getAgentDir`: a literal `~` or `~/` expands and the value is never trimmed. A relative or
+`file://` value is refused before anything is written.
 
 ## Authentication
 

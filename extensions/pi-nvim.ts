@@ -28,10 +28,23 @@ import * as crypto from "node:crypto";
  *
  * The socket path for a given cwd is also written to /tmp/pi-nvim-sockets/<hash>
  * as a plain text file containing the cwd, so neovim can list all running sessions.
+ *
+ * When Go's mindmux adapter manages this Mind (MINDMUX_ADAPTER_SOCKET and
+ * MINDMUX_MANIFEST), the generic discovery surface is not published at all:
+ * the dedicated private draft server in mindmux-host owns prompts, and a second
+ * socket/info file would make standalone pi-nvim discovery select a Mind it
+ * cannot submit to. Standalone Pi keeps the legacy socket unchanged.
  */
 
 function cwdHash(cwd: string): string {
   return crypto.createHash("md5").update(cwd).digest("hex").slice(0, 12);
+}
+
+/** True only for the explicit Go-managed pair; no half-set env is adopted. */
+function isManagedMind(): boolean {
+  const adapter = (process.env.MINDMUX_ADAPTER_SOCKET || "").trim();
+  const manifest = (process.env.MINDMUX_MANIFEST || "").trim();
+  return adapter.startsWith("/") && manifest.startsWith("/");
 }
 
 function getSocketPath(cwd: string): string {
@@ -47,6 +60,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     if (ctx.mode !== "tui") return;
+
+    // Go-managed Mind: mindmux-host owns the private draft server. Do not
+    // publish a generic pi-nvim socket or discovery manifest, so standalone
+    // discovery never selects a session it cannot submit to.
+    if (isManagedMind()) return;
 
     const cwd = ctx.cwd;
     // Ensure sockets directory exists
@@ -77,7 +95,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     server.listen(socketPath, () => {
-      // Update latest symlink
+      // Update latest symlink.
       try {
         fs.unlinkSync(LATEST_LINK);
       } catch {}
@@ -85,7 +103,7 @@ export default function (pi: ExtensionAPI) {
         fs.symlinkSync(socketPath!, LATEST_LINK);
       } catch {}
 
-      // Register in sockets directory for discovery
+      // Register in sockets directory for discovery.
       try {
         fs.mkdirSync(SOCKETS_DIR, { recursive: true });
         // Write a manifest file alongside the socket for discovery

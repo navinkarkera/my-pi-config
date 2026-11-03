@@ -1,120 +1,66 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Entrypoint for the mind + worker pair. Mind replaces this terminal's shell or
-# pane program (run it with the shell builtin `exec`). Backend: --backend
-# hc|tmux, else mind-worker.json terminalBackend, else hc. No whole-pool reset.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AGENT_DIR="$SCRIPT_DIR/.."
-# pi's agent dir may be relocated (PI_CODING_AGENT_DIR). The launcher module and
-# the tmux cleanup guard apply the same rule: a literal "~" or "~/" expands, the
-# value is never trimmed, and a relative or file:// value is refused instead of
-# guessed. The install dir stays AGENT_DIR.
-normalize_agent_config_dir() {
-    local dir="${PI_CODING_AGENT_DIR-}"
-    if [ -z "$dir" ]; then printf '%s\n' "$AGENT_DIR"; return 0; fi
-    case "$dir" in
-        "~") dir="$HOME" ;;
-        "~/"*) dir="$HOME/${dir#\~/}" ;;
-    esac
-    case "$dir" in
-        /*) printf '%s\n' "$dir" ;;
-        *)
-            printf 'ERROR: PI_CODING_AGENT_DIR must be an absolute path or start with "~/" (relative and file:// values are refused): %s\n' "$dir" >&2
-            return 1 ;;
-    esac
+# Entrypoint for the mind + worker pair. The legacy hc/tmux hosting is retired,
+# so this file is only a compatibility shim: it starts, stops, deletes and
+# kills nothing itself and owns no record, pane or lock. A pool's lifetime
+# belongs to mindmux, which decides by the invoking pane's session/server tuple.
+#
+#   mind-worker-launcher            exec mindmux start
+#   mind-worker-launcher --force    exec mindmux start --force
+#
+# MINDMUX_BIN overrides PATH. Herdr's pi-current-mind and the Herdr app program
+# run this path with no arguments and require it to be executable.
+# Never legacy hosting: every old flag is refused instead of reinterpreted.
+
+usage() {
+    printf 'usage: mind-worker-launcher [--force]   start or focus Mind via mindmux\n' >&2
 }
-AGENT_CONFIG_DIR="$(normalize_agent_config_dir)" || exit 1
-CONFIG_FILE="$AGENT_CONFIG_DIR/mind-worker.json"
-# Explicit toolchain: the launcher's Node and Mind share this resolved PATH.
-NODE_CMD=("${MISE_BIN:-/usr/bin/mise}" x node@26 -- node)
+die() { printf 'mind-worker-launcher: %s\n' "$1" >&2; exit "${2:-1}"; }
 
-PASSTHROUGH_ARGS=()
-EXPLICIT_BACKEND=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --background)
-      echo "ERROR: Mind runs in the invoking terminal; --background is gone." >&2
-      exit 2 ;;
-    --reset)
-      echo "ERROR: Whole-pool reset is gone. Stop this root terminal and start a fresh one." >&2
-      exit 2 ;;
-    --backend)
-      if [ $# -lt 2 ]; then
-        echo "ERROR: --backend needs hc or tmux." >&2
+# The binary to delegate to: an explicit override, else PATH. Empty = unavailable.
+mindmux_bin() {
+    local bin="${MINDMUX_BIN:-}"
+    if [ -z "${bin}" ]; then bin="$(command -v mindmux 2>/dev/null || true)"; fi
+    printf '%s' "${bin}"
+}
+
+FORCE=""
+case "$#" in
+    0) ;;
+    1)
+        case "$1" in
+            --force) FORCE=force ;;
+            -h|--help) usage; exit 0 ;;
+            --*)
+                printf 'mind-worker-launcher: %s is gone: the legacy hc/tmux host is retired; run mindmux start\n' "$1" >&2
+                usage
+                exit 2
+                ;;
+            *)
+                printf 'mind-worker-launcher: %s is gone: session arguments are no longer accepted; run mindmux start in that pane\n' "$1" >&2
+                usage
+                exit 2
+                ;;
+        esac
+        ;;
+    *)
+        printf 'mind-worker-launcher: arguments are gone (%s): run mindmux start in that pane\n' "$1" >&2
+        usage
         exit 2
-      fi
-      EXPLICIT_BACKEND="$2"
-      PASSTHROUGH_ARGS+=("$1" "$2")
-      shift 2 ;;
-    --backend=*)
-      EXPLICIT_BACKEND="${1#--backend=}"
-      PASSTHROUGH_ARGS+=("$1")
-      shift ;;
-    *) PASSTHROUGH_ARGS+=("$1"); shift ;;
-  esac
-done
-set -- "${PASSTHROUGH_ARGS[@]}"
-
-if [ -n "${MIND_WORKER_LAUNCHER_BACKGROUND:-}" ]; then
-  echo "ERROR: Mind runs in the invoking terminal; MIND_WORKER_LAUNCHER_BACKGROUND is gone." >&2
-  exit 2
-fi
-
-# The flag wins over the config; an absent config selects hc. Nothing is written.
-if [ -n "$EXPLICIT_BACKEND" ]; then
-  BACKEND="$EXPLICIT_BACKEND"
-elif [ -f "$CONFIG_FILE" ]; then
-  BACKEND="$("${NODE_CMD[@]}" -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf-8")).terminalBackend||"")}catch{console.log("")}' "$CONFIG_FILE" 2>/dev/null)"
-else
-  BACKEND=""
-fi
-if [ -z "$BACKEND" ]; then
-  BACKEND="hc"
-fi
-case "$BACKEND" in
-  hc|tmux) ;;
-  *)
-    echo "ERROR: unknown terminal backend \"$BACKEND\"; --backend must be hc or tmux." >&2
-    exit 1 ;;
+        ;;
 esac
 
-if [ "$BACKEND" = "hc" ]; then
-  if [ -z "${HC_TERMINAL_ID:-}" ]; then
-    echo "ERROR: HC_TERMINAL_ID is not set. Start this from a herdr-app (hc) terminal, not a plain shell." >&2
-    exit 2
-  fi
-else
-  if [ -z "${TMUX:-}" ]; then
-    echo "ERROR: TMUX is not set. Start this from a tmux pane, not a plain shell." >&2
-    exit 2
-  fi
-  if [ -z "${TMUX_PANE:-}" ]; then
-    echo "ERROR: TMUX_PANE is not set; refusing to guess the root pane." >&2
-    exit 2
-  fi
+if [ -n "${MIND_WORKER_LAUNCHER_BACKGROUND:-}" ]; then
+    die "MIND_WORKER_LAUNCHER_BACKGROUND is gone: Mind runs in the invoking terminal." 2
 fi
 
-if [ ! -t 0 ] || [ ! -t 1 ] || [ ! -t 2 ]; then
-  echo "ERROR: Mind must be started interactively in its terminal; detached startup cannot take it over." >&2
-  exit 2
-fi
+BIN="$(mindmux_bin)"
+[ -n "${BIN}" ] || die "mindmux is not installed: build it from ~/work/mindmux and put it on PATH"
+[ -x "${BIN}" ] || die "mindmux is not executable: ${BIN}"
 
-# A background job can inherit all three TTY descriptors.
-read -r CURRENT_PGID TTY_PGID < <(ps -o pgid= -o tpgid= -p "$$" 2>/dev/null) || {
-  echo "ERROR: Cannot verify foreground terminal ownership; refusing to start Mind." >&2
-  exit 2
-}
-if [ -z "$CURRENT_PGID" ] || [ "$CURRENT_PGID" != "$TTY_PGID" ]; then
-  echo "ERROR: Mind must run in the foreground process group of its terminal." >&2
-  exit 2
+# exec keeps this PID: mindmux becomes the terminal's/pane's root program.
+if [ -n "${FORCE}" ]; then
+    exec "${BIN}" start --force
 fi
-
-HC_LAUNCHER="$AGENT_DIR/lib/mind-worker/hc-launcher.mjs"
-if [ ! -f "$HC_LAUNCHER" ]; then
-  echo "ERROR: launcher module not found at $HC_LAUNCHER" >&2
-  exit 1
-fi
-
-# exec keeps this PID: the launcher must be the terminal's/pane's root program.
-exec "${NODE_CMD[@]}" "$HC_LAUNCHER" "$@"
+exec "${BIN}" start
