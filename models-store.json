@@ -70,7 +70,8 @@
         },
         "compat": {
           "forceAdaptiveThinking": true,
-          "supportsTemperature": false
+          "supportsTemperature": false,
+          "supportsMidConvoEffort": true
         },
         "inputLimits": {
           "images": {
@@ -86,7 +87,7 @@
       },
       {
         "id": "deepseek-v4-pro",
-        "name": "DeepSeek V4 Pro (New)",
+        "name": "DeepSeek V4 Pro",
         "api": "openai-completions",
         "provider": "opencode-go",
         "baseUrl": "https://opencode.ai/inference/go/openai/v1",
@@ -515,6 +516,52 @@
           "high": "high",
           "xhigh": null,
           "max": null
+        },
+        "type": "chat"
+      },
+      {
+        "id": "hy4",
+        "name": "Hy4",
+        "api": "openai-completions",
+        "provider": "opencode-go",
+        "baseUrl": "https://opencode.ai/inference/go/openai/v1",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0.834,
+          "output": 2.501,
+          "cacheRead": 0.042,
+          "cacheWrite": 0
+        },
+        "contextWindow": 1048576,
+        "maxTokens": 65536,
+        "compat": {
+          "supportsStore": false,
+          "supportsDeveloperRole": false,
+          "supportsStrictMode": true,
+          "maxTokensField": "max_tokens"
+        },
+        "thinkingLevelMap": {
+          "off": "none",
+          "minimal": null,
+          "low": null,
+          "medium": null,
+          "high": "high",
+          "xhigh": null,
+          "max": null
+        },
+        "inputLimits": {
+          "images": {
+            "resize": {
+              "maxWidth": 2000,
+              "maxHeight": 2000,
+              "maxBytes": 4718592,
+              "jpegQuality": 80
+            }
+          }
         },
         "type": "chat"
       },
@@ -1199,9 +1246,9 @@
         "type": "chat"
       }
     ],
-    "lastModified": 1793193885000,
-    "etag": "W/\"2a97586719f0fc413c838181323179be\"",
-    "checkedAt": 1793529522264
+    "lastModified": 1793884928000,
+    "etag": "W/\"3532ecf20b2912c11a27a115a4b4ef98\"",
+    "checkedAt": 1793887547376
   },
   "openai-codex": {
     "models": [
@@ -5124,6 +5171,6 @@
     ],
     "lastModified": 1793193877000,
     "etag": "W/\"9cb1a79c50b9cf662b2087060a30e5dc\"",
-    "checkedAt": 1793529522417
+    "checkedAt": 1793887548482
   }
 }

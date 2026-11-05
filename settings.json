@@ -1,6 +1,6 @@
 {
   "quietStartup": true,
-  "lastChangelogVersion": "1.4.0",
+  "lastChangelogVersion": "1.5.0",
   "defaultProvider": "openai",
   "defaultModel": "gpt-6-luna",
   "defaultThinkingLevel": "max",
@@ -26,7 +26,7 @@
     "npm:pi-ast-grep",
     "npm:@ff-labs/pi-fff"
   ],
-  "hideThinkingBlock": false,
+  "hideThinkingBlock": true,
   "steeringMode": "one-at-a-time",
   "followUpMode": "one-at-a-time",
   "enableInstallTelemetry": false,
@@ -66,5 +66,8 @@
     "extensions/repl-system-prompt.ts",
     "extensions/pi-orchestrate-worker-only.ts"
   ],
-  "deviceId": "cffad980-44e8-4cdc-9d39-51af4f0afaf6"
+  "deviceId": "cffad980-44e8-4cdc-9d39-51af4f0afaf6",
+  "extensionChangelogVersions": {
+    "{\"source\":\"npm:pi-web-access\",\"scope\":\"user\"}": "0.46.0"
+  }
 }
