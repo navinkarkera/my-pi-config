@@ -30,5 +30,7 @@ tmp/
 /pi-web.sqlite
 /pi-web.sqlite-shm
 /pi-web.sqlite-wal
+/pi-web-access/last-seen-version.json
+/models-store.json
 /mindworker
 /missions

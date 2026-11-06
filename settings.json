@@ -68,6 +68,6 @@
   ],
   "deviceId": "cffad980-44e8-4cdc-9d39-51af4f0afaf6",
   "extensionChangelogVersions": {
-    "{\"source\":\"npm:pi-web-access\",\"scope\":\"user\"}": "0.46.0"
+    "{\"source\":\"npm:pi-web-access\",\"scope\":\"user\"}": "0.47.0"
   }
 }
