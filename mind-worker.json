@@ -8,7 +8,8 @@
   "mindModel": "openai/gpt-6.1-sol",
   "mindThinkingLevel": "xhigh",
   "workerModels": [
-    { "model": "opencode-go/deepseek-v4.1-flash", "count": 2, "tier": "flash" }
+    { "model": "opencode-go/deepseek-v4.1-flash", "count": 2, "tier": "flash", "thinkingLevel": "low" },
+    { "model": "opencode-go/deepseek-v4.1-flash", "count": 2, "tier": "strong", "thinkingLevel": "max" }
   ],
   "workerModel": "opencode-go/deepseek-v4.1-flash",
   "workerThinkingLevel": "max",
@@ -22,6 +23,7 @@
   "burstFlash": {
     "enabled": true,
     "model": "opencode-go/deepseek-v4.1-flash",
+    "thinkingLevel": "low",
     "maxBurst": 5,
     "idleTtlMs": 180000,
     "maxTasksPerWorker": 3,
