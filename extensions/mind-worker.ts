@@ -4767,15 +4767,14 @@ async function executeFanout(
 				"Default to delegate_async for delegated work, including implementation, edits, tests, builds, and investigation; preserve the existing tier-selection rules.\n" +
 				"Use blocking delegate only when its result is required before continuing and no useful independent work can proceed.\n" +
 				"Async submission is not completion: track pending task IDs, incorporate each required <worker_result>, and do not redispatch pending work. If only pending async work remains, end with a brief in-progress status and continue when results arrive; do not claim completion before required results.\n" +
-				"Default: parallel-first. Saturate all idle workers whenever tasks are independent.\n" +
-				"Preflight rule: before every non-trivial task, decompose it into independent chunks and saturate all idle workers immediately.\n" +
+				"Right-size the delegation: one worker owns inspect → implement/install → verify for each scoped deliverable. One small task is one delegate to one worker — the blocking exception above when nothing independent remains — never split into separate preflight/read tasks.\n" +
+				"Mind does not duplicate an in-flight delegated investigation unless new evidence requires it.\n" +
 				"Use tier='flash' for ALL scoped/simple tasks — anything that does not require multi-file architecture, deep debugging, or correctness-sensitive reasoning. Prefer delegate_async, but use blocking delegate when the immediate-result exception above applies.\n" +
 				"Do not hold back flash delegates because static flash workers are busy — queued flash-tier tasks auto-spawn burst workers up to configured max.\n" +
-				"Parallelize/queue independent flash work liberally; burst workers activate from queue pressure.\n" +
 				"Mind: planning, final review/verdict, and direct read/git/ripgrep checks. Git accepts any subcommand and may change the worktree/history or contact remotes; it is noninteractive (no editor or prompts), and do not run mutating Git while a worker is editing the same worktree.\n" +
 				"Never use write/edit/bash/grep/find directly in mind mode.\n" +
 				"Codemode in mind exposes the tools above plus code_explore: use tools.code_explore with action 'files'|'text'|'ast'|'symbol'|'references'|'impact'|'map' and optional query/scope/language/maxResults/maxTokens/maxFiles; 'ast' requires language. Keep scopes narrow and output small.\n" +
-				"Parallel-by-default: independent tasks (separate files, separate searches, separate assertions) fan out across all idle workers in the same turn. This is the expected default — not a special pattern.\n" +
+				"Parallel-by-default: genuinely independent tasks (separate files, separate searches, separate assertions) fan out across all idle workers in the same turn. This is the expected default — not a special pattern; stages of one deliverable are not independent.\n" +
 				"Sequential exception: dependent tasks and overlapping file edits stay sequential; never overlap edits to the same files, and wait for the prior result before continuing.\n" +
 				"Blocking delegate batches return together; async results arrive separately in follow-up messages. Merge all required results before dependent work or final conclusions.\n" +
 				"If no workerId or tier is given, either delegation tool auto-routes to an idle worker.\n" +
