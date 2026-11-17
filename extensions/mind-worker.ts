@@ -460,6 +460,8 @@ const taskMetadataMap = new Map<string, TaskMetadata>();
 let dashboardHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 let lastDashboardStatus = "";
 let lastDashboardCwd = "";
+/** A low-level Mind run is live. Only agent_settled proves Mind is ready again. */
+let mindRunLive = false;
 
 // ── Burst identity ──────────────────────────────────────────────────────────
 
@@ -1531,6 +1533,9 @@ function writeControlFileStatus(cwd: string, status: string, message?: string): 
 	// A failed Go startup must stay failed. Worker handshakes (worker-connected)
 	// and task transitions cannot overwrite the error that Go is waiting on.
 	if (readMindmuxEnv() && mindmuxStartupError && status !== "error" && status !== "stopped") return;
+	// Ready means "Mind waits for input". A live run (retries, follow-ups, queued work,
+	// a delegate result mid-turn) is still busy; agent_settled is the only proof otherwise.
+	if (mindRunLive && (status === "ready" || status === "worker-connected")) status = "busy";
 
 	// Track last status for heartbeat writes
 	lastDashboardStatus = status;
@@ -3843,6 +3848,8 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 			stopMindServer(ctx.cwd, ctx);
 			if (defaultTools) pi.setActiveTools(defaultTools);
 			currentRole = "none";
+			// The role, not a settled run, owns the readiness flag from here on.
+			mindRunLive = false;
 			pi.appendEntry("mind-worker-role", { role: "none", cwd: ctx.cwd });
 			ctx.ui.notify("Mind mode stopped", "info");
 		},
@@ -4826,6 +4833,12 @@ async function executeFanout(
 		return { action: "continue" };
 	});
 
+	pi.on("agent_start", async (_event, ctx) => {
+		if (currentRole !== "mind") return;
+		mindRunLive = true;
+		writeControlFileBusy(ctx.cwd);
+	});
+
 	pi.on("agent_end", async (event, ctx) => {
 		if (currentRole === "mind") {
 			const summary = extractLastAssistantText(event.messages);
@@ -4861,7 +4874,10 @@ async function executeFanout(
 
 	pi.on("agent_settled", async (event, ctx) => {
 		// 005: control status is state, not an alert — restore it on any settled idle Mind parent.
-		if (currentRole === "mind" && ctx.isIdle() && !hasPendingWork()) writeControlFileIdle(ctx.cwd);
+		if (currentRole === "mind") {
+			mindRunLive = false;
+			if (ctx.isIdle() && !hasPendingWork()) writeControlFileIdle(ctx.cwd);
+		}
 		// Consume the capture once for every settled run, whatever the role: a run that still
 		// owns a retired worker record belongs to 001 and must never alert Mind.
 		const capture = mindSettleCapture;
@@ -4956,6 +4972,8 @@ async function executeFanout(
 		if (currentRole === "worker") disconnectWorker(ctx);
 		failPendingTasks("Session ended", "SESSION_END");
 		currentRole = "none";
+		// A replaced runtime never settles the old run: no stale busy may cross it.
+		mindRunLive = false;
 		mindSettleCapture = null;
 		if (!workerTask) {
 			workerBusy = false;
