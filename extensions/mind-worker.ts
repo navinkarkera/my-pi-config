@@ -3795,6 +3795,22 @@ async function activateWorkerRole(ctx: ExtensionContext, pi: ExtensionAPI): Prom
 }
 
 export default function mindWorkerExtension(pi: ExtensionAPI) {
+	// workmux shows "done" when the activity count reaches 0. Only the settled gate below
+	// may say that; a busy worker or a run still to come is never finished work.
+	// The last answer is latched: in the gap between a worker result arriving and the run
+	// that processes it, nothing may re-derive "0" from the pool being empty.
+	let publishedActivity: number | undefined;
+	const publishMindActivity = (activeCount: number) => {
+		publishedActivity = activeCount;
+		pi.events.emit("suba:activity", { activeCount });
+	};
+	// The status extension subscribes after load and may ask again (reload): replay the
+	// latch, and derive startup state only before Mind has published anything.
+	pi.events.on("suba:activity:request", () => {
+		if (currentRole !== "mind") return;
+		publishMindActivity(publishedActivity ?? (mindRunLive || hasPendingWork() ? 1 : 0));
+	});
+
 	pi.registerCommand("be-mind", {
 		description: "Activate mind role",
 		handler: async (_args, ctx) => {
@@ -3850,6 +3866,8 @@ export default function mindWorkerExtension(pi: ExtensionAPI) {
 			currentRole = "none";
 			// The role, not a settled run, owns the readiness flag from here on.
 			mindRunLive = false;
+			// A stopped role owes no work: never leave workmux on a stale "working".
+			publishMindActivity(0);
 			pi.appendEntry("mind-worker-role", { role: "none", cwd: ctx.cwd });
 			ctx.ui.notify("Mind mode stopped", "info");
 		},
@@ -4837,6 +4855,7 @@ async function executeFanout(
 		if (currentRole !== "mind") return;
 		mindRunLive = true;
 		writeControlFileBusy(ctx.cwd);
+		publishMindActivity(1);
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
@@ -4883,8 +4902,14 @@ async function executeFanout(
 		const capture = mindSettleCapture;
 		mindSettleCapture = null;
 		if (currentRole === "mind" && !workerTask) {
-			if (!capture || event.aborted || capture.outcome !== "completed" || !ctx.isIdle()) return;
-			if (ctx.hasPendingMessages() || hasPendingWork()) return;
+			// The one finished gate, shared by workmux "done" and the idle notification: a
+			// completed run, an idle parent, and no message or worker Mind must still process.
+			if (!capture || event.aborted || capture.outcome !== "completed" || !ctx.isIdle()
+				|| ctx.hasPendingMessages() || hasPendingWork()) {
+				publishMindActivity(1);
+				return;
+			}
+			publishMindActivity(0);
 			const { config } = loadConfig();
 			await sendMindIdleNotification(config, ctx, capture.summary || undefined);
 			return;
