@@ -32,6 +32,11 @@ function execWithPrompt(args: string[], prompt: PendingPrompt): Promise<number> 
 }
 
 export default function (pi: ExtensionAPI) {
+  // mindmux starts every worker pi with the Mind's pane still in TMUX_PANE, so a
+  // worker's write would land on the Mind's window (a finished worker then shows
+  // "done" while Mind is still busy). A worker pane owns no window of its own.
+  if (process.env.PI_MIND_WORKER_ROLE === "worker") return;
+
   let sessionActive = false;
   let parentWorking = false;
   let activeCount: number | undefined;
