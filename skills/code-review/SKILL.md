@@ -30,7 +30,8 @@ If target is ambiguous and multiple plausible scopes exist, ask one short clarif
    - data loss, races, leaks, resource handling
    - security and privacy issues
    - error handling and observability gaps
-   - test coverage gaps for changed behavior
+   - test coverage gaps for changed behavior, and tests that re-prove a dependency default or the same app contract twice (see the [framework-default pass](../test-consolidation/SKILL.md#framework-default-pass))
+   - changed comments and docstrings: non-obvious current rationale or contracts, plain language, one sentence when it fits, and context-free — no session, branch or split history (that belongs in the PR or decision note)
    - maintainability issues that will slow future changes
 5. Run targeted tests or static checks only user specifically asks to else DO NOT RUN TESTS or CHECKS
 6. Produce concise findings with file/line references when possible.
