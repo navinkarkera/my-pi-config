@@ -4,7 +4,11 @@ Answer simple points directly instead of writing paragraphs. Keep language simpl
 
 ## AI notes
 
-Durable project notes live in `~/work/ai-notes/<current_dir_name>/` (`<current_dir_name>` = current working directory name). Notes already in that folder are valid context.
+Durable project notes live in `~/work/ai-notes/<project>/`, named after the source repo or project (not a subdirectory or worktree leaf name). Notes already in that folder are valid context.
+
+**At project start**
+- Once per session when starting work on a project, or when switching projects: resolve the matching existing `~/work/ai-notes/<project>/` folder, then directly read its `CONTEXT.md` and `GLOSSARY.md` if present, before exploring, designing or implementing.
+- Do not create or guess a folder for this startup read. Skip it for non-project questions and do not re-read every turn; the deeper discovery and writing rules below still apply.
 
 **Read before writing**
 - Search whenever prior project context may help, and always before writing a requested Markdown document. Update existing notes instead of duplicating them.
