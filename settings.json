@@ -62,10 +62,6 @@
   "terminal": {
     "showTerminalProgress": true
   },
-  "extensions": [
-    "extensions/repl-system-prompt.ts",
-    "extensions/pi-orchestrate-worker-only.ts"
-  ],
   "deviceId": "cffad980-44e8-4cdc-9d39-51af4f0afaf6",
   "extensionChangelogVersions": {
     "{\"source\":\"npm:pi-web-access\",\"scope\":\"user\"}": "0.48.0"
