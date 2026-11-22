@@ -5444,6 +5444,8 @@ async function executeFanout(
 				"If investigation is extensive (many files, repeated searches, or large outputs), delegate to worker and request concise summary with evidence.\n" +
 				"If multiple file reads are needed, delegate worker to read files and write concise summary to temporary file, then read that file from mind.\n" +
 				"If search scope is large, delegate worker to run ripgrep/searches and write concise findings to temporary file, then read that file from mind.\n" +
+				"Delegation checkpoint: if you cannot name the file likely to answer the question, or the question spans multiple subsystems, delegate before searching (flash for scoped work). If a targeted check turns exploratory, stop and delegate. Once delegated, do not duplicate the search; after the Worker reports back, verify only the decisive lines directly.\n" +
+				"Tool lookup: use tools already documented in these instructions directly. If you need to confirm an argument, look up that tool by name. Search the tool catalog only when you don't know which tool to use.\n" +
 				(strongCount > 0
 					? "Strong tier: architecture, deep debugging, ambiguous requirements, and correctness-sensitive reasoning. Strong may use implementation tools (bash, edit, write) through codemode.\n" +
 					  "Flash tier: scoped implementation, searches, test runs, and straightforward fixes. Prefer flash for anything that does NOT need strong's deeper reasoning.\n"
