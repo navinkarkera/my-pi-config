@@ -3,7 +3,7 @@
   "lastChangelogVersion": "1.6.0",
   "defaultProvider": "openai",
   "defaultModel": "gpt-6-luna",
-  "defaultThinkingLevel": "max",
+  "defaultThinkingLevel": "medium",
   "defaultTools": [
     "+codemode"
   ],

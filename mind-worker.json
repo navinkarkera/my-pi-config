@@ -6,7 +6,7 @@
   "notifyOnMindIdle": true,
   "ntfyTopic": "nrk_mangalpete_legion_ai_reminders",
   "mindModel": "openai/gpt-6.2-sol",
-  "mindThinkingLevel": "high",
+  "mindThinkingLevel": "medium",
   "workerModels": [
     { "model": "opencode-go/deepseek-v4.1-flash", "count": 2, "tier": "flash", "thinkingLevel": "low" },
     { "model": "opencode-go/deepseek-v4.1-flash", "count": 2, "tier": "strong", "thinkingLevel": "max" }
