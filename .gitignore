@@ -22,6 +22,8 @@ tmp/
 /bin/*
 !/bin/mind-worker-launcher
 !/bin/mind-worker-dashboard
+# Shipped Arch-host installer (not a generated helper): must stay tracked.
+!/bin/install-pi-ntfy-notify
 /pi-web
 /pi-web-run
 /pi-web-session-index.json

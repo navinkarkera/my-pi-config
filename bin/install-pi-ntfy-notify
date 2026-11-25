@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Install the Pi ntfy -> desktop-notification user service (systemd/pi-ntfy-notify.service).
+# Idempotent: the ntfy.sh topic URL is asked for once (hidden) and reused from the private
+# env file on later runs. Never prints the topic.
+set -euo pipefail
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+unit_src="$repo/systemd/pi-ntfy-notify.service"
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+unit="$unit_dir/pi-ntfy-notify.service"
+env_file="$HOME/.config/pi-ntfy-notify.env"   # must match EnvironmentFile=%h/... in the unit
+topic_re='^https://ntfy\.sh/[A-Za-z0-9_-]{1,64}$'
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# sudo is only for pacman; a root shell would drop the unit and env into root's home and
+# talk to the wrong user manager.
+[[ $EUID -eq 0 ]] && die "run this as your normal user, not as root (it uses sudo only for pacman)"
+
+# The unit calls /usr/bin/ntfy and /usr/bin/notify-send by absolute path, so check those
+# exact paths: a $PATH hit in ~/.local/bin or /usr/local/bin would still fail at runtime.
+# ntfy first: it is not in the Arch repos, and a missing binary must not trigger package work.
+[[ -x /usr/bin/ntfy ]] || die "no /usr/bin/ntfy. Install ntfy at that exact path and re-run: 'paru -S ntfy' (AUR package, installs /usr/bin/ntfy), or copy the release binary from https://github.com/binwiederhier/ntfy/releases to /usr/bin/ntfy"
+if [[ ! -x /usr/bin/notify-send ]]; then
+  pacman -Si libnotify >/dev/null 2>&1 || die "no /usr/bin/notify-send and 'libnotify' is not in the pacman repos"
+  sudo pacman -S --needed --noconfirm libnotify
+  [[ -x /usr/bin/notify-send ]] || die "libnotify installed but /usr/bin/notify-send is still missing"
+fi
+
+[[ -f $unit_src ]] || die "service file not found: $unit_src"
+
+if [[ -f $env_file ]]; then
+  topic=$(sed -n 's/^NTFY_TOPIC_URL=//p' "$env_file" | head -n1)
+  [[ $topic =~ $topic_re ]] || die "existing $env_file has no valid NTFY_TOPIC_URL; fix or remove it (not overwriting)"
+  printf '==> reusing topic from %s\n' "$env_file"
+else
+  read -rsp 'ntfy.sh topic URL (https://ntfy.sh/<topic>): ' topic
+  printf '\n'
+  [[ $topic =~ $topic_re ]] || die "not an ntfy.sh topic URL (expected https://ntfy.sh/<topic>, letters/digits/_/-)"
+  mkdir -p "$(dirname -- "$env_file")"
+  (umask 077; printf 'NTFY_TOPIC_URL=%s\n' "$topic" > "$env_file")
+  printf '==> wrote %s (mode 600)\n' "$env_file"
+fi
+chmod 600 "$env_file"
+
+mkdir -p "$unit_dir"
+install -m 0644 "$unit_src" "$unit"
+systemctl --user daemon-reload
+systemctl --user enable pi-ntfy-notify.service
+systemctl --user restart pi-ntfy-notify.service
+systemctl --user is-active --quiet pi-ntfy-notify.service \
+  || die "service is not active; see: journalctl --user -u pi-ntfy-notify.service -n 50"
+
+printf 'installed %s\n' "$unit"
+printf 'log: journalctl --user -u pi-ntfy-notify.service -f\n'
+printf 'note: any ntfy subscriber you started by hand is untouched; stop it to avoid double notifications.\n'
