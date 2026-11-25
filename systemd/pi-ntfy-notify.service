@@ -1,0 +1,18 @@
+[Unit]
+Description=ntfy desktop notification for Pi (Pi is ready for input)
+Documentation=https://docs.ntfy.sh/subscribe/cli/
+
+[Service]
+Type=simple
+# The topic URL is a per-user secret, so it lives outside this repo.
+EnvironmentFile=%h/.config/pi-ntfy-notify.env
+# ntfy runs this command through sh for every message. The message stays a single quoted
+# argv word (\x22 is a literal quote after systemd unquotes the line) and `--` ends option
+# parsing, so an untrusted payload can only ever be the notify-send body, never shell code
+# or a notify-send option.
+ExecStart=/usr/bin/ntfy subscribe ${NTFY_TOPIC_URL} "/usr/bin/notify-send -- Pi \x22$$NTFY_MESSAGE\x22"
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
